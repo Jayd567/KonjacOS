@@ -3405,12 +3405,23 @@ See item 44 for the matched-binary evidence and actual futex failure.
     entire real-time path to a clean exit) shows the exact same
     unchanging screen -- this is genuinely stuck, not merely slow.
     Neither `write` nor `writev` is ever called again after the initial
-    `Error:` line in any run tried, traced or quiet. Not yet
-    root-caused; see [docs/java-jar.md](docs/java-jar.md) for the full
-    trace evidence and the next concrete steps (a fresh, longer trace
-    started right at the jar-open point instead of from boot, and a
-    `java -cp` unpacked-class run to isolate whether jar/zip reading or
-    class resolution itself is where this stalls).
+    `Error:` line in any run tried, traced or quiet.
+
+    Isolated with the other concrete lever this item's own investigation
+    named: `java -cp / Hello world` -- `Hello.class` copied directly
+    onto the disk, no `jar`/zip packaging at all -- **runs to complete
+    success in a single quiet attempt.** Real class loading, real
+    bytecode execution, this program's own real `System.out.println`
+    output, its real `argv[1]` (`"world"`) printed correctly, no
+    `Error:` line at all. The first real, user-written Java program (not
+    just the JDK's own `-version` banner) to run to completion on
+    KonjacOS. This narrows `-jar`'s remaining problem precisely to
+    something in jar/zip-archive reading itself (`java.util.zip`/
+    `URLClassPath`'s native code, plausibly the exact JDK-8313765
+    `readAttributes` call already implicated) -- general class loading,
+    bytecode execution, and program I/O are all now confirmed working.
+    See [docs/java-jar.md](docs/java-jar.md) for the full trace
+    evidence.
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.

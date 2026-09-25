@@ -170,21 +170,43 @@ its own longest attempt by far -- still shows the exact same unchanging
 screen. That rules "just needs more time" out conclusively: this genuinely
 is stuck, not slow.
 
-**Not yet root-caused.** What's established: real, varied, non-repeating
-reads happen (ruling out the simplest "tight retry loop" shape); nothing
-is ever written to console or the process's own output streams after
-the initial `Error:` line (ruling out "it's working, just quiet");
-thirty real minutes produces no further change (ruling out "just needs
-more time"). What's not yet established is *where* forward progress
-actually stops for good, only that it does. The concrete next step is
-a full syscall trace (not a filtered one) restarted fresh right as
-`/hello.jar` itself is opened (rather than from process start, to avoid
-burning trace budget on shared-library loading this session's own
-`-version` work already exercises), run long enough in wall-clock terms
-to watch the `pread64` offset sequence either keep advancing into new
-territory or start actually repeating -- the filtered traces so far
-never watched long enough past the jar-open point specifically to tell
-which. A `java -cp` run against an unpacked `.class` file (no zip/jar
-layer, isolating whether class *resolution* itself is where this
-stalls, independent of jar/zip reading) is the other concrete,
-cheap-to-try lever, not yet attempted.
+**Not root-caused for `-jar` specifically, but isolated.** What was
+established for `-jar`: real, varied, non-repeating reads happen (ruling
+out the simplest "tight retry loop" shape); nothing is ever written to
+console or the process's own output streams after the initial `Error:`
+line; thirty real minutes produces no further change (ruling out "just
+needs more time"). What wasn't established is *where* forward progress
+actually stops for good, only that it does.
+
+## `java -cp` (no jar/zip layer at all): works completely
+
+The other concrete lever this document named -- a `java -cp` run
+against `Hello.class` copied directly onto the disk (no `jar`/zip
+packaging step, `javac`'s own output copied as-is) -- isolates the
+question cleanly: is this a jar/zip-reading problem specifically, or a
+class-resolution/execution problem generally?
+
+```
+konjac> run /usr/lib/jvm/java-21-openjdk-amd64/bin/java -cp / Hello world
+...
+Hello from a real java -jar run on KonjacOS!
+arg: world
+```
+
+**It's the jar/zip-reading path specifically.** `java -cp / Hello world`
+runs to completion in a single quiet attempt -- no `Error:` line at all,
+real class loading, real bytecode execution, this program's own real
+`System.out.println` output, and its real `argv[1]` (`"world"`) printed
+correctly. This is a genuinely new milestone in its own right: the
+*first* real, user-written Java program (as opposed to the JDK's own
+`java -version` banner) to run to completion on KonjacOS.
+
+This narrows `-jar`'s remaining problem precisely: something specific to
+opening a class file *through* a jar/zip archive (central directory
+parsing, `ZipFile`'s own native code, or the exact `readAttributes` call
+JDK-8313765 already implicated) is where forward progress stops --
+general class loading, bytecode execution, and program I/O are all
+confirmed working. The next concrete step for `-jar` itself is
+narrower than before: focus specifically on `java.util.zip`/
+`jdk.internal.loader.URLClassPath`'s jar-reading native code path, not
+class loading in general.
