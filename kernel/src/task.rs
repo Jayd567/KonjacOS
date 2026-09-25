@@ -315,6 +315,43 @@ pub struct OpenFile {
     /// comment for what happened when every file honestly reported
     /// `(0, 0)` instead.
     pub ino: u64,
+    /// `None` for the ordinary case `data` (`FileBacking`) already fully
+    /// covers: a real, read-only regular file or static content, mmap-
+    /// compatible (see `vm.rs`'s own `Region::backing`, which needs
+    /// `FileBacking` to stay cheap and `Copy` -- exactly why this lives
+    /// in a separate field instead of growing `FileBacking` itself with
+    /// heap-allocated variants). `Some` for the two real capabilities
+    /// added for `java -version`'s own `hsperfdata` PerfData file (see
+    /// `docs/java-version.md`): an open directory descriptor (real
+    /// `openat(..., O_DIRECTORY)`/`fchdir` needs its resolved path, not
+    /// file content) and a real writable regular file, materialized
+    /// fully in memory and flushed to `fat16` on close -- this
+    /// filesystem's write path (`fat16::write_file`) is already a
+    /// whole-buffer operation, not a real incremental one, so this
+    /// doesn't lose anything a real per-offset disk write would have
+    /// given a caller here. `data` is left as an inert `FileBacking::
+    /// Static(&[])` placeholder whenever this is `Some`.
+    pub extra: Option<Box<OpenExtra>>,
+}
+
+/// See [`OpenFile::extra`]'s own doc comment for why this exists as a
+/// separate type instead of two more `FileBacking` variants.
+pub enum OpenExtra {
+    /// A real, already-resolved absolute path to an open directory --
+    /// `linux_syscall.rs`'s `sys_fchdir` reads it back to call
+    /// `fat16::change_dir`, the same real Linux dance a real glibc/
+    /// HotSpot uses (`openat(dir, O_DIRECTORY)` + `fchdir`) to create a
+    /// file by a bare relative name inside a specific directory without
+    /// building a full path string itself.
+    Dir(String),
+    /// A real regular file's full content, plus the real path it'll be
+    /// flushed back to on close. `write`/`pwrite`/`ftruncate` all operate
+    /// directly on this `Vec` (see `linux_syscall.rs`'s own doc comments
+    /// on those); nothing here is a demand-paged/lazy read the way a
+    /// `FileBacking::Disk` read is, because a small, actively-written
+    /// file (this exists for a 32 KiB PerfData region, not a multi-
+    /// megabyte archive) has no real reason to be.
+    Writable(String, Vec<u8>),
 }
 
 /// A simple FNV-1a hash of a file's path, used as [`OpenFile::ino`] --
@@ -1270,6 +1307,29 @@ pub fn with_current_open_files<R>(f: impl FnOnce(&mut [Option<OpenFile>; MAX_OPE
 /// Stage a bounded read into resident kernel memory, outside TASKS. Callers
 /// copy to user memory only after this returns. Explicit offsets preserve pos.
 pub fn read_open_file(fd: usize, buffer: &mut [u8], offset: Option<usize>) -> Result<usize, i64> {
+    // A `Dir`/`Writable` fd (see `OpenFile::extra`'s doc comment) is pure
+    // in-memory bookkeeping, not disk I/O -- handled entirely in one lock
+    // acquisition, no need for the release-the-lock-across-I/O dance the
+    // `FileBacking::Disk` path below still needs.
+    let fast: Option<Result<usize, i64>> = with_current_open_files(|table| {
+        let file = table.get_mut(fd).and_then(|f| f.as_mut())?;
+        let (start, n) = match file.extra.as_deref() {
+            Some(OpenExtra::Dir(_)) => return Some(Err(-21)), // EISDIR: a real plain read() on a directory fd
+            Some(OpenExtra::Writable(_, buf)) => {
+                let start = offset.unwrap_or(file.pos);
+                let n = (buf.len() as u64).saturating_sub(start as u64).min(buffer.len() as u64) as usize;
+                if n != 0 { buffer[..n].copy_from_slice(&buf[start..start + n]); }
+                (start, n)
+            }
+            None => return None,
+        };
+        if offset.is_none() { file.pos = start + n; }
+        Some(Ok(n))
+    });
+    if let Some(result) = fast {
+        return result;
+    }
+
     let (mut backing, start) = with_current_open_files(|table| {
         let file = table.get(fd).and_then(|f| f.as_ref()).ok_or(-9i64)?;
         Ok::<_, i64>((file.data, offset.unwrap_or(file.pos)))
@@ -1285,6 +1345,82 @@ pub fn read_open_file(fd: usize, buffer: &mut [u8], offset: Option<usize>) -> Re
         }
     });
     Ok(n)
+}
+
+/// Real Linux `write`/`pwrite`-style write onto a real [`OpenExtra::Writable`]
+/// fd -- see its own doc comment. Extends the in-memory buffer with zero
+/// bytes if `offset` (or the fd's own sequential position) lands past the
+/// current end, the same "seek past EOF, then write, leaves a real hole"
+/// semantics `sys_lseek`'s own doc comment already describes for reads.
+/// Any other fd kind (`Dir`, or a plain read-only `FileBacking`) honestly
+/// refuses with `EBADF` -- this kernel's FAT16 write path
+/// (`fat16::write_file`) is whole-buffer, so there's no real way to grow
+/// an existing read-only lazy `FileBacking::Disk` read into a writable one
+/// without re-opening it, and nothing has ever needed that yet.
+pub fn write_open_file(fd: usize, bytes: &[u8], offset: Option<usize>) -> Result<usize, i64> {
+    with_current_open_files(|table| {
+        let file = table.get_mut(fd).and_then(|f| f.as_mut()).ok_or(-9i64)?;
+        let Some(OpenExtra::Writable(_, buf)) = file.extra.as_deref_mut() else {
+            return Err(-9); // EBADF
+        };
+        let start = offset.unwrap_or(file.pos);
+        if buf.len() < start {
+            buf.resize(start, 0);
+        }
+        let end = start + bytes.len();
+        if buf.len() < end {
+            buf.resize(end, 0);
+        }
+        buf[start..end].copy_from_slice(bytes);
+        if offset.is_none() { file.pos = end; }
+        Ok(bytes.len())
+    })
+}
+
+/// Real Linux `ftruncate(2)` onto a real [`OpenExtra::Writable`] fd --
+/// grows (zero-filled) or shrinks the in-memory buffer to exactly `size`,
+/// same real semantics a real regular file's `ftruncate` has. Any other
+/// fd kind honestly refuses with `EINVAL`, real Linux's own answer for
+/// `ftruncate` on something that isn't a regular writable file.
+pub fn truncate_open_file(fd: usize, size: u64) -> Result<(), i64> {
+    with_current_open_files(|table| {
+        let file = table.get_mut(fd).and_then(|f| f.as_mut()).ok_or(-9i64)?;
+        let Some(OpenExtra::Writable(_, buf)) = file.extra.as_deref_mut() else {
+            return Err(-22); // EINVAL
+        };
+        buf.resize(size as usize, 0);
+        Ok(())
+    })
+}
+
+/// `(size, ino, is_dir)` for `linux_syscall.rs`'s `sys_fstat`/`sys_lseek`
+/// -- checks `extra` first (a `Dir`/`Writable` fd's real size/kind lives
+/// there, not in the inert `FileBacking::Static(&[])` placeholder `data`
+/// holds for either -- see `OpenFile::extra`'s own doc comment), falling
+/// back to the ordinary `FileBacking` case otherwise.
+pub fn open_file_len(fd: usize) -> Option<(u64, u64, bool)> {
+    with_current_open_files(|table| {
+        let file = table.get(fd).and_then(|f| f.as_ref())?;
+        let (size, is_dir) = match file.extra.as_deref() {
+            Some(OpenExtra::Dir(_)) => (0u64, true),
+            Some(OpenExtra::Writable(_, buf)) => (buf.len() as u64, false),
+            None => (file.data.len() as u64, false),
+        };
+        Some((size, file.ino, is_dir))
+    })
+}
+
+/// The real, already-resolved absolute path an open directory fd names --
+/// what `linux_syscall.rs`'s `sys_fchdir` needs to call `fat16::change_dir`
+/// with. `None` for anything that isn't a real open [`OpenExtra::Dir`].
+pub fn open_file_dir_path(fd: usize) -> Option<String> {
+    with_current_open_files(|table| {
+        let file = table.get(fd).and_then(|f| f.as_ref())?;
+        match file.extra.as_deref() {
+            Some(OpenExtra::Dir(path)) => Some(path.clone()),
+            _ => None,
+        }
+    })
 }
 
 /// The current task's real invocation path -- see [`Task::exe_path`]'s doc

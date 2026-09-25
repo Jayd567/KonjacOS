@@ -229,7 +229,90 @@ real banner); `run hello.exe` is unaffected. Still no observed
 doing more real, further-along work now, not necessarily less time from
 finishing it.
 
-**Not yet established:** what specifically real HotSpot's shutdown path
+## Building the rest of the `hsperfdata` chain
+
+The `mkdir`/`hsperfdata` lead above named `mkdir` as the first divergence,
+but real HotSpot's own PerfData setup needs much more than that one call
+once it succeeds -- confirmed against a fresh host `strace -f java
+-version` (with `/tmp/hsperfdata_root` removed first, to match this
+kernel's own always-fresh disk): `openat(O_NOFOLLOW)` to check for an
+existing directory, `mkdir`, `openat(O_NOFOLLOW)` again, `fstat`,
+`geteuid`, `openat(O_DIRECTORY)`, more `fstat`s, `openat(".")` to save the
+caller's own cwd, `fchdir` into the new directory, `openat(O_CREAT)` for a
+file named after the PID, `fstat`, `fcntl`, `fchdir` back, `flock`,
+`ftruncate` (twice), eight `lseek`+`write` pairs (one byte per 4 KiB
+page, forcing real page allocation), and finally `mmap(MAP_SHARED)` on
+that same fd -- all before any class loading starts.
+
+Implemented in this kernel for the first time (`linux_syscall.rs`,
+`task.rs`, `fat16.rs`), rather than continuing to patch around each one:
+
+* **Real writable regular files.** `task::OpenFile` grows a new `extra`
+  field (`Option<Box<OpenExtra>>`) carrying either an open directory's
+  resolved path (`OpenExtra::Dir`) or a real file's full content plus its
+  path (`OpenExtra::Writable`) -- kept separate from the existing
+  `FileBacking` enum deliberately, since `FileBacking` has to stay `Copy`
+  for `vm.rs`'s own fixed-size `Region` array (2048 entries, no
+  allocation) to keep working unmodified; `Vec<u8>`/`String` variants
+  would have broken that. `sys_open`/`sys_openat` now honor `O_CREAT`
+  (materializing a new empty file in memory) and a write-mode open of an
+  existing file (reading it fully into memory first) -- a plain read-only
+  open of a regular file is completely unchanged, still the original
+  lazy/bounded `FileBacking::Disk` path items 46/49 built.
+* **Real `write`/`pwrite`, routed by fd.** `sys_write` previously wrote
+  *every* call straight to the console regardless of `fd`, harmlessly
+  only because nothing had ever opened a real file for writing before.
+  Now `fd` 0/1/2 still go to the console; anything else routes to
+  `task::write_open_file`, extending the in-memory buffer with zero
+  bytes on a write past the current end, same as a real sparse write.
+* **`mkdir`/`mkdirat`**, onto a new `fat16::create_dir` -- see the
+  section above.
+* **`fchdir`**, onto `fat16::change_dir` using the open directory fd's
+  own resolved path -- this filesystem's `CWD` was already a single
+  global before this (item 49's own "this does not add per-process CWD"
+  callout), so reusing it here is the same honestly-narrower-than-real-
+  Linux scope, not a new limitation.
+* **`ftruncate`**, growing or shrinking a `Writable` fd's in-memory
+  buffer.
+* **`flock`**, accepted as a no-op -- there is never a second process
+  here to actually contend with.
+* **A real `MAP_SHARED`+`PROT_WRITE` `mmap` onto a `Writable` fd.**
+  `vm.rs`'s general file-backed mapping path explicitly refuses this
+  combination already (`"Shared writable pages require cache/writeback
+  semantics we do not have"`) -- correctly, for the general case. But
+  there's never a second reader for this kernel's own writable fds to
+  share memory *with* either, so `sys_mmap` special-cases a `Writable` fd:
+  reserve an ordinary anonymous region through the existing `vm::map`
+  (unmodified address allocation, region bookkeeping, and process-
+  teardown frame cleanup), eagerly populate every page through the exact
+  same `vm::fault` a lazy first touch would have used, then copy the fd's
+  current buffer content in.
+
+**Verified:** `mkdir` now genuinely creates a real, persistent FAT16
+subdirectory -- checked directly with `mdir` against a non-snapshotted
+disk image, not just inferred from console silence -- and neither
+`hello.exe` nor `java -version`'s own banner regressed. A targeted GDB
+breakpoint on `linux_syscall_handler` (filtering for syscall numbers 83/
+81/77/73, real `mkdir`/`fchdir`/`ftruncate`/`flock`) confirms `mkdir`
+really does fire during a live `java -version` run.
+
+**Not yet established:** whether the *rest* of the chain (`fchdir`
+onward) actually runs. `mkdir` firing is confirmed; `fchdir`/`ftruncate`/
+`flock` were not observed firing in the trace windows tried so far, and a
+non-snapshotted disk check after a full run shows the directory created
+but still empty -- no per-PID file, meaning the dance is abandoned
+somewhere between `mkdir` succeeding and the file actually being created,
+not completed. Whether that's a real remaining bug in the new code above,
+or real HotSpot choosing to abandon PerfData for an unrelated reason
+(there's real precedent for this being silent and non-fatal on real Linux
+too) isn't established yet. Full syscall tracing is heavy enough here
+(each breakpoint hit costs a real GDB round-trip) that reaching this
+point in HotSpot's startup reliably within one bounded trace window has
+been inconsistent run to run -- the next real step is a longer or more
+targeted trace, not a new hypothesis.
+
+**Not yet established (unchanged from before):** what specifically real
+HotSpot's shutdown path
 needs from this kernel that it isn't getting. A real lead, though, from
 `strace -f java -version` on the host (the same free-ground-truth
 technique every prior item in this chain has used) -- real shutdown's

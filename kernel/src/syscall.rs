@@ -142,7 +142,7 @@ extern "C" fn syscall_handler(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
             match fat16::open_file(path).map(FileBacking::Disk) {
                 Ok(data) => task::with_current_open_files(|table| match table.iter().position(|f| f.is_none()) {
                     Some(fd) => {
-                        table[fd] = Some(OpenFile { data, pos: 0, ino });
+                        table[fd] = Some(OpenFile { data, pos: 0, ino, extra: None });
                         fd as u64
                     }
                     None => SYS_ERROR, // every fd slot is in use

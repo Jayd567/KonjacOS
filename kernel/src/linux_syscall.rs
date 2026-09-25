@@ -60,6 +60,7 @@ extern crate alloc;
 use core::arch::global_asm;
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use crate::fat16;
 use crate::gdt;
@@ -81,6 +82,9 @@ const SYS_PREAD64: u64 = 17;
 const SYS_OPEN: u64 = 2;
 const SYS_MKDIR: u64 = 83;
 const SYS_MKDIRAT: u64 = 258;
+const SYS_FLOCK: u64 = 73;
+const SYS_FCHDIR: u64 = 81;
+const SYS_FTRUNCATE: u64 = 77;
 const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_MMAP: u64 = 9;
@@ -161,6 +165,12 @@ const TIOCGWINSZ: u64 = 0x5413;
 // `sys_mmap`'s doc comment for why only these matter here.
 const MAP_ANONYMOUS: u64 = 0x20;
 
+// Real Linux open(2) flag bits sys_open actually consults -- see its own
+// doc comment.
+const O_ACCMODE: u64 = 0x3;
+const O_CREAT: u64 = 0o100;
+const O_DIRECTORY: u64 = 0o200000;
+
 // Real Linux errno values (negated on return -- see the module docs).
 const ENOSYS: i64 = -38;
 const ENOTTY: i64 = -25;
@@ -170,6 +180,9 @@ const EAGAIN: i64 = -11;
 const ETIMEDOUT: i64 = -110;
 const ENOENT: i64 = -2;
 const EEXIST: i64 = -17;
+const ENOTDIR: i64 = -20;
+const EISDIR: i64 = -21;
+const ENOMEM: i64 = -12;
 
 // Real Linux RLIMIT_* resource numbers sys_prlimit64 actually special-cases
 // below -- see its own doc comment.
@@ -272,7 +285,7 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         SYS_LSEEK => sys_lseek(a0, a1, a2),
         SYS_CLOSE => sys_close(a0),
         SYS_BRK => sys_brk(a0) as i64,
-        SYS_OPEN => sys_open(a0),
+        SYS_OPEN => sys_open(a0, a1, a2),
         SYS_FSTAT => sys_fstat(a0, a1),
         // openat(dirfd, path, flags, mode): dirfd/flags/mode all read but
         // unconsulted -- see sys_newfstatat's doc comment just below for
@@ -280,13 +293,20 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // sys_open's own doc comment for flags/mode. Genuinely the same
         // operation as sys_open once that's true, not just similar, so it
         // reuses it outright rather than duplicating its body.
-        SYS_OPENAT => sys_open(a1),
+        SYS_OPENAT => sys_open(a1, a2, a3),
         SYS_NEWFSTATAT => sys_newfstatat(a1, a2),
         SYS_MKDIR => sys_mkdir(a0),
         // mkdirat(dirfd, path, mode): dirfd ignored, same precedent as
         // SYS_OPENAT reusing sys_open above -- every path this kernel has
         // ever been asked to create has been absolute.
         SYS_MKDIRAT => sys_mkdir(a1),
+        // flock: advisory, cooperative locking against *other processes*
+        // -- there's never a second process here to contend with, so
+        // accepting it as a no-op is honest, not a shortcut around real
+        // contention this kernel can't detect.
+        SYS_FLOCK => 0,
+        SYS_FCHDIR => sys_fchdir(a0),
+        SYS_FTRUNCATE => sys_ftruncate(a0, a1),
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         SYS_NANOSLEEP => sys_clock_nanosleep(CLOCK_MONOTONIC, 0, a0),
         SYS_SCHED_YIELD => { task::yield_now(); 0 },
@@ -440,13 +460,34 @@ fn write_bytes_to_console(bytes: &[u8]) {
     }
 }
 
-fn sys_write(_fd: u64, ptr: u64, len: u64) -> i64 {
+/// `fd` 0/1/2 (stdin/stdout/stderr) always go to the real console --
+/// never real table entries (nothing here ever calls `open` and gets one
+/// of those three numbers back low enough to collide, since `sys_open`'s
+/// own fd search starts at the table's first free slot, but a real
+/// program's `write(1, ...)`/`write(2, ...)` use the fixed numbers
+/// directly, inherited rather than opened). Any other `fd` now really
+/// means a real open file (see `task::OpenFile::extra`'s doc comment for
+/// how `java -version`'s own `hsperfdata` PerfData file first needed
+/// this) -- routed to `task::write_open_file` instead of the console,
+/// which was this function's *only* behavior before, regardless of `fd`,
+/// simply because nothing had ever opened a real file for writing yet.
+fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
     let len = (len as usize).min(MAX_IO_LEN);
-    if len > 0 {
-        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-        write_bytes_to_console(bytes);
+    if fd <= 2 {
+        if len > 0 {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+            write_bytes_to_console(bytes);
+        }
+        return len as i64;
     }
-    len as i64
+    if len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    match task::write_open_file(fd as usize, bytes, None) {
+        Ok(n) => n as i64,
+        Err(errno) => errno,
+    }
 }
 
 /// `writev` -- a scatter/gather `write`, real musl stdio's actual flush
@@ -546,10 +587,15 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> i64 {
         let Some(file) = table.get_mut(fd as usize).and_then(|slot| slot.as_mut()) else {
             return EBADF;
         };
+        let real_len = match file.extra.as_deref() {
+            Some(task::OpenExtra::Dir(_)) => 0,
+            Some(task::OpenExtra::Writable(_, buf)) => buf.len(),
+            None => file.data.len(),
+        };
         let base = match whence {
             0 => 0, // SEEK_SET
             1 => file.pos, // SEEK_CUR
-            2 => file.data.len(), // SEEK_END
+            2 => real_len, // SEEK_END
             _ => return EINVAL,
         };
         let Ok(base) = i64::try_from(base) else { return EINVAL };
@@ -563,15 +609,25 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> i64 {
     })
 }
 
+/// Real Linux `close(2)`. A real [`task::OpenExtra::Writable`] fd (see
+/// its own doc comment) is flushed back to `fat16` here, best-effort --
+/// this filesystem's own write path is already whole-buffer, so "flush
+/// on close" is the natural, and only, point a real in-memory write
+/// actually reaches disk; a failed flush is silently swallowed rather
+/// than turning a real, successful `close(2)` into a surprising error a
+/// real caller has no precedent to expect from `close` at all.
 fn sys_close(fd: u64) -> i64 {
     let fd = fd as usize;
-    task::with_current_open_files(|table| match table.get_mut(fd) {
-        Some(slot @ Some(_)) => {
-            *slot = None;
+    let removed = task::with_current_open_files(|table| table.get_mut(fd).and_then(|slot| slot.take()));
+    match removed {
+        Some(file) => {
+            if let Some(task::OpenExtra::Writable(path, buf)) = file.extra.as_deref() {
+                let _ = fat16::write_file(path, buf);
+            }
             0
         }
-        _ => EBADF,
-    })
+        None => EBADF,
+    }
 }
 
 /// Reads a NUL-terminated string out of ring-3 memory, capped at
@@ -739,40 +795,70 @@ fn sys_sysinfo(info_ptr: u64) -> i64 {
     0
 }
 
-/// Real Linux `open(2)`, used so far for exactly one real thing: musl's
-/// own `dlopen`, which -- unlike every other file-touching syscall this
-/// kernel has run before now -- actually needs to open an arbitrary named
-/// file at *runtime*, not just whatever `PT_INTERP`/`DT_NEEDED` mapped up
-/// front at load time (see `loader.rs`'s module docs and item 23's
-/// README entry). `flags`/`mode` (a real `open`'s 2nd/3rd arguments) are
-/// read but not consulted -- this kernel's FAT16 backing is read-only in
-/// practice (see `fat16.rs`), and every file this loader or `dlopen` ever
-/// opens is opened for reading, so there's nothing an `O_WRONLY`/
-/// `O_CREAT`/... would actually change here; a real write-mode open would
-/// need real FAT16 write support this kernel doesn't have, not a flag
-/// check. Reuses the exact same per-task open-file table (`task::
-/// with_current_open_files`) `syscall.rs`'s own `SYS_OPEN` already
-/// established -- an `fd` here and an `fd` from KonjacOS's own `int 0x80`
-/// ABI are genuinely interchangeable, since they're indices into the same
-/// table.
-fn sys_open(path_ptr: u64) -> i64 {
+/// Real Linux `open(2)`. Originally used for exactly one thing: musl's
+/// own `dlopen`, needing an arbitrary named file at runtime rather than
+/// whatever `PT_INTERP`/`DT_NEEDED` mapped up front (see `loader.rs`'s
+/// module docs and item 23's README entry) -- every open was read-only in
+/// practice then, so `flags`/`mode` went unconsulted.
+///
+/// Real HotSpot's own `java -version` startup (see `docs/java-version.md`)
+/// needed more: opening an existing *directory* (`O_DIRECTORY`, for its
+/// own `fchdir` dance -- see `sys_fchdir`) and creating/writing a real
+/// regular file (`O_CREAT`, for its `hsperfdata` PerfData region). Both
+/// now real:
+///
+/// * A path that's already a directory opens as [`task::OpenExtra::Dir`]
+///   -- `data` stays an inert placeholder, real content lives in `extra`
+///   (see its own doc comment for why, and `sys_fstat`/`sys_read` for how
+///   each caller tells the two apart).
+/// * A path opened with a write mode (`O_WRONLY`/`O_RDWR`, i.e.
+///   `flags & O_ACCMODE != 0`) -- whether it already exists or is being
+///   created fresh (`O_CREAT`, and only then) -- opens as a real
+///   [`task::OpenExtra::Writable`], its full content read into memory
+///   up front (empty for a brand new file) and flushed back to `fat16`
+///   on close (`sys_close`).
+/// * A plain read-only open of a regular file keeps the exact previous
+///   path unchanged (`FileBacking::Disk`, real lazy/bounded reads --
+///   see items 46/49) -- nothing about this addition touches the common
+///   case a real `libjimage`/library load already depends on.
+///
+/// `mode` (the real third argument) is still read but not consulted --
+/// same reasoning as ever: no real permission model exists here for it to
+/// mean anything against.
+fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     let Some(path) = read_c_string(path_ptr) else {
         return EINVAL;
     };
     let ino = task::hash_path(&path);
-    let data = match synthetic_proc_file(&path) {
-        Some(content) => Ok(FileBacking::Static(content)),
-        None => fat16::open_file(&path).map(FileBacking::Disk),
+    let write_mode = flags & O_ACCMODE != 0;
+    let want_dir = flags & O_DIRECTORY != 0;
+
+    let opened: Result<(FileBacking, Option<task::OpenExtra>), i64> = if let Some(content) = synthetic_proc_file(&path) {
+        Ok((FileBacking::Static(content), None))
+    } else {
+        match fat16::stat_path(&path) {
+            Ok((true, _)) if write_mode => Err(EISDIR),
+            Ok((true, _)) => Ok((FileBacking::Static(&[]), Some(task::OpenExtra::Dir(path.clone())))),
+            Ok((false, _)) if want_dir => Err(ENOTDIR),
+            Ok((false, _)) if write_mode => match fat16::read_file(&path) {
+                Ok(bytes) => Ok((FileBacking::Static(&[]), Some(task::OpenExtra::Writable(path.clone(), bytes)))),
+                Err(_) => Err(ENOENT),
+            },
+            Ok((false, _)) => fat16::open_file(&path).map(|f| (FileBacking::Disk(f), None)).map_err(|_| ENOENT),
+            Err(_) if flags & O_CREAT != 0 => Ok((FileBacking::Static(&[]), Some(task::OpenExtra::Writable(path.clone(), Vec::new())))),
+            Err(_) => Err(ENOENT),
+        }
     };
-    match data {
-        Ok(data) => task::with_current_open_files(|table| match table.iter().position(|f| f.is_none()) {
+
+    match opened {
+        Ok((data, extra)) => task::with_current_open_files(|table| match table.iter().position(|f| f.is_none()) {
             Some(fd) => {
-                table[fd] = Some(OpenFile { data, pos: 0, ino });
+                table[fd] = Some(OpenFile { data, pos: 0, ino, extra: extra.map(alloc::boxed::Box::new) });
                 fd as i64
             }
             None => EBADF, // every fd slot is in use -- a real ENFILE/EMFILE would be more accurate, but EBADF is already this module's established "ran out of fd-table-shaped resources" answer (see sys_close).
         }),
-        Err(_) => ENOENT,
+        Err(errno) => errno,
     }
 }
 
@@ -795,6 +881,32 @@ fn sys_mkdir(path_ptr: u64) -> i64 {
     }
 }
 
+/// Real Linux `fchdir(2)`. Onto `task::open_file_dir_path`/
+/// `fat16::change_dir` -- see `task::OpenFile::extra`'s own doc comment
+/// for why this needs an open directory fd's own resolved path rather
+/// than a new, real per-task-cwd concept: this kernel's `fat16::CWD` was
+/// already a single global before this (see item 49's own "this does not
+/// add per-process CWD" callout), and reusing it here is the same
+/// honestly-narrower-than-real-Linux scope, not a new limitation.
+fn sys_fchdir(fd: u64) -> i64 {
+    match task::open_file_dir_path(fd as usize) {
+        Some(path) => match fat16::change_dir(&path) {
+            Ok(()) => 0,
+            Err(_) => ENOENT,
+        },
+        None => EBADF,
+    }
+}
+
+/// Real Linux `ftruncate(2)`, onto `task::truncate_open_file` -- see its
+/// own doc comment.
+fn sys_ftruncate(fd: u64, size: u64) -> i64 {
+    match task::truncate_open_file(fd as usize, size) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
+}
+
 /// Real Linux `fstat(2)`, filling in only what a real caller here has
 /// ever actually needed (found the same ground-truth way as everything
 /// else in this module): `st_mode` (just enough to say "a regular file,
@@ -807,11 +919,10 @@ fn sys_mkdir(path_ptr: u64) -> i64 {
 /// zeroed rather than fabricated, since nothing that's actually run
 /// against this kernel so far has needed any of it to be real.
 fn sys_fstat(fd: u64, statbuf_ptr: u64) -> i64 {
-    let fd = fd as usize;
-    let Some((size, ino)) = task::with_current_open_files(|table| table.get(fd).and_then(|f| f.as_ref()).map(|f| (f.data.len() as u64, f.ino))) else {
+    let Some((size, ino, is_dir)) = task::open_file_len(fd as usize) else {
         return EBADF;
     };
-    write_stat(statbuf_ptr, size, ino, false); // sys_open never opens a directory (see sys_open's own doc comment) -- every fd here is a real file.
+    write_stat(statbuf_ptr, size, ino, is_dir);
     0
 }
 
@@ -1179,13 +1290,70 @@ fn sys_brk(requested: u64) -> u64 {
 fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> i64 {
     // Safety: this is the current live syscall frame, unchanged by this call.
     let offset = unsafe { ((gdt::SYSCALL_KERNEL_RSP - 128 + 5 * 8) as *const u64).read() };
-    let backing = if flags & MAP_ANONYMOUS == 0 {
-        match task::with_current_open_files(|table| table.get(fd as usize).and_then(|f| f.as_ref()).map(|f| f.data)) {
-            Some(file) => Some(file),
-            None => return EBADF,
+    if flags & MAP_ANONYMOUS == 0 {
+        let writable = task::with_current_open_files(|table| {
+            let file = table.get(fd as usize).and_then(|f| f.as_ref())?;
+            match file.extra.as_deref() {
+                Some(task::OpenExtra::Writable(_, buf)) => Some(buf.clone()),
+                _ => None,
+            }
+        });
+        if let Some(bytes) = writable {
+            return sys_mmap_writable_fd(addr, len, prot, flags, offset, &bytes);
         }
-    } else { None };
-    crate::vm::map(addr, len, prot, flags, backing, offset).unwrap_or_else(|errno| errno)
+        let backing = match task::with_current_open_files(|table| table.get(fd as usize).and_then(|f| f.as_ref()).map(|f| f.data)) {
+            Some(data) => data,
+            None => return EBADF,
+        };
+        return crate::vm::map(addr, len, prot, flags, Some(backing), offset).unwrap_or_else(|errno| errno);
+    }
+    crate::vm::map(addr, len, prot, flags, None, offset).unwrap_or_else(|errno| errno)
+}
+
+/// Real `MAP_SHARED` + writable file-backed `mmap` onto a real
+/// [`task::OpenExtra::Writable`] fd -- what HotSpot's own `hsperfdata`
+/// PerfData region needs (see `docs/java-version.md`). `vm.rs`'s own
+/// general file-backed mapping path explicitly refuses this exact
+/// combination (`prot & 2 != 0` with `MAP_SHARED`, "shared writable pages
+/// require cache/writeback semantics we do not have") -- correctly, for
+/// the general case this kernel has no real page-cache/writeback path
+/// for. But there's never a second process (or even a second reader) for
+/// this kernel's own writable fds to actually share memory *with* -- so
+/// this narrower path handles the one real caller found so far honestly:
+/// reserve an ordinary anonymous region through the existing `vm::map`
+/// (real address allocation, capacity/region bookkeeping, and process-
+/// teardown frame cleanup all unchanged and untouched), eagerly populate
+/// every page through the exact same `vm::fault` a lazy first access
+/// would have taken (eagerly rather than lazily, since the content needs
+/// to be right *before* this call returns, not on first touch), then
+/// copy the fd's current buffer content in. Not a real shared mapping in
+/// the cross-process sense -- an honest, narrower stand-in for the one
+/// real thing that actually calls this.
+fn sys_mmap_writable_fd(addr: u64, len: u64, prot: u64, flags: u64, offset: u64, bytes: &[u8]) -> i64 {
+    let anon_flags = (flags & !3) | MAP_ANONYMOUS | 2; // force MAP_PRIVATE|MAP_ANONYMOUS, keep MAP_FIXED and any other bits.
+    let start = match crate::vm::map(addr, len, prot, anon_flags, None, offset) {
+        Ok(start) => start as u64,
+        Err(errno) => return errno,
+    };
+    let page_count = len.div_ceil(PAGE_SIZE);
+    for i in 0..page_count {
+        if !crate::vm::fault(start + i * PAGE_SIZE, 2) {
+            return ENOMEM;
+        }
+    }
+    let copy_len = bytes.len().min(len as usize);
+    if copy_len > 0 {
+        // Safety: every page in [start, start+len) was just eagerly
+        // populated and mapped PAGE_USER|PAGE_WRITABLE above, in this
+        // exact address space (this syscall runs with the caller's own
+        // CR3 already active) -- a plain kernel-context write through
+        // the user VA is exactly what every other in-place write in this
+        // module already does to freshly mapped user memory.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), start as *mut u8, copy_len);
+        }
+    }
+    start as i64
 }
 
 fn sys_munmap(addr: u64, len: u64) -> i64 {
