@@ -3383,8 +3383,34 @@ See item 44 for the matched-binary evidence and actual futex failure.
     landing exactly at the file's real size minus 22), so whatever's
     actually failing now returns a value this kernel considers valid
     but Java doesn't, further into the real `-jar` open path than
-    `statx` alone. Not yet root-caused. See
-    [docs/java-jar.md](docs/java-jar.md).
+    `statx` alone.
+
+    A web search (this machine's own JDK `src.zip` is a broken symlink)
+    identifies the real message: JDK-8313765, a genuine OpenJDK
+    regression where jar-opening can hit a real `ENOSYS`
+    ("Function not implemented") on some real Linux systems -- this
+    kernel returns real `ENOSYS` by design for several things that fire
+    during this exact run (`rseq`, `getrandom` without `RDRAND`,
+    `prlimit64` when actually setting a limit). The documented
+    workaround flag made no difference here, but a GDB trace confirms
+    the error is non-fatal regardless: execution continues well past
+    it, into real, varied (non-repeating) `pread64` reads spread across
+    ~29 MB of `lib/modules` -- genuine class-loading work, not a tight
+    retry loop -- reaching the same steady-state futex loop a
+    successful `-version` run passes through before its own
+    `exit_group`.
+
+    What stops it from getting further is still open. Ruled out
+    definitively: a 30-minute quiet run (three times `-version`'s own
+    entire real-time path to a clean exit) shows the exact same
+    unchanging screen -- this is genuinely stuck, not merely slow.
+    Neither `write` nor `writev` is ever called again after the initial
+    `Error:` line in any run tried, traced or quiet. Not yet
+    root-caused; see [docs/java-jar.md](docs/java-jar.md) for the full
+    trace evidence and the next concrete steps (a fresh, longer trace
+    started right at the jar-open point instead of from boot, and a
+    `java -cp` unpacked-class run to isolate whether jar/zip reading or
+    class resolution itself is where this stalls).
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.

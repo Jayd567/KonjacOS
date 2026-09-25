@@ -164,9 +164,27 @@ class) -- a proportionally longer real time to reach any output at all,
 on top of `-version`'s own already-slow real path to `exit_group`, is a
 real, plausible, unexcluded explanation on its own.
 
-**Not yet root-caused; not yet ruled out as "just needs more time"
-either.** The concrete next step is a single quiet run given a
-substantially longer window (30+ minutes) than tried so far, watching
-specifically for either real program output or a final `exit_group` --
-this session's own longest attempt (10 minutes) was calibrated off
-`-version`'s timeline, not `-jar`'s real, larger workload.
+A quiet run given a full **30 minutes** of real wall-clock time -- three
+times `-version`'s entire real-time path to a clean `exit_group`, and
+its own longest attempt by far -- still shows the exact same unchanging
+screen. That rules "just needs more time" out conclusively: this genuinely
+is stuck, not slow.
+
+**Not yet root-caused.** What's established: real, varied, non-repeating
+reads happen (ruling out the simplest "tight retry loop" shape); nothing
+is ever written to console or the process's own output streams after
+the initial `Error:` line (ruling out "it's working, just quiet");
+thirty real minutes produces no further change (ruling out "just needs
+more time"). What's not yet established is *where* forward progress
+actually stops for good, only that it does. The concrete next step is
+a full syscall trace (not a filtered one) restarted fresh right as
+`/hello.jar` itself is opened (rather than from process start, to avoid
+burning trace budget on shared-library loading this session's own
+`-version` work already exercises), run long enough in wall-clock terms
+to watch the `pread64` offset sequence either keep advancing into new
+territory or start actually repeating -- the filtered traces so far
+never watched long enough past the jar-open point specifically to tell
+which. A `java -cp` run against an unpacked `.class` file (no zip/jar
+layer, isolating whether class *resolution* itself is where this
+stalls, independent of jar/zip reading) is the other concrete,
+cheap-to-try lever, not yet attempted.
