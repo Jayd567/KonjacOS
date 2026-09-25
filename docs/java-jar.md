@@ -206,7 +206,88 @@ opening a class file *through* a jar/zip archive (central directory
 parsing, `ZipFile`'s own native code, or the exact `readAttributes` call
 JDK-8313765 already implicated) is where forward progress stops --
 general class loading, bytecode execution, and program I/O are all
-confirmed working. The next concrete step for `-jar` itself is
-narrower than before: focus specifically on `java.util.zip`/
-`jdk.internal.loader.URLClassPath`'s jar-reading native code path, not
-class loading in general.
+confirmed working.
+
+## Real evidence, not just guessing: `ps` shows a genuine deadlock
+
+Since `task::spawn_user` returns immediately (`run` never blocks the
+shell), the shell stays fully interactive while `java -jar` keeps
+running as a background task -- so the shell's own real `ps`/`meminfo`
+commands (no GDB needed at all, none of its overhead or timing
+distortion) can inspect the stuck process's real thread state directly,
+live, while it's stuck.
+
+First snapshot (~20s after launch):
+
+```
+ID  NAME      STATE     TICKS
+0   shell     running   571
+1   counter-a ready     571
+2   counter-b ready     571
+5   run:elf   blocked   164
+6   thread    ready     47
+```
+
+Second snapshot, the *same* boot, ~80s after launch (60s later):
+
+```
+ID  NAME      STATE     TICKS
+0   shell     running   2920
+1   counter-a ready     2920
+2   counter-b ready     2920
+5   run:elf   blocked   164
+6   thread    blocked   709
+10  thread    blocked   4
+11  thread    blocked   (~0)
+12  thread    blocked   3
+13  thread    blocked   (~0)
+14  thread    blocked   156
+15  thread    blocked   131
+16  thread    blocked   107
+17  thread    blocked   5
+```
+
+**Task 5 -- the real JVM main thread -- is frozen at exactly 164 ticks
+in both snapshots, 60 real seconds apart.** Not slow: genuinely stopped,
+while `shell`/`counter-a`/`counter-b` (the kernel's own always-running
+background demo tasks) advance normally the entire time, proving the
+scheduler itself is healthy and this is specific to the java process.
+Meanwhile the JVM keeps spawning *new* threads (task IDs 6 through 17,
+most of them real short-lived HotSpot worker/compiler/GC threads by the
+look of their low tick counts) -- and every single one of them also
+ends up `blocked`, none ever completing or being reaped. This is a
+real, growing pile-up of blocked threads with no forward progress
+anywhere in the process -- the actual shape of the "stuck" behavior
+this document spent the previous sections characterizing indirectly
+through syscall traces. A `getdents64` (syscall 217) unimplemented-
+syscall line also appeared in this run, from the disk's `hsperfdata_root`
+already existing from an earlier manual test in the same session (the
+"already exists" validation dance -- see `docs/java-version.md` --
+which this kernel still doesn't support); worth ruling out as a
+contributing factor on a genuinely fresh disk before chasing anything
+deeper.
+
+**Confirmed independent of the `getdents64`/stale-disk gap:** rerun on a
+genuinely fresh disk (`hsperfdata_root` removed first) shows the exact
+same shape, with no `getdents64` line this time at all -- task 5 frozen
+at `163` ticks in both a ~20s and a ~90s snapshot of the same boot,
+while a fresh crop of worker threads (9 of them by the second snapshot)
+all pile up `blocked` the same way. Not a contributing cause; ruled out
+cleanly.
+
+**Not yet root-caused**, but now a real, reproducible, inspectable
+target instead of an opaque hang: task 5 is blocked on *something* --
+most plausibly a real futex wait or a thread-join -- that never gets
+satisfied, while its children pile up the same way. The concrete next
+step: a GDB trace specifically watching `futex` (202) calls made *by
+task 5 specifically* (this kernel's own task IDs are stable and visible
+to a breakpoint condition on the current task) to see exactly what
+address/op it's blocked on, and whether any `FUTEX_WAKE` targeting that
+same address ever fires from another thread without successfully
+waking it -- the classic shape of a lost-wakeup bug, which if real
+would be a genuine kernel-level concurrency bug in `sys_futex`/
+`task.rs`'s wait/wake path, not a JDK issue at all. This is a
+qualitatively different, more promising kind of lead than anything
+earlier in this document: a specific, reproducible task ID stuck at a
+specific, unchanging tick count, not just "the screen stopped
+updating."

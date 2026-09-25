@@ -3420,8 +3420,22 @@ See item 44 for the matched-binary evidence and actual futex failure.
     `URLClassPath`'s native code, plausibly the exact JDK-8313765
     `readAttributes` call already implicated) -- general class loading,
     bytecode execution, and program I/O are all now confirmed working.
-    See [docs/java-jar.md](docs/java-jar.md) for the full trace
-    evidence.
+
+    Real evidence of exactly what "stuck" means, not just guessing: since
+    `run` never blocks the shell, the shell's own `ps` can inspect
+    `-jar`'s stuck process live, no GDB needed. It shows a genuine
+    deadlock: the real JVM main thread sits `blocked` at an *exact,
+    unchanging* tick count across a full 70 real seconds (confirmed
+    twice, including once on a genuinely fresh disk to rule out an
+    unrelated `getdents64` gap as a contributing cause), while HotSpot
+    keeps spawning new worker/compiler/GC threads that each run briefly
+    and also end up permanently `blocked` -- nine of them piled up by
+    the second snapshot, none ever completing or being reaped. A
+    specific, reproducible, inspectable target now: most plausibly a
+    real futex wait that never gets satisfied, possibly even a genuine
+    lost-wakeup bug in this kernel's own `sys_futex`/`task.rs` wait/wake
+    path rather than a JDK issue. See [docs/java-jar.md](docs/java-jar.md)
+    for the full trace evidence.
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.
