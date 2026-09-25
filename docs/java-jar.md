@@ -302,13 +302,54 @@ instant merely because the observation happened to land during one; the
 same steady-state pattern (several `FUTEX_WAIT_BITSET` calls cycling
 through wait/timeout/reissue) is exactly what `docs/java-version.md`
 documented for a real, *successful* `java -version` run's safepoint
-polling, before it eventually reached `exit_group`. What makes this
-worth recording as a real data point rather than noise is only the
-combination with the `ps` evidence above: those same six-plus timed
-waits, if genuinely still cycling normally, would show their owning
-tasks' tick counts slowly climbing -- and `ps` instead shows them
-frozen. The next real step remains what the `ps` evidence already
-pointed at: correlating a specific blocked task ID (not just an
-address) with its own specific pending futex call, to see directly
-whether its deadline is being checked at all, or whether a real
-`FUTEX_WAKE` for its address fires without successfully reaching it.
+polling, before it eventually reached `exit_group`.
+
+## Root-caused: a real, unsatisfied wait -- not a kernel lost-wakeup bug
+
+Answered directly with temporary, targeted instrumentation (`task.rs`'s
+`block_until`/`futex_wake`, each logging the current task's real ID,
+name, wait address and deadline to the serial console -- reverted after
+collecting evidence; near-zero overhead since it's plain `sprintln!` to
+a 16550 UART, not a GDB round-trip, so this ran the real, un-throttled
+`-jar` workload directly). One real boot, `-jar` launched, left running
+45 real seconds, serial log captured directly -- no GDB, no screendump,
+no timing distortion:
+
+* **Task 5 -- the real JVM main thread -- blocks exactly once**, on a
+  single address, with `deadline=None` (a genuine untimed wait, purely
+  for an explicit `FUTEX_WAKE`): `task 5 (run:elf) blocking on
+  addr=Some(7001c34990) deadline=None`. It never blocks again for the
+  rest of the log -- consistent with `ps`'s own frozen tick count.
+* **That exact address never appears as a `FUTEX_WAKE` target, anywhere,
+  for the rest of the run** -- 389 real wake calls happen, targeting 54
+  distinct other addresses, and `0x7001c34990` is not among them. Every
+  one of those 389 wake calls' own diagnostic snapshot of currently-
+  blocked tasks lists task 5 still waiting on that same address,
+  unchanged, from its first block to the last line of the log.
+* Meanwhile **other threads demonstrably do make real progress**: task 6,
+  for instance, cycles through 21 different wait addresses over the same
+  window, each transition implying a real wake or timeout actually
+  worked. Task 7 shows a real, correctly-functioning timed-poll loop
+  (deadlines `0xcc9`, `0xcd5`, `0xce1`, ... climbing steadily, each one
+  expiring and being reissued exactly as designed). The kernel's own
+  futex wait/wake and timed-deadline-expiry mechanisms are demonstrably
+  *not* broken in general -- dozens of real wakes and timed expiries
+  happen correctly throughout this exact run.
+
+**This rules out a general kernel-level lost-wakeup bug.** The
+mechanism works; nothing ever calls `FUTEX_WAKE` for task 5's specific
+address. That means either (a) real HotSpot code elsewhere is supposed
+to call it and never reaches that call -- itself stuck earlier, on
+something this same investigation hasn't traced back to yet, possibly
+several threads upstream -- or (b) this kernel's `clone`/thread-creation
+path fails to set up the *shared* condition correctly for whichever
+real synchronization primitive this is (a `pthread_join`, a HotSpot
+`Monitor`/`Parker`, ...), so the "signal this address" and "wait on this
+address" halves of a real wait/notify pair end up looking at two
+different things that only coincidentally share a name in the source.
+Genuinely not established which, and not a small further step --
+tracing this to its real cause means identifying what real HotSpot
+synchronization primitive lives at that guest virtual address, which
+needs matching it against HotSpot's own real source (`src/hotspot/os/
+posix/`'s `Parker`/`PlatformMonitor`, most likely) rather than anything
+further this kernel's own tooling alone can resolve.

@@ -3430,12 +3430,31 @@ See item 44 for the matched-binary evidence and actual futex failure.
     unrelated `getdents64` gap as a contributing cause), while HotSpot
     keeps spawning new worker/compiler/GC threads that each run briefly
     and also end up permanently `blocked` -- nine of them piled up by
-    the second snapshot, none ever completing or being reaped. A
-    specific, reproducible, inspectable target now: most plausibly a
-    real futex wait that never gets satisfied, possibly even a genuine
-    lost-wakeup bug in this kernel's own `sys_futex`/`task.rs` wait/wake
-    path rather than a JDK issue. See [docs/java-jar.md](docs/java-jar.md)
-    for the full trace evidence.
+    the second snapshot, none ever completing or being reaped.
+
+    Root-caused further with temporary, targeted instrumentation
+    (`task.rs`'s wait/wake paths, logging real task ID/address/deadline
+    to serial, reverted after collecting evidence): the real JVM main
+    thread blocks exactly once, on one specific address, with no
+    deadline (a genuine untimed wait for an explicit `FUTEX_WAKE`) --
+    and that exact address never appears as a wake target again for the
+    rest of the run, across 389 real wake calls to 54 other addresses.
+    Every one of those 389 wakes' own snapshot of currently-blocked
+    tasks shows the main thread still waiting on that same address,
+    unchanged, start to finish. Meanwhile other threads demonstrably
+    make real progress in the same window -- one cycles through 21
+    different wait addresses, another runs a real, correctly
+    self-expiring timed-poll loop -- ruling out a general kernel-level
+    lost-wakeup bug: the wait/wake mechanism itself works, dozens of
+    times, in the same run. Something real -- either HotSpot code
+    elsewhere that's supposed to signal that address and never reaches
+    the call, or this kernel's `clone` path not correctly sharing
+    whatever real synchronization primitive lives there -- never wakes
+    it. Not yet resolved which; the next step needs matching that guest
+    address against HotSpot's own real C++ synchronization primitives
+    (`Parker`/`PlatformMonitor` in its real source), not just this
+    kernel's own tooling. See [docs/java-jar.md](docs/java-jar.md) for
+    the full evidence.
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.
