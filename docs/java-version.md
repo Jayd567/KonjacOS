@@ -1,4 +1,14 @@
-# Real `argv[1..]`, and `java -version` prints the real banner
+# Real `argv[1..]`, and a real, clean `java -version` exit
+
+**End state of this document: a real, unmodified `java -version` now
+starts, prints its real banner, runs HotSpot's real startup (including a
+real PerfData/`hsperfdata` file with real VFAT long filenames this
+session's own fixes made possible), and calls a real `exit_group` to
+terminate cleanly -- no kernel panic, no CPU exception.** The sections
+below are in the order this was actually found, including the dead ends
+and the real root cause (a filesystem bug, not a missing syscall) --
+kept because the trail is as useful as the destination for whatever
+gap `java -jar` finds next.
 
 ## The blocker
 
@@ -296,56 +306,102 @@ breakpoint on `linux_syscall_handler` (filtering for syscall numbers 83/
 81/77/73, real `mkdir`/`fchdir`/`ftruncate`/`flock`) confirms `mkdir`
 really does fire during a live `java -version` run.
 
-**Not yet established:** whether the *rest* of the chain (`fchdir`
-onward) actually runs. `mkdir` firing is confirmed; `fchdir`/`ftruncate`/
-`flock` were not observed firing in the trace windows tried so far, and a
-non-snapshotted disk check after a full run shows the directory created
-but still empty -- no per-PID file, meaning the dance is abandoned
-somewhere between `mkdir` succeeding and the file actually being created,
-not completed. Whether that's a real remaining bug in the new code above,
-or real HotSpot choosing to abandon PerfData for an unrelated reason
-(there's real precedent for this being silent and non-fatal on real Linux
-too) isn't established yet. Full syscall tracing is heavy enough here
-(each breakpoint hit costs a real GDB round-trip) that reaching this
-point in HotSpot's startup reliably within one bounded trace window has
-been inconsistent run to run -- the next real step is a longer or more
-targeted trace, not a new hypothesis.
+## The real root cause: this filesystem never wrote real VFAT long names
 
-**Not yet established (unchanged from before):** what specifically real
-HotSpot's shutdown path
-needs from this kernel that it isn't getting. A real lead, though, from
-`strace -f java -version` on the host (the same free-ground-truth
-technique every prior item in this chain has used) -- real shutdown's
-last ~20 syscalls, across several threads:
+`mkdir` firing was confirmed, but `fchdir`/`ftruncate`/`flock` never did
+in the first several trace attempts, and a non-snapshotted disk check
+after a full run showed the directory created but empty -- no per-PID
+file. Targeted GDB breakpoints (filtering `linux_syscall_handler` entry
+by syscall number, printing path/return value, far cheaper per-hit than
+the full per-syscall tracer) caught the actual sequence directly:
 
 ```
-unlink("/tmp/hsperfdata_root/<pid>")       # PerfData shared file cleanup
-futex(..., FUTEX_WAKE_PRIVATE, N)          # main thread wakes worker threads
-rt_sigprocmask(...)                        # each worker unblocks its signal mask
-gettid()
-futex(..., FUTEX_WAIT_PRIVATE, ...)        # a couple of final synchronization waits
-madvise(..., MADV_DONTNEED)
-exit(0)                                     # each worker thread, individually
-...
-exit_group(0)                               # the main thread, last
+ENTER openat  path=/tmp/hsperfdata_root flags=O_NOFOLLOW   LEAVE ret=-2 (ENOENT, doesn't exist yet)
+ENTER mkdir   path=/tmp/hsperfdata_root                    LEAVE ret=0  (created)
+ENTER openat  path=/tmp/hsperfdata_root flags=O_NOFOLLOW   LEAVE ret=-2 (ENOENT -- again!)
 ```
 
-Every one of those primitives (`futex` WAKE/WAIT, `rt_sigprocmask`,
-`gettid`, `madvise`, `exit`/`exit_group`) is already implemented here.
-What's conspicuously *absent* from the KonjacOS guest trace, though, is
-`mkdir`/`mkdirat` (real HotSpot creates `/tmp/hsperfdata_<user>/<pid>` --
-a memory-mapped shared performance-counter file `jps`/`jstat` read --
-early in startup, before any of the above): it never appears as an
-"unimplemented syscall" line on the guest console at all, meaning
-whatever code path real HotSpot takes to get to that `mkdir` either isn't
-reached the same way here, or fails differently/earlier than on real
-Linux (where a failed `mkdir` -- e.g. no writable `/tmp` -- is a
-well-known, documented, non-fatal case: PerfData just gets disabled).
-That divergence, not a single missing syscall, is the most concrete next
-thing to chase: single-step (GDB, same harness `tools/trace_jvm.py`
-already drives) through HotSpot's own `PerfMemory::create_memory_region`/
-`os::Linux::create_file_for_heap`-equivalent path on the guest and
-compare against the host trace's own timing, the same way items 36-38
-tracked down the `strtold`/`abort` misdiagnosis. `-version`'s own required
-output is real and confirmed; a clean process exit, and therefore a full
-`java -jar` run to completion, is closer but not yet demonstrated.
+`mkdir` genuinely succeeds, and the *very next* `openat` on that exact
+same path -- the directory that call just created -- fails with `ENOENT`
+as if it still didn't exist. That's the real bug, not a missing syscall:
+`fat16.rs`'s own module docs already flagged this gap honestly ("every
+write always targets an already-existing short-name entry, never
+allocating new LFN entries of its own"). `create_dir`/`write_file` only
+ever wrote the plain 8.3-truncated short entry -- `hsperfdata_root` (15
+characters, no dot) truncates to `HSPERFDA`, no extension. A subsequent
+lookup by the *real* name, `hsperfdata_root`, compares against that
+short entry's reconstructed name (`HSPERFDA`, no LFN entries to
+reconstruct a long name from) and finds no match at all: a real, silent
+"created it, then immediately couldn't find it again," not something
+HotSpot could ever route around.
+
+Fixed with real VFAT long-filename **writing** (`fat16.rs`), the
+missing half of item 34's own long-filename **reading** support:
+
+* `short_name_checksum` -- the real VFAT checksum of an 8.3 short name,
+  stored in every LFN entry that precedes it, standard algorithm.
+* `needs_lfn` -- true whenever a name's own short-entry rendering
+  wouldn't reproduce it exactly (longer than fits 8.3, a case difference,
+  ...).
+* `build_lfn_entries` -- the real, on-disk-ordered sequence of 32-byte
+  LFN entries for a long name (13 UTF-16 code units each, checksummed,
+  reversed into real on-disk order -- highest sequence number, the last
+  part of the name, physically first), the direct inverse of
+  `decode_lfn_chars`/`reconstruct_long_name`, which only ever had to
+  read this shape before now.
+* `locate_slot_run` -- finds `N` consecutive free/deleted directory
+  slots (extending the directory with a fresh cluster if needed, same
+  rule `locate_slot` already follows), since a real LFN write needs
+  several *physically contiguous* entries, not the one slot
+  `locate_slot` finds.
+* `create_dir` and `write_file` both use these now: a name that needs
+  LFN entries gets them; a name that already fits 8.3 keeps the exact
+  same single-entry write as before (no behavior change for every
+  existing short-named file this driver has ever written).
+
+**Verified independently, not just by this driver's own logic agreeing
+with itself:** `mdir`/`mcopy` (real, unmodified `mtools`, a real
+third-party VFAT implementation) lists the created directory as
+`HSPERFDA … hsperfdata_root` -- reading back the real long name from
+real on-disk LFN entries this driver wrote. `run hello.exe` and
+`java -version`'s own banner are both unchanged.
+
+## Result: a real, clean `exit_group`
+
+With the LFN fix, a live GDB-traced `java -version` run shows the *entire*
+`hsperfdata` dance completing for the first time -- `mkdir` → `openat`
+*succeeds* (previously the point of failure) → `openat(".")` →
+`fchdir` → `openat(O_CREAT)` the per-PID file → `fchdir` back → `flock`
+→ `ftruncate(0, then 0x8000)` -- exactly matching the real host trace,
+including the exact byte count (32768). Confirmed directly against a
+non-snapshotted disk image too: `mdir` shows a real 32,768-byte file
+named after the PID inside the real `hsperfdata_root` directory.
+
+That, in turn, exposed the next and -- it turned out -- final real gap:
+`unlink` (syscall 87), real HotSpot's own PerfData cleanup at shutdown,
+had never been implemented at all. Added (`sys_unlink`/`sys_unlinkat`
+onto the existing `fat16::remove_file`), and a GDB trace watching for
+`exit`/`exit_group` directly (not inferred from console silence) shows:
+
+```
+ENTER mkdir
+ENTER fchdir
+ENTER fchdir
+ENTER exit          (a worker thread)
+ENTER exit          (a worker thread)
+ENTER unlink        (real PerfData cleanup)
+ENTER exit          (a worker thread)
+ENTER exit_group    (the main thread -- real, clean process termination)
+```
+
+**`exit_group` fires.** This is a real, clean, complete `java -version`
+run end to end -- real `openjdk version "21.0.10"` banner, real HotSpot
+startup including its PerfData subsystem, real per-thread shutdown, and
+a real process exit -- with no kernel panic and no CPU exception,
+confirmed both on-screen and via direct GDB observation of the syscall
+that actually ends a process. This is the exact milestone the roadmap's
+item 1 named as unverified, now genuinely closed for `-version`. What's
+still open: whether a *heavier* run -- `java -jar` executing real
+bytecode, not just printing a banner and exiting -- surfaces further
+gaps (class loading, JIT compilation, a real socket for the attach
+listener, ...) is unexplored territory, not yet attempted.

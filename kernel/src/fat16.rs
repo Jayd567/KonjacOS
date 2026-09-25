@@ -756,6 +756,182 @@ fn zero_cluster(l: Layout, cluster: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The real VFAT checksum of an 8.3 short name -- stored in every LFN
+/// entry that precedes it (byte 13), so a reader can tell a set of LFN
+/// entries actually belongs to the short entry immediately following
+/// them rather than some unrelated, coincidentally-adjacent one. Standard
+/// algorithm (every real VFAT implementation, including this project's
+/// own `mtools`-built disk images, computes it exactly this way) --
+/// found nowhere else in this driver before now because reading never
+/// needed to verify it, only writing needs to produce a real, correct
+/// one.
+fn short_name_checksum(short: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in short {
+        sum = (sum >> 1).wrapping_add(if sum & 1 != 0 { 0x80 } else { 0 }).wrapping_add(b);
+    }
+    sum
+}
+
+/// Whether `display` needs real LFN entries to be found again by its own
+/// name -- true whenever the plain 8.3 short entry `short` decodes back
+/// to (a real transformation the short name is a real function of the
+/// long one for) doesn't reproduce `display` exactly. This is the actual
+/// bug real `java -version`'s own `mkdir("/tmp/hsperfdata_root")`
+/// exposed: `create_dir`/`write_file` wrote only the truncated 8.3 entry
+/// (`HSPERFDA`, no extension) before this, so a subsequent real
+/// `openat("/tmp/hsperfdata_root", ...)` -- looked up by the real, full
+/// name, not the truncated one -- got a real `ENOENT` immediately after
+/// the `mkdir` that just created it, even though the directory
+/// genuinely existed. See `docs/java-version.md` for the full trace
+/// evidence.
+fn needs_lfn(display: &str, short: &[u8; 11]) -> bool {
+    let base = core::str::from_utf8(&short[0..8]).unwrap_or("").trim_end();
+    let ext = core::str::from_utf8(&short[8..11]).unwrap_or("").trim_end();
+    // `alloc::format!` links fine syntactically but fails at *link* time
+    // under this kernel's stable-toolchain/panic=abort setup (see
+    // README.md's own toolchain notes: "undefined symbol: _Unwind_Resume")
+    // -- plain `String`/`push_str` avoids it, same workaround `cfile.rs`
+    // and `apex.rs` already use.
+    let mut rebuilt = String::from(base);
+    if !ext.is_empty() {
+        rebuilt.push('.');
+        rebuilt.push_str(ext);
+    }
+    !rebuilt.eq_ignore_ascii_case(display)
+}
+
+/// Builds the real, on-disk-ordered sequence of VFAT LFN entries for
+/// `display`, checksummed against the real 8.3 `short` entry they'll
+/// precede -- see [`short_name_checksum`]. On-disk order is the physical
+/// order [`list_dir_at`]'s own LFN reassembly already expects (see its
+/// doc comment): highest sequence number (the entry holding the *last*
+/// part of the name, `0x40`-flagged) first, working down to sequence 1
+/// immediately before the short entry. Each entry holds 13 UTF-16 code
+/// units (5+6+2, the real on-disk field split -- see
+/// [`decode_lfn_chars`]'s doc comment for the read-side mirror of this
+/// layout); a name that doesn't exactly fill its last entry gets a
+/// `0x0000` terminator immediately after its final real character, then
+/// `0xFFFF` padding for whatever's left, matching real VFAT's own
+/// padding convention. Only the Basic Multilingual Plane, one code unit
+/// per character -- the same real, honest limitation
+/// [`reconstruct_long_name`]'s own doc comment already states for
+/// reading; nothing this driver has ever needed to write has been
+/// outside it.
+fn build_lfn_entries(display: &str, short: &[u8; 11]) -> Vec<[u8; 32]> {
+    let checksum = short_name_checksum(short);
+    let chars: Vec<u16> = display.encode_utf16().collect();
+    let entry_count = chars.len().div_ceil(13).max(1);
+    let mut entries = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let seq = (i + 1) as u8;
+        let start = i * 13;
+        let mut slots = [0xFFFFu16; 13];
+        for (j, slot) in slots.iter_mut().enumerate() {
+            let pos = start + j;
+            if pos < chars.len() {
+                *slot = chars[pos];
+            } else if pos == chars.len() {
+                *slot = 0x0000;
+            }
+        }
+        let mut entry = [0u8; 32];
+        entry[0] = if i == entry_count - 1 { seq | 0x40 } else { seq };
+        for k in 0..5 {
+            entry[1 + k * 2..3 + k * 2].copy_from_slice(&slots[k].to_le_bytes());
+        }
+        entry[11] = ATTR_LFN;
+        entry[12] = 0;
+        entry[13] = checksum;
+        for k in 0..6 {
+            entry[14 + k * 2..16 + k * 2].copy_from_slice(&slots[5 + k].to_le_bytes());
+        }
+        entry[26] = 0;
+        entry[27] = 0;
+        for k in 0..2 {
+            entry[28 + k * 2..30 + k * 2].copy_from_slice(&slots[11 + k].to_le_bytes());
+        }
+        entries.push(entry);
+    }
+    entries.reverse(); // Disk order: highest sequence (last part of the name) first.
+    entries
+}
+
+/// Finds `count` consecutive available (free or deleted) directory-entry
+/// slots, extending the directory with a fresh cluster if the ones seen
+/// so far run out before `count` is reached (same "root can't grow, a
+/// subdirectory can" rule [`locate_slot`] already follows, and an error
+/// for the same reason if `location` is the root). What a real LFN write
+/// needs that a single-slot [`locate_slot`] can't provide: `count - 1`
+/// LFN entries immediately followed by the real 8.3 entry, physically
+/// contiguous in on-disk scan order -- a reader (this driver's own
+/// [`list_dir_at`] included) accumulates LFN parts by scanning entries in
+/// that order and expects the short entry to follow with nothing else
+/// interleaved.
+fn locate_slot_run(l: Layout, location: DirLocation, count: usize) -> Result<Vec<(u32, usize)>, &'static str> {
+    let mut run: Vec<(u32, usize)> = Vec::new();
+    let mut cluster = match location {
+        DirLocation::Root => None,
+        DirLocation::Cluster(c) => Some(c),
+    };
+
+    loop {
+        let sector_range: Vec<u32> = match (location, cluster) {
+            (DirLocation::Root, _) => (0..l.root_dir_sectors).map(|i| l.root_dir_start_lba + i).collect(),
+            (DirLocation::Cluster(_), Some(c)) => (0..l.sectors_per_cluster).map(|s| cluster_to_lba(l, c) + s).collect(),
+            (DirLocation::Cluster(_), None) => Vec::new(),
+        };
+
+        for lba in sector_range {
+            let buf = read_sector(lba)?;
+            for (idx, chunk) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
+                let offset = idx * DIR_ENTRY_SIZE;
+                if chunk[0] == ENTRY_FREE || chunk[0] == ENTRY_DELETED {
+                    run.push((lba, offset));
+                    if run.len() == count {
+                        return Ok(run);
+                    }
+                } else {
+                    run.clear(); // A live entry breaks any run in progress.
+                }
+            }
+        }
+
+        match location {
+            DirLocation::Root => return Err("root directory is full"),
+            DirLocation::Cluster(_) => {
+                let last = cluster.expect("Cluster(_) location always has Some(cluster) here");
+                let new_cluster = allocate_cluster(l)?;
+                set_fat_entry(l, last, new_cluster as u16)?;
+                zero_cluster(l, new_cluster)?;
+                cluster = Some(new_cluster);
+                // Loop again: the whole fresh cluster's slots are all
+                // genuinely free now, easily enough to finish any run.
+            }
+        }
+    }
+}
+
+/// Writes `entries` (already in on-disk order) into consecutive slots
+/// starting at `run[0]`, then the real 8.3 `short_entry` bytes into
+/// `run[entries.len()]` -- the last slot [`locate_slot_run`] found.
+/// Shared by [`create_dir`] and [`write_file`], the two real callers that
+/// need a name written out with real LFN entries when it doesn't fit 8.3.
+fn write_named_entry(l: Layout, run: &[(u32, usize)], lfn_entries: &[[u8; 32]], short_entry: &[u8; 32]) -> Result<(), &'static str> {
+    for (i, lfn) in lfn_entries.iter().enumerate() {
+        let (lba, offset) = run[i];
+        let mut sector_buf = read_sector(lba)?;
+        sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(lfn);
+        write_sector(lba, &sector_buf)?;
+    }
+    let (lba, offset) = run[lfn_entries.len()];
+    let mut sector_buf = read_sector(lba)?;
+    sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(short_entry);
+    write_sector(lba, &sector_buf)?;
+    let _ = l;
+    Ok(())
+}
+
 /// Finds where a directory entry named `target` (an already-8.3-formatted
 /// name) either already lives, or should be written: an exact name match
 /// (for overwriting), a deleted/free slot (for a new entry), or -- for a
@@ -893,9 +1069,22 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
     entry[27] = ((first_cluster >> 8) & 0xFF) as u8;
     entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
 
-    let mut sector_buf = read_sector(lba)?;
-    sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
-    write_sector(lba, &sector_buf)?;
+    // Overwriting an existing entry reuses its exact slot (and whatever
+    // LFN entries -- correct or not, see needs_lfn's own doc comment for
+    // this narrow scope's one known gap -- already precede it) unchanged.
+    // A genuinely new entry gets real LFN entries first when its name
+    // doesn't fit 8.3 -- seebuild_lfn_entries'/needs_lfn's own doc
+    // comments for why this matters: without them, a real caller that
+    // wrote a long name here could never find it again by that name.
+    if existing.is_some() || !needs_lfn(filename, &target) {
+        let mut sector_buf = read_sector(lba)?;
+        sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
+        write_sector(lba, &sector_buf)?;
+    } else {
+        let lfn_entries = build_lfn_entries(filename, &target);
+        let run = locate_slot_run(l, dir_location, lfn_entries.len() + 1)?;
+        write_named_entry(l, &run, &lfn_entries, &entry)?;
+    }
 
     Ok(())
 }
@@ -968,9 +1157,21 @@ pub fn create_dir(path: &str) -> Result<(), &'static str> {
     // report a directory's own size as 0, same as this driver's readers
     // (decode_entry) already assume.
 
-    let mut sector_buf = read_sector(lba)?;
-    sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
-    write_sector(lba, &sector_buf)?;
+    // Real LFN entries first when `dirname` doesn't fit 8.3 -- see
+    // `needs_lfn`/`build_lfn_entries`'s own doc comments for why this
+    // matters: real `java -version`'s own `mkdir("/tmp/hsperfdata_root")`
+    // is exactly the real case that exposed this (see
+    // docs/java-version.md) -- without this, the directory this call
+    // just created could never be found again by its own real name.
+    if !needs_lfn(dirname, &target) {
+        let mut sector_buf = read_sector(lba)?;
+        sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
+        write_sector(lba, &sector_buf)?;
+    } else {
+        let lfn_entries = build_lfn_entries(dirname, &target);
+        let run = locate_slot_run(l, dir_location, lfn_entries.len() + 1)?;
+        write_named_entry(l, &run, &lfn_entries, &entry)?;
+    }
 
     Ok(())
 }

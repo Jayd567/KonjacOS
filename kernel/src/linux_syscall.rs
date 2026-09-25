@@ -81,6 +81,8 @@ const SYS_WRITE: u64 = 1;
 const SYS_PREAD64: u64 = 17;
 const SYS_OPEN: u64 = 2;
 const SYS_MKDIR: u64 = 83;
+const SYS_UNLINK: u64 = 87;
+const SYS_UNLINKAT: u64 = 263;
 const SYS_MKDIRAT: u64 = 258;
 const SYS_FLOCK: u64 = 73;
 const SYS_FCHDIR: u64 = 81;
@@ -300,6 +302,13 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // SYS_OPENAT reusing sys_open above -- every path this kernel has
         // ever been asked to create has been absolute.
         SYS_MKDIRAT => sys_mkdir(a1),
+        SYS_UNLINK => sys_unlink(a0),
+        // unlinkat(dirfd, path, flags): dirfd ignored, same precedent as
+        // openat/mkdirat above -- every path here has been absolute.
+        // AT_REMOVEDIR (flag 0x200) would mean "this is really an rmdir"
+        // on real Linux; not observed here, and fat16::remove_file
+        // already honestly refuses a directory target regardless.
+        SYS_UNLINKAT => sys_unlink(a1),
         // flock: advisory, cooperative locking against *other processes*
         // -- there's never a second process here to contend with, so
         // accepting it as a no-op is honest, not a shortcut around real
@@ -877,6 +886,22 @@ fn sys_mkdir(path_ptr: u64) -> i64 {
     match fat16::create_dir(&path) {
         Ok(()) => 0,
         Err("already exists") => EEXIST,
+        Err(_) => ENOENT,
+    }
+}
+
+/// Real Linux `unlink(2)`, onto `fat16::remove_file`. Real HotSpot calls
+/// this at real shutdown, on its own `hsperfdata` PerfData file (see
+/// `docs/java-version.md`) -- observed for the first time only once the
+/// rest of that file's own real creation dance (`mkdir`/`fchdir`/
+/// `ftruncate`/...) started succeeding rather than being silently
+/// abandoned partway through.
+fn sys_unlink(path_ptr: u64) -> i64 {
+    let Some(path) = read_c_string(path_ptr) else {
+        return EINVAL;
+    };
+    match fat16::remove_file(&path) {
+        Ok(()) => 0,
         Err(_) => ENOENT,
     }
 }

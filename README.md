@@ -55,10 +55,15 @@ that); update it as steps complete or the plan changes.
    config placement as the next thing to check. Item 52 closes that out --
    real `argv[1..]` for spawned programs plus a full disk JDK/glibc
    placement -- and `java -version` now prints the real, correct banner
-   with no kernel panic. HotSpot's own clean shutdown (a real `exit_group`)
-   is still unconfirmed; see item 52's own entry for the syscalls that
-   still block it. Follow actual launch failures toward a full `java -jar`
-   run, then Minecraft.
+   with no kernel panic. Item 53 finds and fixes the real remaining
+   blocker -- this filesystem never wrote real VFAT long filenames, so a
+   freshly created file/directory with a name over 8.3 could never be
+   found again by its real name -- and with that fixed, `java -version`
+   now reaches a real, clean `exit_group`: genuine end-to-end success,
+   confirmed by direct GDB observation of the syscall that actually
+   terminates a process, not just console silence. Follow actual launch
+   failures toward a full `java -jar` run (real bytecode execution, not
+   just a banner), then Minecraft.
 2. **A minimal loopback-only TCP/IP stack.** Even *singleplayer*
    Minecraft opens a real local socket (its internal integrated server).
    No real NIC or internet access is needed for this -- just real
@@ -3306,6 +3311,56 @@ See item 44 for the matched-binary evidence and actual futex failure.
     succeeding now, not necessarily meaning less time left before it
     finishes. See [staging steps, the argv fix, the ten new syscalls and
     full evidence](docs/java-version.md).
+
+53. **The real root cause, found and fixed: this filesystem never wrote
+    real VFAT long filenames, so `java -version` now reaches a real,
+    clean `exit_group`.** Targeted GDB breakpoints (filtering
+    `linux_syscall_handler` entry by syscall number -- far cheaper per
+    hit than tracing every syscall) caught the real sequence directly:
+    `mkdir("/tmp/hsperfdata_root")` returns `0` (success), and the *very
+    next* `openat` on that exact same path returns `ENOENT` -- as if the
+    directory it just created didn't exist. Real bug, not a missing
+    syscall: `fat16.rs`'s own module docs already named this gap
+    ("every write always targets an already-existing short-name entry,
+    never allocating new LFN entries of its own"). `create_dir`/
+    `write_file` only ever wrote the plain 8.3-truncated short entry --
+    `hsperfdata_root` (15 characters) truncates to `HSPERFDA`, no
+    extension -- so a lookup by the real name found nothing at all.
+
+    Fixed with real VFAT long-filename *writing* (`fat16.rs`), the
+    missing half of item 34's own long-filename *reading* support: a
+    real VFAT short-name checksum, real on-disk-ordered LFN entries (13
+    UTF-16 code units each, the direct inverse of the existing LFN
+    *decoder*), and a new `locate_slot_run` finding the several
+    physically contiguous directory slots a real LFN write needs (not
+    the one slot the existing single-entry `locate_slot` finds,
+    extending the directory with a fresh cluster the same way it
+    already does). `create_dir`/`write_file` both use it now; any name
+    that already fits 8.3 keeps the exact same single-entry write as
+    before. Verified independently of this driver's own logic: real
+    `mtools` (`mdir`/`mcopy`, a real third-party VFAT implementation)
+    reads the real long name (`hsperfdata_root`) back off the real
+    on-disk LFN entries this driver wrote.
+
+    With that fixed, a live GDB-traced run shows the *entire*
+    `hsperfdata` dance completing for the first time -- `mkdir` →
+    `openat` *succeeds* (previously the failure point) → `fchdir` →
+    create the per-PID file → `flock` → `ftruncate(0x8000)` -- matching
+    the real host trace exactly, down to the byte count, confirmed
+    directly against a non-snapshotted disk image (`mdir` shows a real
+    32,768-byte file where the trace says one should be). That exposed
+    one final real gap -- `unlink` (real PerfData cleanup at shutdown),
+    never implemented at all -- fixed the same way (`sys_unlink`/
+    `sys_unlinkat` onto the existing `fat16::remove_file`). A GDB trace
+    watching directly for `exit`/`exit_group` (not inferred from console
+    silence) then shows: `mkdir` → `fchdir` ×2 → `exit` (worker
+    threads) → `unlink` → `exit` → **`exit_group`** -- a real, clean
+    process termination. No kernel panic, no CPU exception. This is the
+    exact milestone item 1's roadmap named as unverified, now genuinely
+    closed for `-version`. Whether a heavier `java -jar` run (real
+    bytecode execution, not just a banner) surfaces further gaps is
+    unexplored. See [the full trace evidence and fix
+    details](docs/java-version.md).
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.
