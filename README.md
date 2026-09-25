@@ -3285,9 +3285,26 @@ See item 44 for the matched-binary evidence and actual futex failure.
     `exit`/`exit_group`) -- all already implemented here -- and one
     conspicuous absence from the guest trace: `mkdir`/`mkdirat` never
     appears at all, even though real HotSpot creates a
-    `/tmp/hsperfdata_<user>/<pid>` PerfData file early in startup. That
-    divergence, not one missing syscall, is the concrete next thing to
-    chase. See [staging steps, the argv fix, the eight new syscalls and
+    `/tmp/hsperfdata_<user>/<pid>` PerfData file early in startup.
+
+    Confirmed cheaply before writing any kernel code: adding a minimal
+    `/etc/passwd` directly to `disk.img` (no kernel change) made `mkdir`
+    (`83`) appear as "unimplemented" for the first time -- real proof
+    glibc's `getpwuid()` (needed to build the real `hsperfdata_<user>`
+    directory name) was the actual earlier, silent failure point. Real
+    `mkdir(2)`/`mkdirat(2)` are now implemented (`linux_syscall.rs`, onto
+    a new `fat16::create_dir` -- this driver had directory *reading*
+    since item 34 but never directory *creation*: allocates a cluster,
+    writes real `.`/`..` entries, adds one `ATTR_DIRECTORY` entry in the
+    parent). `mkdir` no longer shows as unimplemented at all, and a
+    syscall-traced run afterward shows real further progress: eight
+    pending futex waits instead of three, several with genuinely deep
+    HotSpot call stacks (compiler-broker/class-loading frames, not the
+    previous shallow safepoint loop) and at least one real `FUTEX_WAKE`
+    actually waking a waiter. Still no observed `exit_group` in the
+    windows tried -- more of HotSpot's own startup is genuinely
+    succeeding now, not necessarily meaning less time left before it
+    finishes. See [staging steps, the argv fix, the ten new syscalls and
     full evidence](docs/java-version.md).
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all

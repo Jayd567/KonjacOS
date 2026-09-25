@@ -79,6 +79,8 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_PREAD64: u64 = 17;
 const SYS_OPEN: u64 = 2;
+const SYS_MKDIR: u64 = 83;
+const SYS_MKDIRAT: u64 = 258;
 const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_MMAP: u64 = 9;
@@ -167,6 +169,7 @@ const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ETIMEDOUT: i64 = -110;
 const ENOENT: i64 = -2;
+const EEXIST: i64 = -17;
 
 // Real Linux RLIMIT_* resource numbers sys_prlimit64 actually special-cases
 // below -- see its own doc comment.
@@ -279,6 +282,11 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // reuses it outright rather than duplicating its body.
         SYS_OPENAT => sys_open(a1),
         SYS_NEWFSTATAT => sys_newfstatat(a1, a2),
+        SYS_MKDIR => sys_mkdir(a0),
+        // mkdirat(dirfd, path, mode): dirfd ignored, same precedent as
+        // SYS_OPENAT reusing sys_open above -- every path this kernel has
+        // ever been asked to create has been absolute.
+        SYS_MKDIRAT => sys_mkdir(a1),
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         SYS_NANOSLEEP => sys_clock_nanosleep(CLOCK_MONOTONIC, 0, a0),
         SYS_SCHED_YIELD => { task::yield_now(); 0 },
@@ -764,6 +772,25 @@ fn sys_open(path_ptr: u64) -> i64 {
             }
             None => EBADF, // every fd slot is in use -- a real ENFILE/EMFILE would be more accurate, but EBADF is already this module's established "ran out of fd-table-shaped resources" answer (see sys_close).
         }),
+        Err(_) => ENOENT,
+    }
+}
+
+/// Real Linux `mkdir(2)`. `mode` (the second argument) is read but not
+/// consulted -- same reasoning `sys_open`'s own flags/mode doc comment
+/// already gives: this kernel has no real permission model for a mode
+/// bit to mean anything against (see `sys_prlimit64`/uid-syscalls' own
+/// doc comments for the same point made elsewhere in this module).
+/// Onto `fat16::create_dir` -- see its own doc comment for the real,
+/// ground-truthed reason this exists: a real `java -version` calls this
+/// for its own `/tmp/hsperfdata_<user>` PerfData directory.
+fn sys_mkdir(path_ptr: u64) -> i64 {
+    let Some(path) = read_c_string(path_ptr) else {
+        return EINVAL;
+    };
+    match fat16::create_dir(&path) {
+        Ok(()) => 0,
+        Err("already exists") => EEXIST,
         Err(_) => ENOENT,
     }
 }

@@ -900,6 +900,81 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Creates an empty subdirectory at `path`: allocates one cluster, zero-
+/// fills it, writes real `.`/`..` entries into it (pointing at itself and
+/// its parent -- `..`'s cluster field is `0` when the parent is the root,
+/// the same special-case every other reader here already gives the root
+/// directory, since FAT16's root has no cluster number of its own to
+/// give), then adds one `ATTR_DIRECTORY` entry for it in the parent. The
+/// parent directory in `path` must already exist -- same "no recursive
+/// creation" scope `write_file` already has for a file's parent.
+/// Real Linux ground truth for why this exists at all: a real,
+/// unmodified `java -version` calls `mkdir` for its own
+/// `/tmp/hsperfdata_<user>` PerfData directory (see docs/java-version.md)
+/// -- previously always `-ENOSYS` because this driver had no directory-
+/// creation path whatsoever, file writing (item 5) having only ever
+/// needed to place new entries in a directory that already existed.
+pub fn create_dir(path: &str) -> Result<(), &'static str> {
+    let l = layout()?;
+    let (dir_part, dirname) = split_path(path);
+    if dirname.is_empty() {
+        return Err("not a directory name");
+    }
+    let dir_location = resolve_dir(dir_part)?;
+    let target = to_short_name(dirname);
+
+    let (lba, offset, existing) = locate_slot(l, dir_location, &target)?;
+    if existing.is_some() {
+        return Err("already exists");
+    }
+
+    let new_cluster = allocate_cluster(l)?;
+    zero_cluster(l, new_cluster)?;
+
+    let parent_cluster = match dir_location {
+        DirLocation::Root => 0,
+        DirLocation::Cluster(c) => c,
+    };
+    let mut dot_sector = [0u8; SECTOR_SIZE];
+    let mut dot_entry = [0u8; DIR_ENTRY_SIZE];
+    dot_entry[0] = b'.';
+    for b in &mut dot_entry[1..11] {
+        *b = b' ';
+    }
+    dot_entry[11] = ATTR_DIRECTORY;
+    dot_entry[26] = (new_cluster & 0xFF) as u8;
+    dot_entry[27] = ((new_cluster >> 8) & 0xFF) as u8;
+    dot_sector[0..DIR_ENTRY_SIZE].copy_from_slice(&dot_entry);
+
+    let mut dotdot_entry = [0u8; DIR_ENTRY_SIZE];
+    dotdot_entry[0] = b'.';
+    dotdot_entry[1] = b'.';
+    for b in &mut dotdot_entry[2..11] {
+        *b = b' ';
+    }
+    dotdot_entry[11] = ATTR_DIRECTORY;
+    dotdot_entry[26] = (parent_cluster & 0xFF) as u8;
+    dotdot_entry[27] = ((parent_cluster >> 8) & 0xFF) as u8;
+    dot_sector[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot_entry);
+
+    write_sector(cluster_to_lba(l, new_cluster), &dot_sector)?;
+
+    let mut entry = [0u8; DIR_ENTRY_SIZE];
+    entry[0..11].copy_from_slice(&target);
+    entry[11] = ATTR_DIRECTORY;
+    entry[26] = (new_cluster & 0xFF) as u8;
+    entry[27] = ((new_cluster >> 8) & 0xFF) as u8;
+    // entry[28..32] (size) stays 0 -- real FAT16 directory entries always
+    // report a directory's own size as 0, same as this driver's readers
+    // (decode_entry) already assume.
+
+    let mut sector_buf = read_sector(lba)?;
+    sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
+    write_sector(lba, &sector_buf)?;
+
+    Ok(())
+}
+
 /// Deletes a file at `path`: frees its cluster chain and marks its
 /// directory entry deleted. Directories aren't supported (there's no
 /// `rmdir` here, deliberately -- removing a non-empty directory safely

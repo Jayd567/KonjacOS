@@ -39,6 +39,12 @@ mmd -i disk.img ::/lib64 ::/lib ::/lib/x86_64-linux-gnu
 mcopy -i disk.img /lib64/ld-linux-x86-64.so.2 ::/lib64/
 mcopy -i disk.img /lib/x86_64-linux-gnu/{libc.so.6,libz.so.1,libstdc++.so.6,libm.so.6,libgcc_s.so.1} \
   ::/lib/x86_64-linux-gnu/
+
+# /etc/passwd (needed for glibc's own getpwuid() -- see "Confirming the
+# lead" below) and an empty /tmp for HotSpot's PerfData directory
+mmd -i disk.img ::/etc ::/tmp
+echo "root:x:0:0:root:/root:/bin/sh" > /tmp/passwd_stage
+mcopy -i disk.img /tmp/passwd_stage ::/etc/passwd
 ```
 
 `jmods`/`legal`/`man`/`include`/`docs` are excluded -- 81 MiB of module
@@ -184,6 +190,44 @@ not a hang this kernel is directly causing -- but real `java -version` on
 real Linux reaches `JNI_DestroyJavaVM` and tears these threads down
 within milliseconds of printing the banner, and this kernel's guest never
 gets there within a 60-second observation window.
+
+## Confirming the lead: `/etc/passwd`, `mkdir`, and real further progress
+
+The `mkdir`/`hsperfdata` divergence above was a real, testable hypothesis,
+not just a plausible-sounding guess -- confirmed cheaply, in two steps,
+*before* writing any kernel code:
+
+1. Added a minimal `/etc/passwd` (`root:x:0:0:root:/root:/bin/sh`) and an
+   empty `/tmp` directory directly to `disk.img` via `mmd`/`mcopy` (no
+   kernel change at all). Re-running the exact same `java -version` trace
+   immediately surfaced a *new* unimplemented-syscall line that had never
+   appeared before: `83` (`mkdir`, `a1=0x1ed` i.e. mode `0755`) --
+   confirming glibc's `getpwuid()` (needed to build the real
+   `hsperfdata_<user>` directory name) really was the earlier, silent
+   failure point, exactly as the host `strace` evidence suggested.
+
+2. Implemented real `mkdir(2)`/`mkdirat(2)` (`linux_syscall.rs`, onto a
+   new `fat16::create_dir`): allocates one cluster, zero-fills it, writes
+   real `.`/`..` entries (this driver had directory *reading* since item
+   34 but never directory *creation* -- file writing, item 5, only ever
+   needed to place an entry in a directory that already existed), then
+   adds one `ATTR_DIRECTORY` entry in the parent. `mkdirat`'s `dirfd` is
+   ignored, same precedent `openat` already set: every path asked for
+   here has been absolute.
+
+With both, `mkdir` no longer appears as "unimplemented" at all -- it
+genuinely succeeds. And the effect goes well past that one call: a
+syscall-traced run afterward shows **eight** pending futex waits instead
+of the previous run's three, several with real, deep HotSpot call stacks
+(compiler-broker/class-loading frames, not just the shallow safepoint
+loop from before) and at least one real `FUTEX_WAKE` actually waking a
+waiter (`ret: 1`) -- concrete evidence of more of HotSpot's own thread
+pool genuinely starting up and synchronizing, not just retrying the same
+three waits forever. `-version`'s own visible output is unaffected (same
+real banner); `run hello.exe` is unaffected. Still no observed
+`exit_group` within the trace windows tried so far -- the process is
+doing more real, further-along work now, not necessarily less time from
+finishing it.
 
 **Not yet established:** what specifically real HotSpot's shutdown path
 needs from this kernel that it isn't getting. A real lead, though, from
