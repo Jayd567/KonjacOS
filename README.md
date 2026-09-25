@@ -3362,6 +3362,30 @@ See item 44 for the matched-binary evidence and actual futex failure.
     unexplored. See [the full trace evidence and fix
     details](docs/java-version.md).
 
+54. **Toward `java -jar`: `statx` implemented, the real next blocker.**
+    With `java -version` reaching a clean exit (item 53), the natural
+    next test is a `java -jar` run that actually loads and executes
+    bytecode, not just prints a banner -- a minimal `Hello.java`,
+    compiled and jarred with this same machine's own real `javac`/`jar`,
+    copied onto the guest disk. `run java -jar /hello.jar world`
+    immediately failed with `Error: An unexpected error occurred while
+    trying to open file /hello.jar`, preceded by `unimplemented syscall
+    number 332` (`statx`) -- unlike `-version`, `-jar` needs to stat a
+    user-supplied file by path before opening it as a zip, and glibc's
+    own zip-checking code calls `statx` directly rather than falling
+    back to `newfstatat`. Implemented (`sys_statx`, the same honest
+    `write_stat`-matching subset of the real 256-byte `struct statx`,
+    `stx_mask` reported to match exactly what's actually filled in).
+    `run hello.exe` unaffected. With `statx` answered, the same error
+    still occurs with no unimplemented-syscall line at all -- a GDB
+    trace shows `/hello.jar` opened and its real ZIP End-Of-Central-
+    Directory record found and read correctly (`lseek(-22, SEEK_END)`
+    landing exactly at the file's real size minus 22), so whatever's
+    actually failing now returns a value this kernel considers valid
+    but Java doesn't, further into the real `-jar` open path than
+    `statx` alone. Not yet root-caused. See
+    [docs/java-jar.md](docs/java-jar.md).
+
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.
 

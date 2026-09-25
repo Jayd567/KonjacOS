@@ -83,6 +83,7 @@ const SYS_OPEN: u64 = 2;
 const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_UNLINKAT: u64 = 263;
+const SYS_STATX: u64 = 332;
 const SYS_MKDIRAT: u64 = 258;
 const SYS_FLOCK: u64 = 73;
 const SYS_FCHDIR: u64 = 81;
@@ -309,6 +310,7 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // on real Linux; not observed here, and fat16::remove_file
         // already honestly refuses a directory target regardless.
         SYS_UNLINKAT => sys_unlink(a1),
+        SYS_STATX => sys_statx(a1, a4),
         // flock: advisory, cooperative locking against *other processes*
         // -- there's never a second process here to contend with, so
         // accepting it as a no-op is honest, not a shortcut around real
@@ -1013,6 +1015,69 @@ fn sys_newfstatat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
             0
         }
         Err(_) => ENOENT,
+    }
+}
+
+/// Real Linux `statx(2)`. Found the same ground-truth way as everything
+/// else in this module: a real `java -jar` (unlike `java -version`,
+/// which never opens a user-supplied file by path) needs to stat the
+/// jar itself before opening it, and modern glibc's own zip/file-
+/// checking code (`libzip.so`'s central-directory lookup, in this case)
+/// calls `statx` directly rather than falling back to `newfstatat` even
+/// though both are available -- this kernel had nothing to answer it
+/// with at all before now, so every `java -jar` invocation failed at
+/// this exact point with "An unexpected error occurred while trying to
+/// open file". `dirfd`/`flags` are read but not consulted, same
+/// reasoning and same precedent `sys_newfstatat`'s own doc comment
+/// already gives (every path seen here is absolute, and there are no
+/// real `AT_*` semantics -- symlinks, empty-path-means-dirfd -- for a
+/// flat FAT16 volume to honor). `mask` (which fields the caller actually
+/// wants) is read but not consulted either: this always fills in the
+/// same honest subset `write_stat` already does for plain `stat`/
+/// `fstat`, and reports `stx_mask` to match -- a real caller asking for
+/// less than that gets a superset, never fields it can't trust; one
+/// asking for more (e.g. `STATX_BTIME`) honestly sees that bit absent
+/// from `stx_mask`, not a fabricated timestamp.
+fn sys_statx(path_ptr: u64, statxbuf_ptr: u64) -> i64 {
+    let Some(path) = read_c_string(path_ptr) else {
+        return EINVAL;
+    };
+    let (size, is_dir, ino) = if let Some(content) = synthetic_proc_file(&path) {
+        (content.len() as u64, false, task::hash_path(&path))
+    } else {
+        match fat16::stat_path(&path) {
+            Ok((is_dir, size)) => (size as u64, is_dir, task::hash_path(&path)),
+            Err(_) => return ENOENT,
+        }
+    };
+    write_statx(statxbuf_ptr, size, ino, is_dir);
+    0
+}
+
+const STATX_TYPE: u32 = 0x1;
+const STATX_MODE: u32 = 0x2;
+const STATX_NLINK: u32 = 0x4;
+const STATX_INO: u32 = 0x100;
+const STATX_SIZE: u32 = 0x200;
+
+/// Real Linux `struct statx`'s exact x86_64 layout, 256 bytes -- see
+/// `sys_statx`'s own doc comment for which fields this honestly fills in
+/// (the same subset `write_stat` already gives plain `stat`/`fstat`) and
+/// why `stx_mask` only claims those.
+fn write_statx(statxbuf_ptr: u64, size: u64, ino: u64, is_dir: bool) {
+    const S_IFREG: u16 = 0o100000;
+    const S_IFDIR: u16 = 0o040000;
+    let mode = (if is_dir { S_IFDIR } else { S_IFREG }) | if is_dir { 0o755 } else { 0o644 };
+    let mask = STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_INO | STATX_SIZE;
+    let mut buf = [0u8; 256];
+    buf[0..4].copy_from_slice(&mask.to_le_bytes()); // stx_mask
+    buf[4..8].copy_from_slice(&512u32.to_le_bytes()); // stx_blksize
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // stx_nlink
+    buf[28..30].copy_from_slice(&mode.to_le_bytes()); // stx_mode
+    buf[32..40].copy_from_slice(&ino.to_le_bytes()); // stx_ino
+    buf[40..48].copy_from_slice(&size.to_le_bytes()); // stx_size
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), statxbuf_ptr as *mut u8, buf.len());
     }
 }
 
