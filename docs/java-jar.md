@@ -124,36 +124,49 @@ likely the launcher's own CDS-archive-related jar check, which has its
 own independent, tolerant error handling separate from the main
 classloading path), not something that stops the JVM.
 
-## The real remaining puzzle: quiet runs don't show the same progress
+## The real remaining puzzle: stuck, not slow
 
-A *quiet* (untraced) run given a full 10 minutes of real wall-clock time
-shows the exact same, unchanging screen the entire time -- no further
-output, ever. That's the opposite of what the GDB-traced run's continued
-deep activity would predict: if that activity were genuine progress
-happening at any real, reasonable pace, ten real minutes with no
-tracing overhead should easily be enough (`java -version`'s own banner
-appears within roughly a minute of quiet real time, and it reaches full
-`exit_group` well within this session's own trace windows).
+A follow-up trace watched for both `write` *and* `writev` (syscall 20 --
+the path musl/glibc stdio actually flushes through in practice, per this
+module's own docs) directly, logging every single call to either
+regardless of content. Across a full traced run, **neither is ever
+called even once.** Combined with a quiet (untraced) run showing the
+exact same unchanging screen for a full 10 minutes: the `Error:` line
+was the *last* thing this process ever wrote to any output stream in
+every run tried, traced or not. The earlier framing ("a quiet run stalls
+but a traced run keeps progressing") was based on incomplete evidence --
+what the GDB trace actually shows is real syscall activity (genuine
+`pread64`s into `lib/modules`, reaching the same steady-state futex loop
+a successful `-version` run also passes through) *without* it ever
+translating into new console output, in either run. That's consistent
+with one simpler explanation: this specific run is genuinely stuck --
+retrying something (most plausibly, class resolution failing and being
+attempted again through JDK's module/classpath search machinery) rather
+than making forward progress toward printing this program's own
+`System.out.println` line, and no timing-sensitive race or output-path
+gap is needed to explain the earlier observations.
 
-Two explanations remain open, not yet distinguished:
+Checked directly against the existing trace data (free -- no new guest
+run needed): the `pread64` offsets into `lib/modules` are **not** a
+retry loop. 33 calls, 32 distinct offsets, spread from small values up
+past `0x1bd99e9` (~29 MB into the archive) -- real, varied reads
+consistent with genuinely loading many different classes out of the
+modules image, not the same lookup failing and retrying. That reframes
+the puzzle: this *is* real forward progress, just real progress that
+produces no console output at all until whatever eventually needs
+`PrintStream`/`System.out` (or the launcher's own completion) is
+reached -- meaning a quiet run's unchanging screen for 10 minutes isn't
+necessarily evidence of being stuck, only evidence that this specific
+window wasn't long enough. `-jar` needs strictly more class loading than
+`-version` ever does (real JVM bootstrap classes *and* this program's
+own `Hello` class, where `-version` never resolves a single application
+class) -- a proportionally longer real time to reach any output at all,
+on top of `-version`'s own already-slow real path to `exit_group`, is a
+real, plausible, unexcluded explanation on its own.
 
-* The GDB-breakpoint-slowed execution's altered timing avoids a real,
-  timing-sensitive bug (a missed wakeup, a race in this kernel's own
-  single-CPU scheduler or futex-wake path) that an unthrottled quiet run
-  hits reliably -- i.e. tracing accidentally "fixes" a real race by
-  slowing everything down enough to avoid it.
-* Something about console output itself is the actual gap (a `writev`
-  buffering/flush difference for this specific, heavier call pattern)
-  rather than JVM progress -- i.e. the process really is still working
-  underneath, but nothing further ever reaches the visible framebuffer
-  console in a quiet run specifically.
-
-**Not yet root-caused.** The next concrete step is watching `writev`
-(syscall 20, not just plain `write`) in the same targeted trace, since
-this module's own docs already note musl/glibc stdio flushes through
-`writev`, not `write`, in practice -- the previous trace only watched
-`write` and caught nothing, which is consistent with output never using
-that path here at all rather than with no output happening. Separately,
-comparing a quiet run's and a traced run's serial console log (not just
-the framebuffer) might catch output the framebuffer screendump missed
-entirely.
+**Not yet root-caused; not yet ruled out as "just needs more time"
+either.** The concrete next step is a single quiet run given a
+substantially longer window (30+ minutes) than tried so far, watching
+specifically for either real program output or a final `exit_group` --
+this session's own longest attempt (10 minutes) was calibrated off
+`-version`'s timeline, not `-jar`'s real, larger workload.
