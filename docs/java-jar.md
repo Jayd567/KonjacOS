@@ -85,12 +85,75 @@ normally means an immediate `System.exit`. Two explanations were tested:
   observation windows ended, or a real loop (e.g. a repeated class-load-
   failure/retry cycle) that never terminates. Not established.
 
-**Not yet root-caused.** The next concrete step is finding what actually
-*prints* `Error: An unexpected error occurred while trying to open file`
-in the real OpenJDK source (a `LauncherHelper`/native-launcher string
-search against the real JDK sources would locate it directly, rather
-than guessing) to learn what condition really triggers it and whether
-it's meant to be fatal -- then, separately, adding `write` (syscall 1)
-to the same targeted-breakpoint trace to see whether *this exact
-message* is what's being printed early, or something else, and whether
-any further real output ever follows it.
+## What the message actually is: a real, known JDK issue -- but not fatal here
+
+A web search (this machine's own real OpenJDK `src.zip` turned out to be
+a broken symlink -- one of the two dangling ones item 34's own disk
+staging already knew about -- so this used real, external ground truth
+instead) identifies the exact real-world bug: **JDK-8313765**, introduced
+by `openjdk/jdk21u@4cf572e`, changed how `UnixFileAttributeViews$Basic
+.readAttributes()` reads file metadata during `ZipFile`/jar-opening --
+and on some real, physical Linux systems (documented reports: Termux/
+Android, some containers, at least one real Samsung phone -- genuinely
+device/kernel-dependent, "unknown why only some devices are affected")
+a `FileSystemException` wrapping `"Function not implemented"` (the exact
+`strerror` text for a real `ENOSYS`) comes back from that read and
+`LauncherHelper` reports exactly this "unexpected error" message. A
+documented workaround flag,
+`-Djdk.util.zip.disableZip64ExtraFieldValidation=true`, exists for a
+related report -- tried directly against the guest here and made no
+difference, so that specific flag's code path isn't the one being hit,
+but the underlying "some real syscall this attribute read needs returns
+ENOSYS" diagnosis fits this kernel exactly: `linux_syscall.rs` returns a
+real `ENOSYS` for several things by design (`rseq`, `getrandom` when
+`RDRAND` isn't available, `prlimit64` when actually *setting* a new
+limit rather than querying one -- all three genuinely fire during this
+exact run, confirmed by a targeted trace logging every negative-return
+syscall).
+
+**Concretely, though, this is not fatal here.** A GDB trace watching for
+`write`/`writev` and any negative return continues *well past* the
+`Error:` line -- deep into real class loading (`libjimage.so`, real
+`pread64`s into the 140 MB `lib/modules` archive), and eventually
+reaches the *exact same* steady-state safepoint-polling futex loop
+(`FUTEX_WAIT_BITSET`, `ETIMEDOUT`, repeating) that a real `java -version`
+run reaches before its own eventual clean `exit_group` (see
+`docs/java-version.md`). This strongly suggests the `Error:` line is a
+real but non-fatal warning from one specific attribute-read call (most
+likely the launcher's own CDS-archive-related jar check, which has its
+own independent, tolerant error handling separate from the main
+classloading path), not something that stops the JVM.
+
+## The real remaining puzzle: quiet runs don't show the same progress
+
+A *quiet* (untraced) run given a full 10 minutes of real wall-clock time
+shows the exact same, unchanging screen the entire time -- no further
+output, ever. That's the opposite of what the GDB-traced run's continued
+deep activity would predict: if that activity were genuine progress
+happening at any real, reasonable pace, ten real minutes with no
+tracing overhead should easily be enough (`java -version`'s own banner
+appears within roughly a minute of quiet real time, and it reaches full
+`exit_group` well within this session's own trace windows).
+
+Two explanations remain open, not yet distinguished:
+
+* The GDB-breakpoint-slowed execution's altered timing avoids a real,
+  timing-sensitive bug (a missed wakeup, a race in this kernel's own
+  single-CPU scheduler or futex-wake path) that an unthrottled quiet run
+  hits reliably -- i.e. tracing accidentally "fixes" a real race by
+  slowing everything down enough to avoid it.
+* Something about console output itself is the actual gap (a `writev`
+  buffering/flush difference for this specific, heavier call pattern)
+  rather than JVM progress -- i.e. the process really is still working
+  underneath, but nothing further ever reaches the visible framebuffer
+  console in a quiet run specifically.
+
+**Not yet root-caused.** The next concrete step is watching `writev`
+(syscall 20, not just plain `write`) in the same targeted trace, since
+this module's own docs already note musl/glibc stdio flushes through
+`writev`, not `write`, in practice -- the previous trace only watched
+`write` and caught nothing, which is consistent with output never using
+that path here at all rather than with no output happening. Separately,
+comparing a quiet run's and a traced run's serial console log (not just
+the framebuffer) might catch output the framebuffer screendump missed
+entirely.
