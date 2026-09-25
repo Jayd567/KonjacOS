@@ -50,11 +50,15 @@ that); update it as steps complete or the plan changes.
    getcwd, passing the String class-format and SystemProps directory errors.
    Item 50 shares descriptors across Linux thread clones, removing the child
    EBADF reads and the observed recursive class-resolution stack-guard fault.
-   Item 51 implements the sleep and yield calls exposed by that trace.
-   Startup still needs a successful end-to-end run; full VM startup and
-   `java -version` remain unverified.
-   The shell also still needs arguments before `java -jar hello.jar` can be tested.
-   Follow actual launch failures toward that milestone, then Minecraft.
+   Item 51 implements the sleep and yield calls exposed by that trace, then
+   reaches `Error loading java.security file` and names the disk JDK's own
+   config placement as the next thing to check. Item 52 closes that out --
+   real `argv[1..]` for spawned programs plus a full disk JDK/glibc
+   placement -- and `java -version` now prints the real, correct banner
+   with no kernel panic. HotSpot's own clean shutdown (a real `exit_group`)
+   is still unconfirmed; see item 52's own entry for the syscalls that
+   still block it. Follow actual launch failures toward a full `java -jar`
+   run, then Minecraft.
 2. **A minimal loopback-only TCP/IP stack.** Even *singleplayer*
    Minecraft opens a real local socket (its internal integrated server).
    No real NIC or internet access is needed for this -- just real
@@ -3210,6 +3214,62 @@ See item 44 for the matched-binary evidence and actual futex failure.
     Java startup is not complete. Next, inspect the disk JDK's configuration
     files and their open/read paths; the host java.security is a symlink into
     /etc/java-21-openjdk, so copying only the JDK directory may omit its target.
+
+52. **Real `argv[1..]` for spawned programs, a full disk JDK/glibc
+    placement, and `java -version` prints the real banner.** This
+    session's `disk.img` is gitignored and rebuilt fresh by `make disk`
+    from `disk_root/`, which has no JDK on it -- item 51's disk-config
+    question was unverified because the guest disk placement items 34-51
+    relied on doesn't survive between sessions; it's redone by hand each
+    time. Redone the same way item 34 first established: the real JDK tree
+    (`rsync -L`, symlinks dereferenced to real files at their real
+    relative paths -- `conf/security/java.security`,
+    `lib/security/cacerts`, `lib/jvm.cfg`, and others all point outside the
+    JDK tree on a real Debian/Ubuntu install) at
+    `/usr/lib/jvm/java-21-openjdk-amd64`, plus `ld-linux-x86-64.so.2` and
+    `java`/`libjvm.so`'s handful of `DT_NEEDED` libraries at `ld.so`'s real
+    compiled-in default search paths (`/lib64/`, `/lib/x86_64-linux-gnu/`)
+    -- no `DT_NEEDED`/`PT_INTERP` string patching, same as item 34.
+
+    That placement immediately exposed a second, real gap: `run
+    .../bin/java -version` failed with "no such file or directory" --
+    `cmd_run` (`commands.rs`) had never split anything past the path, and
+    `loader.rs`'s `build_initial_stack` only ever wrote a single-element
+    `argv` for every caller, exactly the "shell still needs arguments"
+    limitation the roadmap's own item 1 had been naming since item 41.
+    Fixed: `build_initial_stack` now takes a full `argv: &[String]`
+    (written onto the stack the same way `envp` already was, argv first so
+    envp continues right below it) instead of one `argv0: &str`, with
+    `argc`/`argv[]`'s pointer array sized to match; `cmd_run` now splits
+    whatever follows the path on whitespace into real `argv[1..]`, after
+    the existing `VAR=value` `envp` prefix parsing. Both `load_and_run` and
+    the `PT_INTERP` dynamic-linking path `load_and_run_with_interp` (what
+    `java` itself goes through) carry the new `argv` slice through.
+    `run hello.exe` (empty `argv[1..]`) still prints its existing message
+    unchanged, confirming the plumbing change is a no-op for every
+    existing zero-extra-argument caller.
+
+    With both fixes, `run /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+    -version` now prints, to the real framebuffer console and byte-for-
+    byte matching this same JDK on the host: `openjdk version "21.0.10"
+    2026-01-20`, `OpenJDK Runtime Environment (build
+    21.0.10+7-Ubuntu-124.04)`, `OpenJDK 64-Bit Server VM (build
+    21.0.10+7-Ubuntu-124.04, mixed mode, sharing)`. No CPU exception or
+    kernel panic, across two independent runs. This is the exact milestone
+    item 1's own roadmap text named as unverified.
+
+    Not shown: a clean `exit_group`. After the banner, HotSpot spins up
+    background compiler/GC/sweeper threads that hit several syscalls this
+    kernel doesn't implement (`273` `set_robust_list`, `334` `rseq`, `302`
+    `prlimit64`, `96` `gettimeofday`, `157` `prctl`, `229` `clock_getres`,
+    `107` `geteuid`, `41` `socket`); each gets this kernel's generic
+    "unimplemented" response, HotSpot evidently tolerates the failure and
+    keeps going (no crash), but the console's final state was identical
+    across a 90s and a 100s run with no process-exit or new shell prompt
+    ever appearing. `-version`'s own required output is real and
+    confirmed; a full `java -jar` run to completion needs at least some of
+    those syscalls implemented, not attempted here. See [staging steps,
+    the argv fix and full evidence](docs/java-version.md).
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.

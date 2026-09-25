@@ -459,12 +459,14 @@ fn cmd_doom(_rest: &str) {
 /// `=` -- vanishingly unlikely, but not this parser's business to
 /// misinterpret) is taken as `NAME=value` and added to the child's real
 /// `envp`; the first token that isn't shaped like an assignment ends the
-/// list and becomes the path. No real argv[1..] support yet -- see
-/// `loader.rs`'s own `argv0` doc comment for that still-open gap -- this
-/// is specifically about environment variables, the first real one this
-/// kernel has ever handed a spawned program (see item 41's own README
-/// entry for why real `envp` matters at all: it's the concrete lever a
-/// real glibc/JVM needs for things like `GLIBC_TUNABLES`/`JAVA_HOME`).
+/// list and becomes the path. Everything after the path, whitespace-
+/// separated, becomes real `argv[1..]` for the spawned program (`argv[0]`
+/// is the path itself) -- e.g. `run java -version` hands `java` a real
+/// `argv` of `["java", "-version"]`, exactly like a real shell's `exec`
+/// would. See item 41's own README entry for why real `envp` matters at
+/// all: it's the concrete lever a real glibc/JVM needs for things like
+/// `GLIBC_TUNABLES`/`JAVA_HOME`; real `argv[1..]` is the same kind of
+/// lever for a program's own command-line flags.
 fn cmd_run(rest: &str) {
     let mut remaining = rest.trim();
     let mut envp: Vec<String> = Vec::new();
@@ -478,11 +480,18 @@ fn cmd_run(rest: &str) {
             _ => break,
         }
     }
-    let path = remaining;
-    if path.is_empty() {
-        println!("usage: run [VAR=value ...] <file>  (flat binary, ELF64, or PE32+/.exe)");
-        return;
-    }
+    let mut parts = remaining.split_whitespace();
+    let path = match parts.next() {
+        Some(p) => p,
+        None => {
+            println!("usage: run [VAR=value ...] <file> [args...]  (flat binary, ELF64, or PE32+/.exe)");
+            return;
+        }
+    };
+    let mut argv: Vec<String> = Vec::with_capacity(1 + parts.clone().count());
+    argv.push(path.to_string());
+    argv.extend(parts.map(|s| s.to_string()));
+
     let bytes = match crate::fat16::read_file(path) {
         Ok(data) => data,
         Err(e) => {
@@ -502,7 +511,7 @@ fn cmd_run(rest: &str) {
         crate::loader::Format::Flat => "run:bin",
     };
 
-    match crate::loader::load_and_run(name, path, &envp, &bytes) {
+    match crate::loader::load_and_run(name, &argv, &envp, &bytes) {
         Ok((id, format)) => println!("run: {path}: recognized as {}, task #{id} spawned", format.label()),
         Err(e) => println!("run: {path}: {e}"),
     }

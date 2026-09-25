@@ -1070,20 +1070,31 @@ const AT_RANDOM: u64 = 25;
 /// (which always describe the main *program*, not the interpreter,
 /// regardless of which one is actually running first -- see
 /// `load_and_run_with_interp`'s doc comment).
-unsafe fn build_initial_stack(pml4: u64, stack_top: u64, argv0: &str, envp: &[String], image: &Image, at_base: u64) -> Result<u64, &'static str> {
-    let mut argv0_bytes = argv0.as_bytes().to_vec();
-    argv0_bytes.push(0);
-    let argv0_addr = stack_top - argv0_bytes.len() as u64;
-    unsafe { write_bytes_at(pml4, argv0_addr, &argv0_bytes)? };
+unsafe fn build_initial_stack(pml4: u64, stack_top: u64, argv: &[String], envp: &[String], image: &Image, at_base: u64) -> Result<u64, &'static str> {
+    // Real argv strings, written at the top of the stack in argv[0..]
+    // order -- each one's real address (not the string content itself) is
+    // what the argv pointer array further down actually needs. `argv[0]`
+    // is conventionally the program's own path; `argv[1..]` are whatever
+    // extra arguments `cmd_run` parsed off the command line (see its own
+    // doc comment) -- e.g. the `-version` in `run java -version`, which a
+    // real launcher like `java` inspects before doing anything else.
+    let mut cursor = stack_top;
+    let mut argv_addrs = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let mut bytes = arg.as_bytes().to_vec();
+        bytes.push(0);
+        cursor -= bytes.len() as u64;
+        unsafe { write_bytes_at(pml4, cursor, &bytes)? };
+        argv_addrs.push(cursor);
+    }
 
-    // Real environment strings, written right below argv0 the same way --
+    // Real environment strings, written right below argv the same way --
     // each one's real address (not the string content itself) is what the
     // envp pointer array further down actually needs, matching real
     // Linux's own "argv/envp strings live at the top of the stack, the
     // pointer arrays just below them" layout. Empty (`&[]`) for every
     // caller before item 41 -- see `cmd_run`'s own doc comment for the
     // first real source of a non-empty one.
-    let mut cursor = argv0_addr;
     let mut envp_addrs = Vec::with_capacity(envp.len());
     for var in envp {
         let mut bytes = var.as_bytes().to_vec();
@@ -1116,8 +1127,8 @@ unsafe fn build_initial_stack(pml4: u64, stack_top: u64, argv0: &str, envp: &[St
         (AT_RANDOM, random_addr),
     ];
 
-    // argc(1) + argv(argv[0], NULL) + envp(one pointer per real variable, + NULL) + (auxv entries + AT_NULL terminator), each auxv entry 2 words.
-    let ptr_words = 1 + 2 + (envp_addrs.len() + 1) + (auxv.len() + 1) * 2;
+    // argc(1) + argv(one pointer per real argument, + NULL) + envp(one pointer per real variable, + NULL) + (auxv entries + AT_NULL terminator), each auxv entry 2 words.
+    let ptr_words = 1 + (argv_addrs.len() + 1) + (envp_addrs.len() + 1) + (auxv.len() + 1) * 2;
     let sp = (random_addr - ptr_words as u64 * 8) & !0xF;
 
     let mut cursor = sp;
@@ -1126,8 +1137,10 @@ unsafe fn build_initial_stack(pml4: u64, stack_top: u64, argv0: &str, envp: &[St
         cursor += 8;
         Ok(())
     };
-    push(1)?; // argc
-    push(argv0_addr)?; // argv[0]
+    push(argv_addrs.len() as u64)?; // argc
+    for &addr in &argv_addrs {
+        push(addr)?;
+    }
     push(0)?; // argv terminator
     for &addr in &envp_addrs {
         push(addr)?;
@@ -1183,7 +1196,7 @@ unsafe fn build_initial_stack(pml4: u64, stack_top: u64, argv0: &str, envp: &[St
 /// `PT_DYNAMIC` segment to self-relocate before it can trust anything
 /// else. The task's actual first instruction, unlike every other format
 /// this loader runs, is the interpreter's entry point, not the program's.
-fn load_and_run_with_interp(name: &'static str, argv0: &str, envp: &[String], image: Image, interp_path: &str) -> Result<(u64, Format), &'static str> {
+fn load_and_run_with_interp(name: &'static str, argv: &[String], envp: &[String], image: Image, interp_path: &str) -> Result<(u64, Format), &'static str> {
     // fat16::read_file already accepts an absolute, `/`-separated path
     // (see its own doc comment) -- exactly the shape a real PT_INTERP
     // string always has (e.g. "/libc.so"), so no massaging needed here,
@@ -1216,13 +1229,13 @@ fn load_and_run_with_interp(name: &'static str, argv0: &str, envp: &[String], im
         }
     }
     let stack_top = USER_STACK_BASE + USER_STACK_SIZE;
-    let initial_sp = unsafe { build_initial_stack(pml4, stack_top, argv0, envp, &image, INTERP_BASE)? };
+    let initial_sp = unsafe { build_initial_stack(pml4, stack_top, argv, envp, &image, INTERP_BASE)? };
 
-    let id = task::spawn_user(name, argv0.to_string(), interp_image.entry, initial_sp, pml4).ok_or("loader: out of task slots")?;
+    let id = task::spawn_user(name, argv[0].clone(), interp_image.entry, initial_sp, pml4).ok_or("loader: out of task slots")?;
     Ok((id, image.format))
 }
 
-pub fn load_and_run(name: &'static str, argv0: &str, envp: &[String], bytes: &[u8]) -> Result<(u64, Format), &'static str> {
+pub fn load_and_run(name: &'static str, argv: &[String], envp: &[String], bytes: &[u8]) -> Result<(u64, Format), &'static str> {
     let image = match detect(bytes) {
         Format::Elf => parse_elf(bytes)?,
         Format::Pe => parse_pe(bytes)?,
@@ -1230,7 +1243,7 @@ pub fn load_and_run(name: &'static str, argv0: &str, envp: &[String], bytes: &[u
     };
 
     if let Some(interp_path) = image.interp.clone() {
-        return load_and_run_with_interp(name, argv0, envp, image, &interp_path);
+        return load_and_run_with_interp(name, argv, envp, image, &interp_path);
     }
 
     if image.needed.len() > MAX_LIBS {
@@ -1341,8 +1354,8 @@ pub fn load_and_run(name: &'static str, argv0: &str, envp: &[String], bytes: &[u
         }
     }
     let stack_top = USER_STACK_BASE + USER_STACK_SIZE;
-    let initial_sp = unsafe { build_initial_stack(pml4, stack_top, argv0, envp, &image, 0)? };
+    let initial_sp = unsafe { build_initial_stack(pml4, stack_top, argv, envp, &image, 0)? };
 
-    let id = task::spawn_user(name, argv0.to_string(), image.entry, initial_sp, pml4).ok_or("loader: out of task slots")?;
+    let id = task::spawn_user(name, argv[0].clone(), image.entry, initial_sp, pml4).ok_or("loader: out of task slots")?;
     Ok((id, image.format))
 }
