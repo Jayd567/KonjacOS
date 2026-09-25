@@ -278,16 +278,37 @@ cleanly.
 **Not yet root-caused**, but now a real, reproducible, inspectable
 target instead of an opaque hang: task 5 is blocked on *something* --
 most plausibly a real futex wait or a thread-join -- that never gets
-satisfied, while its children pile up the same way. The concrete next
-step: a GDB trace specifically watching `futex` (202) calls made *by
-task 5 specifically* (this kernel's own task IDs are stable and visible
-to a breakpoint condition on the current task) to see exactly what
-address/op it's blocked on, and whether any `FUTEX_WAKE` targeting that
-same address ever fires from another thread without successfully
-waking it -- the classic shape of a lost-wakeup bug, which if real
-would be a genuine kernel-level concurrency bug in `sys_futex`/
-`task.rs`'s wait/wake path, not a JDK issue at all. This is a
+satisfied, while its children pile up the same way. This is a
 qualitatively different, more promising kind of lead than anything
 earlier in this document: a specific, reproducible task ID stuck at a
 specific, unchanging tick count, not just "the screen stopped
 updating."
+
+## Supporting data point: ten real futex waits caught mid-flight
+
+The standard full syscall tracer (`KONJAC_TRACE_SYSCALLS=1`, the
+default) reports whatever syscalls are still mid-flight -- entered but
+not yet returned -- at the moment its own observation window ends. A
+120-second run against `-jar` catches **ten** pending `futex` (202)
+calls at once: six timed (`op=0x189`/`0x109`, i.e.
+`FUTEX_WAIT_BITSET`+`FUTEX_CLOCK_REALTIME`, real deadlines that should
+self-expire via this kernel's own timed-futex support from item 48) and
+four untimed (`op=0x89`, waiting purely for an explicit `FUTEX_WAKE`
+that has to come from somewhere else).
+
+This is suggestive but **not, on its own, conclusive** -- a real,
+healthy timed wait can legitimately be "mid-flight" at any single
+instant merely because the observation happened to land during one; the
+same steady-state pattern (several `FUTEX_WAIT_BITSET` calls cycling
+through wait/timeout/reissue) is exactly what `docs/java-version.md`
+documented for a real, *successful* `java -version` run's safepoint
+polling, before it eventually reached `exit_group`. What makes this
+worth recording as a real data point rather than noise is only the
+combination with the `ps` evidence above: those same six-plus timed
+waits, if genuinely still cycling normally, would show their owning
+tasks' tick counts slowly climbing -- and `ps` instead shows them
+frozen. The next real step remains what the `ps` evidence already
+pointed at: correlating a specific blocked task ID (not just an
+address) with its own specific pending futex call, to see directly
+whether its deadline is being checked at all, or whether a real
+`FUTEX_WAKE` for its address fires without successfully reaching it.
