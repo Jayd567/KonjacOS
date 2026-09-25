@@ -1,0 +1,30 @@
+[package]
+name = "konjac-os"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+# We build a fully freestanding (no_std, no libc) binary. See
+# `.cargo/config.toml` and the top-level README for why the target is the
+# ordinary x86_64-unknown-linux-gnu host target instead of a bare-metal
+# target: it lets everything build on stable Rust with zero extra downloads
+# (no `rustup target add`, no nightly, no `-Z build-std`), which matters a
+# lot the first few times you rebuild this in a fresh environment. The
+# generated machine code is identical either way -- only the Rust-level
+# `target_os` cfg differs, and we never rely on it.
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+# Debug assertions + overflow checks are fine in a kernel; they just call our
+# own panic handler.
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = false

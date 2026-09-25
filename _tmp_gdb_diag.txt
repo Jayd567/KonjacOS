@@ -1,0 +1,6 @@
+set pagination off
+set confirm off
+add-symbol-file /usr/lib/debug/.build-id/a4/a7992a8e66555c8141ab2a08a8465ff6e0ea65.debug 0x70000028800
+info symbol 0x70000579a2
+info line *0x70000579a2
+quit

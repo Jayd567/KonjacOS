@@ -1,0 +1,75 @@
+{
+  "kernel_sha256": "47471821965b7c3d2e09f16c33ca76bff513a8a7faea4032bcab387b583d61cc",
+  "tests": [
+    {
+      "label": "startup-cpu",
+      "messages": [
+        "PASS getcpu values, widths, NULL/unaligned/lazy outputs, glibc sched_getcpu"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "sysinfo-after",
+      "messages": [
+        "PASS sysinfo ABI, byte units, memory values and bounds"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "sysinfo-big",
+      "messages": [
+        "PASS large archive reads, lazy mmap after close, EOF padding, bounded frames, repeat"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "startup-sysinfo-uefi",
+      "messages": [
+        "PASS sysinfo ABI, byte units, memory values and bounds"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "startup-big-uefi",
+      "messages": [
+        "PASS large archive reads, lazy mmap after close, EOF padding, bounded frames, repeat"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "startup-futex",
+      "messages": [
+        "PASS futex-bitset and glibc pthread_join"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "startup-io",
+      "messages": [
+        "PASS seek, cross-sector pread, lazy buffers, file mmap"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    }
+  ],
+  "java_next_blocker": {
+    "n": 202,
+    "args": [
+      "0x7001775eb0",
+      "0x89",
+      "0x0",
+      "0x706821cd20",
+      "0x0",
+      "0xffffffff"
+    ],
+    "frame": "0xffff900000051900",
+    "ret": -38
+  },
+  "limitations": "Java still aborts after unsupported timed futex; regression guests pass. Debug runtime tested; release build/link checked."
+}

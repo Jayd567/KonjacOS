@@ -1,0 +1,654 @@
+{
+  "fault": {
+    "rip": "0x70011998f1",
+    "rsp": "0x707c003f90",
+    "rbp": "0x707c004150",
+    "cs": "0x4b",
+    "error_code": "0x6",
+    "cr2": "0x707c003fe8",
+    "frames": [
+      {
+        "fp": "0x707c004150",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c0041d0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c0042a0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c0043a0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c004570",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c0045f0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c0046c0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c0047c0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c004990",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c004a10",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c004ae0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c004be0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c004db0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c004e30",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c004f00",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c005000",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c0051d0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c005250",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c005320",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c005420",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c0055f0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c005670",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c005740",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c005840",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c005a10",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c005a90",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c005b60",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c005c60",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c005e30",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c005eb0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c005f80",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c006080",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c006250",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c0062d0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c0063a0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c0064a0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c006670",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c0066f0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c0067c0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c0068c0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c006a90",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c006b10",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c006be0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c006ce0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c006eb0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c006f30",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c007000",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c007100",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c0072d0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c007350",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c007420",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c007520",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c0076f0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c007770",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c007840",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c007940",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c007b10",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c007b90",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c007c60",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c007d60",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c007f30",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c007fb0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c008080",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c008180",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c008350",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c0083d0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c0084a0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c0085a0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c008770",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c0087f0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c0088c0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c0089c0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c008b90",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c008c10",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c008ce0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c008de0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c008fb0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c009030",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c009100",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c009200",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c0093d0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c009450",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c009520",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c009620",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c0097f0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c009870",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c009940",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c009a40",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c009c10",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c009c90",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c009d60",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c009e60",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00a030",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00a0b0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00a180",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00a280",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00a450",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00a4d0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00a5a0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00a6a0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00a870",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00a8f0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00a9c0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00aac0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00ac90",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00ad10",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00ade0",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00aee0",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00b0b0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00b130",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00b200",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00b300",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00b4d0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00b550",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00b620",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00b720",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00b8f0",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00b970",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00ba40",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00bb40",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00bd10",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00bd90",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00be60",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00bf60",
+        "pc": "0x700119a1b7"
+      },
+      {
+        "fp": "0x707c00c130",
+        "pc": "0x700119b632"
+      },
+      {
+        "fp": "0x707c00c1b0",
+        "pc": "0x70009cadfb"
+      },
+      {
+        "fp": "0x707c00c280",
+        "pc": "0x70009cd77c"
+      },
+      {
+        "fp": "0x707c00c380",
+        "pc": "0x700119a1b7"
+      }
+    ]
+  },
+  "symbols": [
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)",
+    "SystemDictionary::resolve_or_fail(Symbol*, Handle, Handle, bool, JavaThread*)",
+    "Exceptions::new_exception(JavaThread*, Symbol*, Symbol*, JavaCallArguments*, Handle, Handle, Handle)",
+    "Exceptions::_throw_msg(JavaThread*, char const*, int, Symbol*, char const*)",
+    "SystemDictionary::resolve_instance_class_or_null(Symbol*, Handle, Handle, JavaThread*)"
+  ]
+}

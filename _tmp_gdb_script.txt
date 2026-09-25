@@ -1,0 +1,18 @@
+set pagination off
+set confirm off
+target remote localhost:1234
+add-symbol-file /usr/lib/debug/.build-id/a4/a7992a8e66555c8141ab2a08a8465ff6e0ea65.debug -readnow -o 0x70000000000
+break *0x70000579a2
+continue
+info frame
+print decimal
+print decimal_len
+print current
+print loc
+print nptr
+print grouping
+print thousands
+bt
+info registers
+detach
+quit

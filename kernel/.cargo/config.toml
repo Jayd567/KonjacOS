@@ -1,0 +1,38 @@
+# See the big comment in Cargo.toml and the "Toolchain notes" section of the
+# top-level README for the full rationale.
+#
+# We target the ordinary x86_64-unknown-linux-gnu *host* triple -- the one
+# `rustup` already ships std/core/alloc for -- but compile as #![no_std] and
+# hand the linker a completely different, freestanding layout via
+# `linker.ld`. That combination:
+#   * needs no `rustup target add` (no network access required to build),
+#   * needs no nightly compiler and no `-Z build-std`,
+#   * still produces a plain static ELF64 executable, which is exactly what
+#     Limine loads.
+#
+# If you later install a nightly toolchain + the `rust-src` component, you
+# can switch to the real `x86_64-unknown-none` target instead; see the
+# README for the two-line diff that involves.
+
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = [
+    # Don't link crt0/glibc startup code -- we provide our own entry point,
+    # and link everything statically into one freestanding ELF binary.
+    "-C", "link-args=-nostartfiles -nodefaultlibs -static -no-pie",
+    # Absolute (non-PIC) code, matching the fixed higher-half link address
+    # in linker.ld.
+    "-C", "relocation-model=static",
+    # linker.ld places us at 0xffffffff80000000, i.e. the top 2 GiB of the
+    # address space. The default ("small") code model assumes every symbol
+    # fits in the *low* 4 GiB and emits 32-bit zero-extended addresses,
+    # which overflow up here -- the "kernel" code model is the x86_64 ABI's
+    # answer to exactly this (symbols within the top *or* bottom 2 GiB, sign
+    # -extended 32-bit displacements).
+    "-C", "code-model=kernel",
+    # No unwinding tables/personality routines -- a kernel panic just halts.
+    "-C", "panic=abort",
+    # Use our own linker script (path is relative to the kernel/ crate root,
+    # which is cargo's working directory when it invokes the linker).
+    "-C", "link-args=-Wl,-Tlinker.ld",
+]

@@ -1,0 +1,70 @@
+{
+  "kernel_sha256": "c9bf66f13988ffeced552db21fdc2738f66b5728df2efe6d264d9c738552e8c0",
+  "tests": [
+    {
+      "test": "big",
+      "result": "PASS",
+      "messages": [
+        "PASS large archive reads, lazy mmap after close, EOF padding, bounded frames, repeat\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "test": "vm",
+      "result": "PASS",
+      "messages": [
+        "PASS mmap validation, splitting, lazy permissions, holes, shared threads, capacity rollback\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "test": "io",
+      "result": "PASS",
+      "messages": [
+        "PASS seek, cross-sector pread, lazy buffers, file mmap\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "test": "path",
+      "result": "PASS",
+      "messages": [
+        "PASS readlink errors and glibc realpath\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "test": "glibc",
+      "result": "PASS",
+      "messages": [
+        "hello from glibc dynamic\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "test": "futex",
+      "result": "PASS",
+      "messages": [
+        "PASS futex-bitset and glibc pthread_join\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "test": "uefi",
+      "result": "PASS",
+      "messages": [
+        "PASS large archive reads, lazy mmap after close, EOF padding, bounded frames, repeat\n"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    }
+  ],
+  "oom": "Expected ring-3 termination; BIGCHK passes in the same boot",
+  "jvm": "First unhandled PF at 0xffffffffff600800; full startup remains unverified"
+}

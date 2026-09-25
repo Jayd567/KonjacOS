@@ -1,0 +1,37 @@
+{
+  "kernel_sha256": "213ffdd2b0bd257f009190d882c0e8504973ed3a049757c43f6535892453ffe4",
+  "tests": [
+    {
+      "label": "sleep-final",
+      "messages": [
+        "PASS sleep deadlines/clocks, validation, lazy requests, sibling progress and futex isolation"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "sleep-final-uefi",
+      "messages": [
+        "PASS sleep deadlines/clocks, validation, lazy requests, sibling progress and futex isolation"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "sleep-final-timed",
+      "messages": [
+        "PASS timed futex relative/absolute clocks, validation, wake cleanup, glibc condition timeout"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "sleep-final-files",
+      "messages": [
+        "PASS CLONE_FILES inheritance, shared offsets/open/close, lazy reads and creator lifetime"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    }
+  ]
+}

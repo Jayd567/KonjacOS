@@ -1,0 +1,2 @@
+This file lives inside a real subdirectory (DOCS) on the FAT16 disk,
+to prove cd/ls/cat all work with more than just the root directory.

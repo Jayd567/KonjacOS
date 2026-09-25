@@ -1,0 +1,118 @@
+{
+  "sleep_returns": {
+    "0": 6
+  },
+  "sleep_requests": [
+    "[0, 10000]",
+    "[0, 1000000]"
+  ],
+  "sleep_callers": [
+    [
+      "os::naked_short_nanosleep(long)",
+      "SafepointSynchronize::synchronize_threads(long, int, int*)",
+      "SafepointSynchronize::begin()",
+      "VMThread::inner_execute(VM_Operation*)",
+      "VMThread::run()",
+      "Thread::call_run()",
+      "thread_native_entry(Thread*)"
+    ],
+    [
+      "os::naked_short_sleep(long)",
+      "SafepointSynchronize::synchronize_threads(long, int, int*)",
+      "SafepointSynchronize::begin()",
+      "VMThread::inner_execute(VM_Operation*)",
+      "VMThread::run()",
+      "Thread::call_run()",
+      "thread_native_entry(Thread*)"
+    ],
+    [
+      "os::naked_short_sleep(long)",
+      "SafepointSynchronize::synchronize_threads(long, int, int*)",
+      "SafepointSynchronize::begin()",
+      "VMThread::inner_execute(VM_Operation*)",
+      "VMThread::run()",
+      "Thread::call_run()",
+      "thread_native_entry(Thread*)"
+    ]
+  ],
+  "pending": [
+    {
+      "n": 202,
+      "frame": "0xffff900000096df0",
+      "callers": []
+    },
+    {
+      "n": 202,
+      "frame": "0xffff900000084aa0",
+      "callers": [
+        "PlatformEvent::park()",
+        "ObjectMonitor::wait(long, bool, JavaThread*)",
+        "ObjectSynchronizer::wait(Handle, long, JavaThread*)",
+        "JVM_MonitorWait",
+        "JavaCalls::call_helper(JavaValue*, methodHandle const&, JavaCallArguments*, JavaThread*)",
+        "JavaCalls::call_virtual(JavaValue*, Handle, Klass*, Symbol*, Symbol*, JavaThread*)",
+        "thread_entry(JavaThread*, JavaThread*)"
+      ]
+    },
+    {
+      "n": 202,
+      "frame": "0xffff90000007c870",
+      "callers": [
+        "PlatformMonitor::wait(unsigned long)",
+        "Monitor::wait(unsigned long)",
+        "JVM_WaitForReferencePendingList",
+        "JavaCalls::call_helper(JavaValue*, methodHandle const&, JavaCallArguments*, JavaThread*)",
+        "JavaCalls::call_virtual(JavaValue*, Handle, Klass*, Symbol*, Symbol*, JavaThread*)",
+        "thread_entry(JavaThread*, JavaThread*)",
+        "JavaThread::thread_main_inner()",
+        "Thread::call_run()",
+        "thread_native_entry(Thread*)"
+      ]
+    },
+    {
+      "n": 202,
+      "frame": "0xffff90000009edf0",
+      "callers": [
+        "PosixSemaphore::wait()",
+        "os::signal_wait()",
+        "signal_thread_entry(JavaThread*, JavaThread*)",
+        "JavaThread::thread_main_inner()",
+        "Thread::call_run()",
+        "thread_native_entry(Thread*)"
+      ]
+    },
+    {
+      "n": 202,
+      "frame": "0xffff9000000a6df0",
+      "callers": [
+        "PlatformMonitor::wait(unsigned long)",
+        "Monitor::wait_without_safepoint_check(unsigned long)",
+        "ServiceThread::service_thread_entry(JavaThread*, JavaThread*)",
+        "JavaThread::thread_main_inner()",
+        "Thread::call_run()",
+        "thread_native_entry(Thread*)"
+      ]
+    },
+    {
+      "n": 202,
+      "frame": "0xffff9000000bedf0",
+      "callers": []
+    },
+    {
+      "n": 202,
+      "frame": "0xffff900000071470",
+      "callers": []
+    },
+    {
+      "n": 202,
+      "frame": "0xffff900000067470",
+      "callers": []
+    },
+    {
+      "n": 202,
+      "frame": "0xffff9000000aedf0",
+      "callers": []
+    }
+  ],
+  "output": ""
+}

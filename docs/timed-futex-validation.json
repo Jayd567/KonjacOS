@@ -1,0 +1,46 @@
+{
+  "kernel_sha256": "600a179388b4508950b1c5f3d778a12e8c347f279b0896c0e2cff9d790528649",
+  "tests": [
+    {
+      "label": "timed-final",
+      "messages": [
+        "PASS timed futex relative/absolute clocks, validation, wake cleanup, glibc condition timeout"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "timed-final-uefi",
+      "messages": [
+        "PASS timed futex relative/absolute clocks, validation, wake cleanup, glibc condition timeout"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "timed-futex",
+      "messages": [
+        "PASS futex-bitset and glibc pthread_join"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "timed-vm",
+      "messages": [
+        "PASS mmap validation, splitting, lazy permissions, holes, shared threads, capacity rollback"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    }
+  ],
+  "java": {
+    "timed_wait_returns": [
+      -110
+    ],
+    "output": "Error occurred during initialization of VM\njava/lang/ClassFormatError: Unknown constant tag 0 in class file java/lang/String\n",
+    "cpu_exceptions": 0,
+    "kernel_panics": 0,
+    "limitation": "Class loading fails; startup and clean exit incomplete."
+  }
+}

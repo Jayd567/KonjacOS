@@ -1,0 +1,67 @@
+{
+  "kernel_sha256": "a4e88c62edd30c928e88c245aebd25ed7bb5d77d2ea969c828624c992dc2b197",
+  "tests": [
+    {
+      "label": "read-final",
+      "messages": [
+        "PASS multi-chunk read/pread, lazy destination, EOF, offsets and real String class bytes"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "read-uefi",
+      "messages": [
+        "PASS multi-chunk read/pread, lazy destination, EOF, offsets and real String class bytes"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "read-io",
+      "messages": [
+        "PASS seek, cross-sector pread, lazy buffers, file mmap"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "read-big",
+      "messages": [
+        "PASS large archive reads, lazy mmap after close, EOF padding, bounded frames, repeat"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "cwd-final",
+      "messages": [
+        "PASS getcwd raw length, bounds, ERANGE, lazy and allocating glibc wrappers"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "cwd-subdir",
+      "messages": [
+        "PASS getcwd reflects shell directory"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    }
+  ],
+  "java": {
+    "string_class_read": 49154,
+    "getcwd_return": 2,
+    "next_fault": {
+      "unhandled_pf": {
+        "rip": "0x70011998f1",
+        "rsp": "0x707c003f90",
+        "cs": "0x4b",
+        "error_code": "0x6"
+      },
+      "cr2": "0x707c003fe8"
+    },
+    "limitation": "Stack guard fault; Java startup incomplete."
+  }
+}

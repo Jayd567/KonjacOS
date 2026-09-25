@@ -1,0 +1,65 @@
+{
+  "kernel_sha256": "788dd89edf1696e4aaf4e76f9c6f7df41297fc45f6b42de464e2116abffb2c03",
+  "tests": [
+    {
+      "label": "files-final",
+      "messages": [
+        "PASS CLONE_FILES inheritance, shared offsets/open/close, lazy reads and creator lifetime"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "files-uefi",
+      "messages": [
+        "PASS CLONE_FILES inheritance, shared offsets/open/close, lazy reads and creator lifetime"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "files-read",
+      "messages": [
+        "PASS multi-chunk read/pread, lazy destination, EOF, offsets and real String class bytes"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "files-vm",
+      "messages": [
+        "PASS mmap validation, splitting, lazy permissions, holes, shared threads, capacity rollback"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    },
+    {
+      "label": "files-timed",
+      "messages": [
+        "PASS timed futex relative/absolute clocks, validation, wake cleanup, glibc condition timeout"
+      ],
+      "cpu_exceptions": 0,
+      "kernel_panics": 0
+    }
+  ],
+  "java": [
+    {
+      "label": "java-files",
+      "output": "",
+      "pread_ebadf": 0,
+      "clock_nanosleep_enosys": 26,
+      "cpu_exceptions": 0,
+      "kernel_panics": 0,
+      "limitation": "Bounded trace, no startup/exit completion claim. Default run preceded a comments-only rebuild; interpreter run uses final kernel."
+    },
+    {
+      "label": "java-files-int",
+      "output": "Picked up JAVA_TOOL_OPTIONS: -Xint\n",
+      "pread_ebadf": 0,
+      "clock_nanosleep_enosys": 0,
+      "cpu_exceptions": 0,
+      "kernel_panics": 0,
+      "limitation": "Bounded trace, no startup/exit completion claim. Default run preceded a comments-only rebuild; interpreter run uses final kernel."
+    }
+  ]
+}
