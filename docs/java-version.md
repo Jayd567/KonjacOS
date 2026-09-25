@@ -112,21 +112,113 @@ This is the exact milestone the roadmap's item 1 named as still open
 around anything, but by finishing the disk placement item 51 already
 pointed at and closing the real `argv[1..]` gap it happened to expose.
 
-## What isn't shown
+## Closing more of the gap: eight more real syscalls
 
-The run does **not** reach a clean `exit_group`. After printing the
-version banner, HotSpot goes on to spin up its own background threads
-(compiler/GC/sweeper), each of which hits several syscalls this kernel
-doesn't implement yet -- observed on screen: `273` (`set_robust_list`),
-`334` (`rseq`), `302` (`prlimit64`), `96` (`gettimeofday`), `157`
-(`prctl`), `229` (`clock_getres`), `107` (`geteuid`), `41` (`socket`).
-Each returns this kernel's generic "unimplemented" response and HotSpot
-evidently tolerates the failure and keeps going (no crash observed), but
-across a 90s and a separate 100s run the console's final state was
-identical and no shell prompt or process-exit indication ever reappeared
--- consistent with new threads continuing to start up (or spin) rather
-than the VM shutting down cleanly. Real, unmodified JVM shutdown --
-and therefore a real `java -jar` run all the way to completion -- needs at
-least some of those syscalls implemented; not established or attempted
-here. `-version`'s own required output is real and confirmed; a clean
-process exit is not.
+The first `java -version` run (above) didn't reach a clean `exit_group`:
+after the banner, HotSpot's own background compiler/GC/sweeper threads
+each hit several syscalls this kernel didn't implement --
+`273` (`set_robust_list`), `334` (`rseq`), `302` (`prlimit64`), `96`
+(`gettimeofday`), `157` (`prctl`), `229` (`clock_getres`), `107`
+(`geteuid`), `41` (`socket`) -- and the console's final state was
+identical across a 90s and a separate 100s run, no process-exit ever
+observed.
+
+Implemented in `linux_syscall.rs`, all following the module's existing
+"real value where this kernel has one, honest refusal where it doesn't"
+discipline:
+
+* `gettimeofday`/`clock_getres` -- same boot-relative `timer::ticks()`
+  source `clock_gettime` already used; `clock_getres` reports this
+  kernel's real 10ms (100Hz) tick granularity, not a fabricated
+  high-resolution value.
+* `getuid`/`geteuid`/`getgid`/`getegid` -- `0`, matching the `AT_UID`/
+  `AT_EUID`/`AT_GID`/`AT_EGID` auxv entries `loader.rs` already reports;
+  this kernel has no real user/permission model to back up anything else.
+* `prctl` -- accepted no-op (every glibc thread calls `PR_SET_NAME` once
+  at startup; nothing here reads thread names back yet).
+* `set_robust_list` -- accepted, not acted on (this kernel's futex/task-
+  death paths don't walk the registered list; every glibc thread calls
+  this once, unconditionally, so refusing it outright was pure noise).
+* `prlimit64` -- honest real numbers for `RLIMIT_NOFILE` (matches
+  `task::MAX_OPEN_FILES`) and `RLIMIT_STACK` (8 MiB soft/unlimited hard,
+  real Linux's own common default); unlimited for everything else;
+  *setting* a new limit is refused (`ENOSYS`) since nothing here enforces
+  limits for a new one to change.
+* `rseq` -- explicit `ENOSYS` (same value the catch-all already gave it,
+  just named so it stops logging once per thread): real per-context-
+  switch `cpu_id` maintenance isn't implemented, and modern glibc already
+  treats a failed registration as "unavailable" and falls back cleanly.
+
+Verified: `run hello.exe` unaffected. `run
+/usr/lib/jvm/java-21-openjdk-amd64/bin/java -version`'s own visible
+output is unchanged (same real banner), but the console noise after it
+dropped from a long stream of unimplemented-syscall lines spanning eight
+different thread addresses down to three total (`137` `statfs`, `41`
+`socket` x2, both from what's almost certainly `AttachListener` probing
+its `/tmp` attach-socket path once) -- consistent with most of HotSpot's
+own thread-startup bookkeeping now actually succeeding instead of
+silently failing and retrying. Screen saved at
+[`trace-java-exit.png`](../trace-java-exit.png).
+
+## Still not a clean `exit_group`
+
+A separate run with the GDB syscall tracer left on (`KONJAC_TRACE_SYSCALLS=1`,
+the default) caught the actual steady state directly instead of inferring
+it from console silence: at the 60-second mark, three futex waits are
+still pending --
+
+```
+{"n": 202, "args": ["0x7001c34990", "0x109", "0x6", ...]}   // timed FUTEX_WAIT_BITSET
+{"n": 202, "args": ["0x700176bc10", "0x89",  "0x0", ...]}   // untimed FUTEX_WAIT_BITSET
+{"n": 202, "args": ["0x700176ce90", "0x89",  "0x0", ...]}   // untimed FUTEX_WAIT_BITSET
+```
+
+and the trace log up to that point shows the same three waits repeatedly
+expiring (`ret: -110`, `ETIMEDOUT`) and immediately being reissued --
+consistent with HotSpot's real `WatcherThread`/safepoint-polling steady
+state (see item 51's own README entry: "six successful sleeps in JVM
+safepoint synchronization" was this same loop, observed earlier in
+startup). No `exit`/`exit_group` (syscalls 60/231) appears anywhere in
+either trace. This is real, ordinary HotSpot background-thread behavior,
+not a hang this kernel is directly causing -- but real `java -version` on
+real Linux reaches `JNI_DestroyJavaVM` and tears these threads down
+within milliseconds of printing the banner, and this kernel's guest never
+gets there within a 60-second observation window.
+
+**Not yet established:** what specifically real HotSpot's shutdown path
+needs from this kernel that it isn't getting. A real lead, though, from
+`strace -f java -version` on the host (the same free-ground-truth
+technique every prior item in this chain has used) -- real shutdown's
+last ~20 syscalls, across several threads:
+
+```
+unlink("/tmp/hsperfdata_root/<pid>")       # PerfData shared file cleanup
+futex(..., FUTEX_WAKE_PRIVATE, N)          # main thread wakes worker threads
+rt_sigprocmask(...)                        # each worker unblocks its signal mask
+gettid()
+futex(..., FUTEX_WAIT_PRIVATE, ...)        # a couple of final synchronization waits
+madvise(..., MADV_DONTNEED)
+exit(0)                                     # each worker thread, individually
+...
+exit_group(0)                               # the main thread, last
+```
+
+Every one of those primitives (`futex` WAKE/WAIT, `rt_sigprocmask`,
+`gettid`, `madvise`, `exit`/`exit_group`) is already implemented here.
+What's conspicuously *absent* from the KonjacOS guest trace, though, is
+`mkdir`/`mkdirat` (real HotSpot creates `/tmp/hsperfdata_<user>/<pid>` --
+a memory-mapped shared performance-counter file `jps`/`jstat` read --
+early in startup, before any of the above): it never appears as an
+"unimplemented syscall" line on the guest console at all, meaning
+whatever code path real HotSpot takes to get to that `mkdir` either isn't
+reached the same way here, or fails differently/earlier than on real
+Linux (where a failed `mkdir` -- e.g. no writable `/tmp` -- is a
+well-known, documented, non-fatal case: PerfData just gets disabled).
+That divergence, not a single missing syscall, is the most concrete next
+thing to chase: single-step (GDB, same harness `tools/trace_jvm.py`
+already drives) through HotSpot's own `PerfMemory::create_memory_region`/
+`os::Linux::create_file_for_heap`-equivalent path on the guest and
+compare against the host trace's own timing, the same way items 36-38
+tracked down the `strtold`/`abort` misdiagnosis. `-version`'s own required
+output is real and confirmed; a clean process exit, and therefore a full
+`java -jar` run to completion, is closer but not yet demonstrated.

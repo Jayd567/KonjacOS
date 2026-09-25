@@ -3258,18 +3258,37 @@ See item 44 for the matched-binary evidence and actual futex failure.
     kernel panic, across two independent runs. This is the exact milestone
     item 1's own roadmap text named as unverified.
 
-    Not shown: a clean `exit_group`. After the banner, HotSpot spins up
-    background compiler/GC/sweeper threads that hit several syscalls this
-    kernel doesn't implement (`273` `set_robust_list`, `334` `rseq`, `302`
-    `prlimit64`, `96` `gettimeofday`, `157` `prctl`, `229` `clock_getres`,
-    `107` `geteuid`, `41` `socket`); each gets this kernel's generic
-    "unimplemented" response, HotSpot evidently tolerates the failure and
-    keeps going (no crash), but the console's final state was identical
-    across a 90s and a 100s run with no process-exit or new shell prompt
-    ever appearing. `-version`'s own required output is real and
-    confirmed; a full `java -jar` run to completion needs at least some of
-    those syscalls implemented, not attempted here. See [staging steps,
-    the argv fix and full evidence](docs/java-version.md).
+    Not shown, originally: a clean `exit_group`. After the banner, HotSpot
+    spun up background compiler/GC/sweeper threads that hit eight
+    syscalls this kernel didn't implement (`273` `set_robust_list`, `334`
+    `rseq`, `302` `prlimit64`, `96` `gettimeofday`, `157` `prctl`, `229`
+    `clock_getres`, `107` `geteuid`, `41` `socket`). All eight are now
+    implemented -- real values where this kernel has real state to back
+    them (`gettimeofday`/`clock_getres` off the same tick source
+    `clock_gettime` uses, `prlimit64`'s `RLIMIT_NOFILE`/`RLIMIT_STACK`
+    matching real per-task limits), honest no-ops/refusals where it
+    doesn't (`prctl`, `set_robust_list`, `rseq`, uid/gid). Console noise
+    after the banner dropped from a long stream spanning eight different
+    thread addresses down to three total calls (`137` `statfs`, `41`
+    `socket` x2, almost certainly `AttachListener` probing its `/tmp`
+    socket path once) -- most of HotSpot's own thread-startup bookkeeping
+    now genuinely succeeds instead of silently failing and retrying.
+
+    Still no `exit_group`, though: a syscall-traced run instead directly
+    caught the real steady state -- three futex waits (one timed
+    `FUTEX_WAIT_BITSET`, two untimed) repeatedly expiring and being
+    reissued, HotSpot's own real `WatcherThread`/safepoint-polling loop
+    (the same one item 51 first observed), never progressing to shutdown
+    within a 60-second window. A real `strace -f java -version` on the
+    host names every primitive its own shutdown sequence actually needs
+    (`futex` WAKE/WAIT, `rt_sigprocmask`, `gettid`, `madvise`,
+    `exit`/`exit_group`) -- all already implemented here -- and one
+    conspicuous absence from the guest trace: `mkdir`/`mkdirat` never
+    appears at all, even though real HotSpot creates a
+    `/tmp/hsperfdata_<user>/<pid>` PerfData file early in startup. That
+    divergence, not one missing syscall, is the concrete next thing to
+    chase. See [staging steps, the argv fix, the eight new syscalls and
+    full evidence](docs/java-version.md).
 
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.

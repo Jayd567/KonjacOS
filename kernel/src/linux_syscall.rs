@@ -117,6 +117,16 @@ const SYS_GETCPU: u64 = 309;
 const SYS_UNAME: u64 = 63;
 const SYS_MADVISE: u64 = 28;
 const SYS_SYSINFO: u64 = 99;
+const SYS_GETTIMEOFDAY: u64 = 96;
+const SYS_CLOCK_GETRES: u64 = 229;
+const SYS_GETUID: u64 = 102;
+const SYS_GETGID: u64 = 104;
+const SYS_GETEUID: u64 = 107;
+const SYS_GETEGID: u64 = 108;
+const SYS_PRCTL: u64 = 157;
+const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_PRLIMIT64: u64 = 302;
+const SYS_RSEQ: u64 = 334;
 
 // Real Linux clock IDs sys_clock_gettime actually answers -- see its own
 // doc comment for why all three collapse to the same "ticks since boot"
@@ -157,6 +167,12 @@ const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ETIMEDOUT: i64 = -110;
 const ENOENT: i64 = -2;
+
+// Real Linux RLIMIT_* resource numbers sys_prlimit64 actually special-cases
+// below -- see its own doc comment.
+const RLIMIT_STACK: u64 = 3;
+const RLIMIT_NOFILE: u64 = 7;
+const RLIM_INFINITY: u64 = u64::MAX;
 
 /// A real Linux `struct stat` (x86_64, musl and glibc layout match) is
 /// 144 bytes -- see `sys_fstat`'s doc comment for exactly which fields
@@ -305,6 +321,39 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // mapped page's contents actually depends on any of them yet.
         SYS_MADVISE => 0,
         SYS_SYSINFO => sys_sysinfo(a0),
+        SYS_GETTIMEOFDAY => sys_gettimeofday(a0, a1),
+        SYS_CLOCK_GETRES => sys_clock_getres(a0, a1),
+        // This kernel has no real user/group model (every task already
+        // runs with full kernel privilege -- see `apex.rs` for the one
+        // place that distinction is emulated at all) -- root (0) for all
+        // four is the same honest answer `loader.rs`'s own auxv
+        // AT_UID/AT_EUID/AT_GID/AT_EGID entries already give a spawned
+        // program, not a fabricated non-zero identity this kernel can't
+        // back up with real permission checks.
+        SYS_GETUID => 0,
+        SYS_GETEUID => 0,
+        SYS_GETGID => 0,
+        SYS_GETEGID => 0,
+        SYS_PRCTL => sys_prctl(a0),
+        // set_robust_list: accepted, not acted on. Real Linux uses the
+        // registered list to clean up a dead thread's held futexes for
+        // other threads waiting on them; this kernel's own futex/task-
+        // death paths don't consult it, the same honestly-scoped gap
+        // `sys_futex`'s own doc comment already admits for cross-task
+        // robustness. Every glibc thread startup calls this once,
+        // unconditionally -- refusing it outright would make ordinary
+        // thread creation noisy for no benefit.
+        SYS_SET_ROBUST_LIST => 0,
+        SYS_PRLIMIT64 => sys_prlimit64(a1, a2, a3),
+        // rseq: real restartable-sequence support needs this kernel's own
+        // scheduler to keep a per-task `struct rseq`'s `cpu_id` field
+        // updated across every context switch -- not implemented. Real
+        // glibc (since 2.35) already treats a failed registration as
+        // "unavailable, don't use it" and falls back cleanly -- explicit
+        // `ENOSYS` here is the same honest refusal the catch-all below
+        // already gave it, just named instead of anonymous, so it doesn't
+        // spam the console once per thread.
+        SYS_RSEQ => ENOSYS,
         SYS_FCNTL => 0, // accepted no-op -- see the module docs; only ever seen used for FD_CLOEXEC bookkeeping this kernel doesn't need (every fd is already private per-task, see task::OpenFile).
         SYS_MMAP => sys_mmap(a0, a1, a2, a3, a4),
         SYS_MPROTECT => sys_mprotect(a0, a1, a2),
@@ -901,6 +950,95 @@ fn sys_clock_gettime(clk_id: u64, ts_ptr: u64) -> i64 {
     unsafe {
         core::ptr::write_unaligned(ts_ptr as *mut i64, tv_sec);
         core::ptr::write_unaligned((ts_ptr + 8) as *mut i64, tv_nsec);
+    }
+    0
+}
+
+/// Real Linux `gettimeofday(2)` -- superseded by `clock_gettime` on
+/// modern glibc for anything that actually cares about a specific clock,
+/// but still called directly during real HotSpot startup (observed:
+/// before `java -version`'s own banner ever prints). Backed by the same
+/// boot-relative `timer::ticks()` source `sys_clock_gettime` already
+/// uses, just reported as `{sec, usec}` (a real `struct timeval`) instead
+/// of `{sec, nsec}`. `tz_ptr`, the second, long-obsolete `struct
+/// timezone` argument, is real Linux's own permanent no-op -- ignored
+/// here for the same reason real glibc's own wrapper never fills it in
+/// either.
+fn sys_gettimeofday(tv_ptr: u64, _tz_ptr: u64) -> i64 {
+    if tv_ptr == 0 {
+        return 0;
+    }
+    let ticks = timer::ticks();
+    let tv_sec = (ticks / timer::HZ as u64) as i64;
+    let tv_usec = ((ticks % timer::HZ as u64) * (1_000_000 / timer::HZ as u64)) as i64;
+    unsafe {
+        core::ptr::write_unaligned(tv_ptr as *mut i64, tv_sec);
+        core::ptr::write_unaligned((tv_ptr + 8) as *mut i64, tv_usec);
+    }
+    0
+}
+
+/// Real Linux `clock_getres(2)`. Reports this kernel's own real,
+/// honest timer granularity -- one PIT tick (`timer::HZ`, currently
+/// 100Hz, i.e. 10 milliseconds) -- rather than a fabricated
+/// "1 nanosecond" a genuine high-resolution clock source would claim:
+/// every clock id this kernel answers (`sys_clock_gettime`'s own
+/// REALTIME/MONOTONIC/BOOTTIME) is backed by that same PIT tick counter,
+/// so they honestly share one real resolution.
+fn sys_clock_getres(clk_id: u64, res_ptr: u64) -> i64 {
+    if clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_BOOTTIME {
+        return EINVAL;
+    }
+    if res_ptr != 0 {
+        let nsec = 1_000_000_000 / timer::HZ as i64;
+        unsafe {
+            core::ptr::write_unaligned(res_ptr as *mut i64, 0i64);
+            core::ptr::write_unaligned((res_ptr + 8) as *mut i64, nsec);
+        }
+    }
+    0
+}
+
+/// Real Linux `prctl(2)`. Observed so far only from real glibc's own
+/// per-thread startup (`PR_SET_NAME`, naming the new thread for `/proc`/
+/// debugger display) -- accepted as a no-op for every option, the same
+/// "real syscall, no observable effect this kernel's own `ps` needs yet"
+/// treatment `SYS_FCNTL` already gets above. A specific option feeding
+/// into `ps`'s own display can grow real behavior here later; nothing
+/// observed calling this so far depends on it doing more than
+/// succeeding.
+fn sys_prctl(_option: u64) -> i64 {
+    0
+}
+
+/// Real Linux `prlimit64(2)`, called by real glibc/HotSpot startup to
+/// query resource limits (`RLIMIT_STACK` sizes JVM guard pages;
+/// `RLIMIT_NOFILE` sizes descriptor-table ergonomics). The first argument
+/// (`pid`) is always this task's own real pid in every call observed, so
+/// it's read but not consulted here, same treatment `SYS_OPENAT`'s
+/// `dirfd` already gets. *Setting* a new limit (`new_limit != 0`) is
+/// honestly refused with `ENOSYS`: this kernel enforces no actual
+/// resource limits for a new one to change the meaning of. *Querying*
+/// (`old_limit != 0`) answers with real, sane values -- `RLIMIT_NOFILE`
+/// matches this kernel's own fixed per-task open-file table size (see
+/// `task::MAX_OPEN_FILES`), `RLIMIT_STACK` matches real Linux's own
+/// common default (8 MiB soft, unlimited hard); every other resource
+/// honestly reports unlimited rather than a fabricated specific number
+/// this kernel doesn't actually track or enforce.
+fn sys_prlimit64(resource: u64, new_limit: u64, old_limit: u64) -> i64 {
+    if new_limit != 0 {
+        return ENOSYS;
+    }
+    if old_limit != 0 {
+        let (cur, max): (u64, u64) = match resource {
+            RLIMIT_NOFILE => (task::MAX_OPEN_FILES as u64, task::MAX_OPEN_FILES as u64),
+            RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY),
+            _ => (RLIM_INFINITY, RLIM_INFINITY),
+        };
+        unsafe {
+            core::ptr::write_unaligned(old_limit as *mut u64, cur);
+            core::ptr::write_unaligned((old_limit + 8) as *mut u64, max);
+        }
     }
     0
 }

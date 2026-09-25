@@ -1,0 +1,5 @@
+# Vendored/prebuilt third-party sources -- not this project's own code.
+# See README.md's project-layout section for what each of these is.
+kernel/csrc/doom/** linguist-vendored
+kernel/csrc/doom_include/** linguist-vendored
+limine/** linguist-vendored
