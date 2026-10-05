@@ -82,6 +82,12 @@ ICONS = [
     ("SETTINGS_32", "settings", 32, "regular"),
     ("SETTINGS_32_FILLED", "settings", 32, "filled"),
     ("SETTINGS_20", "settings", 20, "regular"),
+    ("COLOR_20", "color", 20, "regular"),
+    ("CURSOR_20", "cursor", 20, "regular"),
+    ("CLOCK_20", "clock", 20, "regular"),
+    ("STORAGE_20", "storage", 20, "regular"),
+    ("LAPTOP_20", "laptop", 20, "regular"),
+    ("SEARCH_20", "search", 20, "regular"),
 ]
 
 # Cursor pack files in `cursor::Shape` order (kernel/src/cursor.rs).

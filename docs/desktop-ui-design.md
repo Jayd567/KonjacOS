@@ -34,7 +34,7 @@ Added since the brief:
 | Desktop shortcuts and pinning | `icons.rs`: shortcuts made with "Create Shortcut", on a grid, saved with the pinned apps to `/DESKTOP.CFG`; `Desktop` handles selection, dragging and rubber-band select. The taskbar is `Desktop::task_apps`: pinned apps, then any other running ones |
 | Window snapping | `Desktop::snap_target` / `set_snap` (a glass `SnapPreview` layered just under the dragged window) / `snap_window`; `restore` remembers the pre-snap size |
 | Keyboard shortcuts | `keyboard.rs` `desktop_filter` keeps shortcuts (and everything while a menu is open, via `set_capture`) away from the shell and DOOM; `Desktop::on_key` acts on them, including the Alt+Tab `Switcher` |
-| Settings | `settings.rs`: one global `Settings` with a revision counter the desktop watches (`apply_settings`); drawn gradient wallpapers; saved as `set` lines in `/DESKTOP.CFG` |
+| Settings | `settings.rs`: one global `Settings` with a revision counter the desktop watches (`apply_settings`); drawn gradient wallpapers; saved as `set` lines in `/DESKTOP.CFG`. The app has a sidebar of sections and a search box over an `INDEX` of settings and related words; typing reaches it through `App::wants_keys` / `App::key` |
 | Pointer shapes | `cursor.rs` (all 17 cursors from the pack, two of them animated); `Desktop::pick_cursor` picks one from the current drag or what's under the pointer, apps answer for their client area through `App::cursor` |
 
 Differences from the brief:

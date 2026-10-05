@@ -1231,7 +1231,8 @@ impl Desktop {
         while let Some(k) = keyboard::read_desktop_key() {
             self.on_key(k);
         }
-        let want = self.menu.is_some() || self.start.open || self.switcher.is_some();
+        let typing = self.active().is_some_and(|i| self.windows[i].app.wants_keys());
+        let want = self.menu.is_some() || self.start.open || self.switcher.is_some() || typing;
         if want != self.capture {
             self.capture = want;
             keyboard::set_capture(want);
@@ -1281,7 +1282,12 @@ impl Desktop {
             b't' if ctrl && alt => self.launch(AppKind::Terminal),
             _ if self.menu.is_some() => self.menu_key(k.code),
             _ if self.start.open => self.start_key(k.code),
-            _ => {}
+            _ => {
+                if let Some(i) = self.active().filter(|&i| self.windows[i].app.wants_keys()) {
+                    let reply = self.windows[i].app.key(k.code);
+                    self.apply_reply(i, reply);
+                }
+            }
         }
     }
 

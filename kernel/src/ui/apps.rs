@@ -214,6 +214,17 @@ pub trait App {
     fn loading(&self) -> bool {
         false
     }
+    /// Whether this app has a text field with focus. While it does (and
+    /// its window is in front), keys come to [`App::key`] instead of the
+    /// shell.
+    fn wants_keys(&self) -> bool {
+        false
+    }
+    /// A key for the focused text field: lowercase ASCII, or one of
+    /// `keyboard::KEY_*`.
+    fn key(&mut self, _code: u8) -> Reply {
+        Reply::default()
+    }
 }
 
 /// A slightly darker inset panel for content to sit on.

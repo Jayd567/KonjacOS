@@ -8,7 +8,8 @@
 //! - **The desktop** ([`read_desktop_key`]): its shortcuts (Alt+Tab,
 //!   Alt+F4, Super and Super+key, Ctrl+Alt+T), and every key while it has
 //!   asked for them with [`set_capture`] (a menu or the Alt+Tab switcher
-//!   is open). These never reach the shell or DOOM.
+//!   is open, or an app's text field -- Settings' search -- has focus).
+//!   These never reach the shell or DOOM.
 //! - **DOOM**, while its window has focus ([`set_doom_focus`]): press and
 //!   release events, through its own ring.
 //! - **The shell** otherwise: ASCII characters.
@@ -248,6 +249,7 @@ pub const KEY_F4: u8 = 8;
 pub const KEY_SUPER: u8 = 9;
 /// Alt released after an Alt+Tab.
 pub const KEY_ALT_UP: u8 = 10;
+pub const KEY_BACKSPACE: u8 = 11;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
@@ -323,6 +325,8 @@ fn desktop_code(code: u8) -> u8 {
         0x4B => KEY_LEFT,
         0x4D => KEY_RIGHT,
         0x3E => KEY_F4,
+        0x0E => KEY_BACKSPACE,
+        0x39 => b' ',
         c if c < 0x80 && SCANCODE_ASCII[c as usize].is_ascii_alphanumeric() => SCANCODE_ASCII[c as usize],
         _ => 0,
     }

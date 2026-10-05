@@ -39,8 +39,10 @@ ready-to-boot images.
     arrows/Enter/Esc in menus and Start.
   - Tooltips on the tray's memory, CPU and clock.
   - Apps: Terminal (the shell), Files, Monitor, DOOM, Sketch (a small
-    drawing app), Settings (wallpaper, accent colour, glass strength,
-    pointer and double-click speed, 12/24-hour clock) and About.
+    drawing app), Settings and About. Settings is split into sections
+    (Personalization, Mouse, Date & time, Storage, System) with a search
+    box: wallpaper, accent colour, glass strength, pointer and
+    double-click speed, 12/24-hour clock, disk space and system info.
 - The `doom` command and the taskbar both open DOOM in a desktop window.
 
 ### Changed
