@@ -6,6 +6,7 @@
 #   make disk     - build the FAT16 data disk (disk.img) from disk_root/
 #   make run      - build the ISO + disk and boot them in QEMU (BIOS)
 #   make run-uefi - build the ISO + disk and boot them in QEMU (UEFI, via OVMF)
+#   make release  - build both images and package them into dist/
 #   make clean    - remove build output
 #
 # `make disk` needs `mkfs.vfat` and `mcopy` (Debian/Ubuntu: `apt install
@@ -21,6 +22,10 @@ IMAGE         := image.iso
 DISK_ROOT     := disk_root
 DISK_IMAGE    := disk.img
 DISK_SIZE_MB  := 400
+LIMINE_VERSION := 9.6.7
+VERSION       ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+DIST          := dist
+LIMINE_BINS   := $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin
 
 ifeq ($(MODE),release)
 	CARGO_FLAGS := --release
@@ -43,8 +48,20 @@ all: iso
 kernel:
 	cd $(KERNEL_DIR) && cargo build $(CARGO_FLAGS)
 
+# The BIOS/CD boot stages are binary-only and not committed; fetch them from
+# the official Limine binary release that matches the committed limine.h.
+$(LIMINE_BINS):
+	rm -rf .cache/limine
+	git clone --quiet --depth 1 --branch v$(LIMINE_VERSION)-binary \
+		https://github.com/limine-bootloader/limine.git .cache/limine
+	cp .cache/limine/limine-bios.sys .cache/limine/limine-bios-cd.bin \
+		.cache/limine/limine-uefi-cd.bin $(LIMINE_DIR)/
+
+$(LIMINE_DIR)/limine: $(LIMINE_DIR)/limine.c
+	$(MAKE) -C $(LIMINE_DIR)
+
 .PHONY: iso
-iso: kernel
+iso: kernel $(LIMINE_BINS) $(LIMINE_DIR)/limine
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/limine
 	mkdir -p $(ISO_ROOT)/EFI/BOOT
@@ -91,10 +108,20 @@ run-uefi: iso disk
 		-drive if=pflash,format=raw,unit=1,file=/usr/share/OVMF/OVMF_VARS_4M.fd \
 		-cdrom $(IMAGE) $(DISK_DRIVE)
 
+.PHONY: release
+release: iso disk
+	rm -rf $(DIST) && mkdir -p $(DIST)
+	cp $(IMAGE) $(DIST)/konjacos-$(VERSION).iso
+	cd $(DIST) && cp ../$(DISK_IMAGE) konjacos-$(VERSION)-disk.img && \
+		zip -q -9 konjacos-$(VERSION)-disk.zip konjacos-$(VERSION)-disk.img && \
+		rm konjacos-$(VERSION)-disk.img
+	cd $(DIST) && sha256sum * > SHA256SUMS
+	@echo "Release files are in $(DIST)/"
+
 .PHONY: clean
 clean:
 	cd $(KERNEL_DIR) && cargo clean
-	rm -rf $(ISO_ROOT) $(IMAGE)
+	rm -rf $(ISO_ROOT) $(IMAGE) $(DIST)
 	@echo "(leaving $(DISK_IMAGE) alone -- rm it yourself if you want a fresh one)"
 
 # Hosted glibc fixture for the Linux ABI; not linked into the kernel.
@@ -113,6 +140,11 @@ io-fixture:
 	gcc -O2 userprogs/io_glibc.c -o $(DISK_ROOT)/IOCHK.ELF
 	python3 -c "from pathlib import Path; Path('$(DISK_ROOT)/IOPAT.BIN').write_bytes(bytes((i*37+i//251)&255 for i in range(65539)))"
 	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/IOCHK.ELF $(DISK_ROOT)/IOPAT.BIN ::/; fi
+
+.PHONY: statfs-fixture
+statfs-fixture:
+	gcc -O2 userprogs/statfs_glibc.c -o $(DISK_ROOT)/STATFS.ELF
+	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/STATFS.ELF ::/STATFS.ELF; fi
 
 .PHONY: largefile-fixture
 largefile-fixture:

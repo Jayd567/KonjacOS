@@ -56,7 +56,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::paging;
 use crate::sync::IrqSpinLock;
 
-pub const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 64;
 const STACK_SIZE: usize = 32 * 1024;
 
 /// Where a ring-3 task's heap starts, for `syscall.rs`'s `SYS_BRK` --
@@ -388,7 +388,7 @@ pub fn hash_path(path: &str) -> u64 {
     if hash == 0 { 1 } else { hash }
 }
 
-pub const MAX_OPEN_FILES: usize = 16;
+pub const MAX_OPEN_FILES: usize = 64;
 
 static TASKS: IrqSpinLock<[Option<Task>; MAX_TASKS]> = IrqSpinLock::new([const { None }; MAX_TASKS]);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -916,6 +916,30 @@ pub fn exit_current() -> ! {
     task_exit()
 }
 
+/// Real Linux `exit_group(2)`: terminates every task sharing the caller's
+/// address space (its sibling threads), then exits the caller itself.
+/// Siblings are only marked `Terminated`; `schedule` reaps them, and the
+/// last one reaped frees the shared address space, exactly as for [`kill`].
+/// A kernel thread (whose `cr3` is the shared kernel one) only exits
+/// itself.
+pub fn exit_group() -> ! {
+    {
+        let mut tasks = TASKS.lock();
+        let current = CURRENT.load(Ordering::Relaxed);
+        let cr3 = tasks[current].as_ref().map(|t| t.cr3);
+        if let Some(cr3) = cr3.filter(|&c| c != KERNEL_CR3.load(Ordering::Relaxed)) {
+            for (i, slot) in tasks.iter_mut().enumerate() {
+                if let Some(task) = slot {
+                    if i != current && task.cr3 == cr3 {
+                        task.state = TaskState::Terminated;
+                    }
+                }
+            }
+        }
+    }
+    task_exit()
+}
+
 /// Terminates *another* task by ID -- for example the shell's `kill`
 /// command stopping a runaway or unwanted task (DOOM included) without
 /// waiting for it to exit on its own. Unlike [`exit_current`], this doesn't
@@ -1006,7 +1030,7 @@ pub fn schedule() {
                 // that hasn't even run its last instruction yet. Only the
                 // last thread out actually tears it down -- a simple linear
                 // scan under the same `TASKS` lock this whole loop already
-                // holds, cheap at `MAX_TASKS` = 16 and always consistent
+                // holds, cheap at `MAX_TASKS` = 64 and always consistent
                 // since nothing else can be mutating the table concurrently.
                 if let Some(t) = &tasks[i] {
                     let cr3 = t.cr3;

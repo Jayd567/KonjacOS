@@ -119,8 +119,7 @@ to matter over a ~90-second JVM run):
   ```
 
   No CPU exception, no kernel panic, across two independent runs (90s and
-  100s) with identical final screen state both times. Screen saved at
-  [`trace-java-version.png`](../trace-java-version.png).
+  100s) with identical final screen state both times.
 
 This is the exact milestone the roadmap's item 1 named as still open
 ("Startup still needs a successful end-to-end run; full VM startup and
@@ -173,8 +172,7 @@ different thread addresses down to three total (`137` `statfs`, `41`
 `socket` x2, both from what's almost certainly `AttachListener` probing
 its `/tmp` attach-socket path once) -- consistent with most of HotSpot's
 own thread-startup bookkeeping now actually succeeding instead of
-silently failing and retrying. Screen saved at
-[`trace-java-exit.png`](../trace-java-exit.png).
+silently failing and retrying.
 
 ## Still not a clean `exit_group`
 

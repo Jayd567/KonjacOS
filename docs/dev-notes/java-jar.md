@@ -1,7 +1,7 @@
 # Toward `java -jar`: the first new blocker, `statx`
 
 With `java -version` reaching a real, clean `exit_group` (see
-`docs/java-version.md`), the natural next real test is a `java -jar` run
+`java-version.md`), the natural next real test is a `java -jar` run
 that actually loads and executes bytecode, not just prints a banner and
 exits -- the real next milestone on the way to a `java -jar
 minecraft_server.jar`-shaped goal.
@@ -50,7 +50,7 @@ same `Error: An unexpected error occurred while trying to open file
 
 A targeted GDB trace (filtered `linux_syscall_handler` entry breakpoints,
 the same low-overhead technique the `mkdir`/`hsperfdata` investigation in
-`docs/java-version.md` used, watching `open`/`openat`/`fstat`/`statx`/
+`java-version.md` used, watching `open`/`openat`/`fstat`/`statx`/
 `pread64`/`read`/`lseek`/`mmap`) shows the *real* `statx("/hello.jar")`
 call succeeding (`ret=0`), then a real `openat("/hello.jar")` succeeding
 (`ret=3`), then a sequence of `lseek`+`read` pairs against that fd that
@@ -118,7 +118,7 @@ syscall).
 reaches the *exact same* steady-state safepoint-polling futex loop
 (`FUTEX_WAIT_BITSET`, `ETIMEDOUT`, repeating) that a real `java -version`
 run reaches before its own eventual clean `exit_group` (see
-`docs/java-version.md`). This strongly suggests the `Error:` line is a
+`java-version.md`). This strongly suggests the `Error:` line is a
 real but non-fatal warning from one specific attribute-read call (most
 likely the launcher's own CDS-archive-related jar check, which has its
 own independent, tolerant error handling separate from the main
@@ -262,7 +262,7 @@ this document spent the previous sections characterizing indirectly
 through syscall traces. A `getdents64` (syscall 217) unimplemented-
 syscall line also appeared in this run, from the disk's `hsperfdata_root`
 already existing from an earlier manual test in the same session (the
-"already exists" validation dance -- see `docs/java-version.md` --
+"already exists" validation dance -- see `java-version.md` --
 which this kernel still doesn't support); worth ruling out as a
 contributing factor on a genuinely fresh disk before chasing anything
 deeper.
@@ -300,7 +300,7 @@ This is suggestive but **not, on its own, conclusive** -- a real,
 healthy timed wait can legitimately be "mid-flight" at any single
 instant merely because the observation happened to land during one; the
 same steady-state pattern (several `FUTEX_WAIT_BITSET` calls cycling
-through wait/timeout/reissue) is exactly what `docs/java-version.md`
+through wait/timeout/reissue) is exactly what `java-version.md`
 documented for a real, *successful* `java -version` run's safepoint
 polling, before it eventually reached `exit_group`.
 
@@ -353,3 +353,134 @@ synchronization primitive lives at that guest virtual address, which
 needs matching it against HotSpot's own real source (`src/hotspot/os/
 posix/`'s `Parker`/`PlatformMonitor`, most likely) rather than anything
 further this kernel's own tooling alone can resolve.
+
+## Correction: task 5 is just `pthread_join`; the real hang is `System.exit`
+
+The section above treated task 5's single untimed wait as the deadlock.
+It isn't. The `java` launcher never runs Java code on its primordial
+thread: `ContinueInNewThread` starts a new thread for `JavaMain` and then
+`pthread_join`s it. glibc's join is an untimed futex wait on the child's
+`CLONE_CHILD_CLEARTID` word, which this kernel clears and wakes in
+`task_exit`. So task 5 waiting forever is expected for as long as the
+`JavaMain` thread (task 6) stays alive.
+
+**Confirmed directly**, with temporary instrumentation in `block_until`
+(log every untimed wait, plus any task whose `child_tidptr` equals the
+wait address; reverted afterwards):
+
+```
+TMPDBG wait task 5 (run:elf) addr=0x7001c36990 untimed
+TMPDBG   == child_tidptr of task 6 (thread) state=Ready
+```
+
+In the successful `java -cp / Hello world` control run, task 6 exits with
+`child_tidptr=Some(7001c36990)` and task 5 then exits immediately, so the
+join path works.
+
+**The hang isn't jar-specific.** That `Error:` line comes from the Java
+side of the launcher (`LauncherHelper`), which reports a failure and then
+calls `System.exit(1)`. `-version` and a normal `main` return never take
+that path. Test program `userprogs/java/ExitOne.java` prints a line and
+calls `System.exit(1)`:
+
+| Command | Result |
+| --- | --- |
+| `java -cp / Hello world` | prints, all threads exit, clean |
+| `java -cp / ExitOne world` | prints `ExitOne: calling System.exit(1)`, then hangs |
+| `java -jar /hello.jar world` | prints `Error: ...`, then hangs |
+
+The two hangs look identical. `ps` shows the same pile of `blocked`
+threads (5, 6, 9-17). Both serial logs end with task 6 on the same untimed
+wait at `0x700176dc34`, with several workers (11, 13, 14, 15) parked on a
+shared address `0x7078000d84`.
+
+So there are two separate problems:
+
+1. **`System.exit` never finishes** (the hang). `Runtime.exit` goes to
+   `Shutdown`, then `halt0`, then `vm_exit`. That queues a `VM_Exit`
+   operation for the VMThread, which has to bring every Java thread to a
+   safepoint before calling `::exit`. The next step is to find which
+   thread task 6 is waiting on at `0x700176dc34` (most likely the
+   VMThread handshake or safepoint, or the `Threads_lock`), and what the
+   workers parked on `0x7078000d84` are waiting for.
+2. **The `IOException` behind the `Error:` line** (why `-jar` takes the
+   exit path at all). Both runs also print `unimplemented syscall number
+   137` (`statfs`) and `41` (`socket`, `AF_UNIX`). These show up in the
+   successful `-cp` runs too, so neither is jar-specific on its own. The
+   next step is to make the launcher print the actual exception, or try
+   `java -cp /hello.jar Hello`, to see which call fails.
+
+## Resolved: `exit_group` only ended the calling thread
+
+Temporary instrumentation (reverted) logged a frame-pointer walk of the
+user stack on every untimed futex wait and on every `exit`/`exit_group`,
+plus each shared library's load address. Symbolized against the
+`openjdk-21-dbg` debug info for the exact `libjvm.so` on the disk:
+
+- Task 6 (`JavaMain`): `JVM_Halt` -> `vm_exit` -> `VMThread::execute`
+  -> `wait_until_executed`, waiting on `VMOperation_lock`.
+- Tasks 11, 13, 14, 15 (signal, monitor deflation, C1, C2 threads):
+  `SafepointSynchronize::block`, correctly parked for a safepoint.
+- Task 8: **the VMThread**. It ran `VM_Exit` at that safepoint and
+  called glibc `exit()`, which ended in `exit_group(1)`.
+
+This kernel handled `exit_group` exactly like `exit`, so only the VMThread
+died and every other thread stayed parked forever. The process had in fact
+finished `System.exit` correctly.
+
+Fix: `exit_group` now marks every task sharing the caller's address space
+as terminated, then exits the caller. The scheduler reaps them, and the
+last one frees the address space.
+
+Results after the fix (`ps` afterwards shows only the kernel's own tasks):
+
+| Command | Result |
+| --- | --- |
+| `java -cp / ExitOne` | prints, exits, all threads gone |
+| `java -cp / ExitZero` | prints, exits, all threads gone |
+| `java -cp / Hello world` | prints, exits |
+| `java -version` | prints banner, exits |
+| `java -jar /hello.jar world` | prints the `Error:` line, then exits |
+
+Remaining issues:
+
+1. `-jar` still fails to open the jar (the `IOException` behind the
+   `Error:` line). Suspects: `statfs` (137) and `socket` (41) are
+   unimplemented, though both also appear in successful runs.
+2. In 1 of 6 `System.exit` runs, glibc printed `free(): invalid pointer`
+   during `exit()` and called `tgkill` (234, unimplemented) to abort.
+   This happens before `exit_group`, so it is unrelated to this fix.
+3. `MAX_TASKS` is 16, and this JVM already uses every slot (3 kernel
+   tasks plus 13 JVM threads). Larger Java programs will need more.
+
+## Resolved: `java -jar` runs
+
+Three changes, tested together in one boot (`hello.exe`, a `statfs`
+check, `java -jar`, `java -version`, `System.exit(1)`, then `ps` showing
+only the kernel's own tasks):
+
+1. **`MAX_TASKS` 16 -> 64.** The JVM alone was using 13 of 16 slots.
+   Each live task costs a 32 KiB kernel stack, so 64 tasks is about 2 MiB
+   of the 96 MiB heap at most.
+2. **`statfs`/`fstatfs` (137/138).** Disk paths report the real FAT16
+   geometry (`f_type` `0x4d44`, one block per 8 KiB cluster, total and
+   free clusters counted from FAT copy 0). On the test disk this gave
+   51170 blocks with 23706 free, matching an independent count of the
+   image and `mdir`'s free-bytes figure exactly. `/proc` paths report an
+   empty procfs. `userprogs/statfs_glibc.c` prints the fields.
+   This removed syscall 137 from Java startup but did **not** change the
+   `-jar` result.
+3. **The actual `-jar` bug: `open` returned fds 0-2.** With
+   `-Dsun.java.launcher.diag=true` the launcher printed the real
+   exception: `java.io.IOException: No such file or directory` from
+   `FileDescriptor.close0`, while `java -cp /hello.jar Hello` already
+   worked. The kernel's `open` took the lowest free table slot starting
+   at 0, so the jar became fd 0. The JDK never closes fds 0-2; it opens
+   `/dev/null` and `dup2`s it over them instead, and `/dev/null` does not
+   exist here, hence `ENOENT`. It also meant reads and writes on such a
+   file went to the console. `open` now starts at fd 3, as on Linux, and
+   the per-process fd table grew from 16 to 64 entries.
+
+Still unimplemented but harmless in these runs: `socket` (41),
+`getdents64` (217, when `/tmp/hsperfdata_root` already exists), `dup`
+(32), `tgkill` (234).
