@@ -5,12 +5,10 @@
 //! `_entry` (see `boot.rs`) with interrupts disabled. `_entry` enables SSE
 //! and then calls [`kstart`], which brings up serial output, installs our
 //! own GDT/TSS and IDT (so CPU exceptions print a message instead of
-//! silently triple-faulting), reads the framebuffer/memory map Limine
-//! handed us, draws a boot splash, brings up the PS/2 keyboard (masking
-//! every other legacy-PIC IRQ, since nothing else has a handler yet), and
-//! finally hands off to a small interactive shell. There's still no
-//! scheduler, no physical memory allocator, no heap -- see the README for
-//! a suggested order to add those next.
+//! silently triple-faulting), memory management and the scheduler, draws
+//! the "K" boot logo, brings up the keyboard, mouse, timer and filesystem,
+//! starts the desktop (see `ui/`), and finally runs the shell -- whose
+//! output the desktop's Terminal window shows.
 
 #![no_std]
 #![no_main]
@@ -41,6 +39,7 @@ mod paging;
 mod pic;
 mod pmm;
 mod port;
+mod rtc;
 mod serial;
 mod sha256;
 mod shell;
@@ -48,9 +47,9 @@ mod sync;
 mod syscall;
 mod task;
 mod timer;
+mod ui;
 mod usermode;
 mod vm;
-mod wm;
 
 use core::panic::PanicInfo;
 
@@ -112,8 +111,8 @@ pub extern "C" fn kstart() -> ! {
     unsafe {
         task::init();
     }
-    commands::spawn_demo_tasks();
-    sprintln!("preemptive scheduler installed -- a couple of demo kernel threads are running.");
+    task::spawn_idle();
+    sprintln!("preemptive scheduler installed (with an idle task).");
 
     unsafe {
         syscall::init();
@@ -134,8 +133,8 @@ pub extern "C" fn kstart() -> ! {
         );
         fb_dims = Some((fb.width, fb.height));
         let mut canvas = Canvas::new(fb);
-        canvas.draw_boot_splash();
-        sprintln!("boot splash drawn -- {OS_NAME} is alive.");
+        canvas.draw_boot_logo();
+        sprintln!("boot logo drawn -- {OS_NAME} is alive.");
         console::CONSOLE.lock().attach(canvas);
         true
     } else {
@@ -152,7 +151,7 @@ pub extern "C" fn kstart() -> ! {
         unsafe {
             mouse::init(w, h);
         }
-        sprintln!("PS/2 mouse driver installed -- try the `gui` shell command.");
+        sprintln!("PS/2 mouse driver installed (scroll wheel: {}).", if mouse::has_wheel() { "yes" } else { "no" });
     }
 
     unsafe {
@@ -163,6 +162,15 @@ pub extern "C" fn kstart() -> ! {
     match unsafe { fat16::init() } {
         Ok(()) => sprintln!("FAT16 filesystem mounted from the primary ATA disk."),
         Err(e) => sprintln!("no filesystem mounted ({e}) -- `ls`/`cat` won't work."),
+    }
+
+    // The desktop takes over the screen before interrupts (and with them
+    // the scheduler) start, so nothing the first tasks print -- the ring-3
+    // demos, the shell's banner -- is ever drawn over the boot logo; it all
+    // lands in the Terminal window instead.
+    if have_console {
+        ui::start();
+        sprintln!("desktop started.");
     }
 
     // Safe to enable interrupts now: every CPU exception has a handler

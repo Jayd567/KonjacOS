@@ -10,7 +10,10 @@ The long-term goal is to run Minecraft: Java Edition.
 ## Features
 
 - Boots through the [Limine](https://limine-bootloader.org/) bootloader
-  on BIOS and UEFI.
+  on BIOS and UEFI, straight into a desktop.
+- A "liquid glass" desktop drawn entirely in software: squircle windows,
+  a floating taskbar and menus made of glass that blurs, refracts and
+  tints whatever is behind it.
 - Preemptive multitasking, with each user program in its own address space.
 - Virtual memory with demand paging, `mmap`, memory protection and
   no-execute pages.
@@ -19,7 +22,7 @@ The long-term goal is to run Minecraft: Java Edition.
 - Runs ELF64 (static and dynamic), PE32+ `.exe` and flat binary programs.
 - A Linux compatibility layer that runs unmodified glibc and musl
   programs, including threads and signals.
-- DOOM, playable in a window.
+- DOOM, playable in a desktop window.
 - OpenJDK 21: `java -version`, and simple Java programs run from a
   folder or a `.jar` file.
 
@@ -36,16 +39,39 @@ qemu-system-x86_64 -m 256M -boot order=d \
 ```
 
 The ISO boots on its own, but without the disk image there are no files
-to browse and no DOOM. Once the `konjac>` prompt appears, type `help`.
+to browse and no DOOM. For a smoother desktop, add `-accel whpx` on
+Windows, `-accel kvm` on Linux or `-accel hvf` on macOS.
 
-Things to try:
+KonjacOS boots to the desktop with the Terminal open. Start lists every
+app, and typing in it searches apps, settings and the files on the disk;
+the taskbar shows the apps that are running plus any you pin
+(right-click an app, then "Pin to Taskbar"). The "K" in the top-left
+corner has About, the system monitor, Restart and Shut Down. Typing goes
+to whichever window is in front: the shell in the Terminal, Notepad,
+Files, or DOOM.
+
+Files opens, creates, renames, copies, moves and deletes files and
+folders, and Notepad edits text files; double-clicking a `.txt` file
+opens it there.
+
+The desktop starts empty: right-click an app, or a file or folder in
+Files, and choose "Create Shortcut" to put it there. Pins, shortcuts
+and Settings are saved to `DESKTOP.CFG` on the disk. Right-click almost
+anything for a menu, resize windows from any edge or corner, and drag
+them to a screen edge to snap them.
+
+Keyboard shortcuts: Alt+Tab, Alt+F4, Super (Start), Super+arrows (snap),
+Super+D (show desktop), Super+E (Files), Super+I (Settings),
+Ctrl+Alt+T (Terminal). In QEMU, click into the window first so it has
+grabbed the keyboard, or the host OS may take Alt+Tab and Super itself.
+
+Things to try in the Terminal:
 
 ```
 ls                 list files on the disk
 cat README.TXT     print a file
 run hello.exe      run a Windows-format program
-doom               play DOOM
-gui                open the window manager (Esc to exit)
+doom               play DOOM (opens in its own window)
 ps                 list running tasks
 ```
 
@@ -61,7 +87,6 @@ ps                 list running tasks
 | `run <file> [args]` | Run a program |
 | `ps`, `kill <id>` | List or stop running tasks |
 | `doom` | Play DOOM |
-| `gui` | Open the window manager |
 | `meminfo`, `uptime` | Show memory use and uptime |
 | `reboot`, `halt` | Restart or stop the machine (needs the admin password) |
 
@@ -101,9 +126,7 @@ Add `MODE=release` to any of these for an optimized build.
    Minecraft talks to a local server over a socket.
 3. **Graphics.** OpenGL support for LWJGL, most likely through a software
    renderer.
-4. **Desktop.** A new desktop with a taskbar and glass-style windows
-   ([design notes](docs/desktop-ui-design.md)).
-5. **Minecraft.**
+4. **Minecraft.**
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
@@ -112,9 +135,12 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 | Path | Contents |
 | --- | --- |
 | `kernel/src/` | The kernel, in Rust |
+| `kernel/src/ui/` | The desktop ([design notes](docs/desktop-ui-design.md)) |
+| `kernel/assets/` | Wallpaper, logo, icons and fonts baked into the kernel |
 | `kernel/csrc/` | C code built into the kernel, including the DOOM port |
 | `disk_root/` | Files copied onto the disk image |
 | `userprogs/` | Small test programs |
+| `tools/` | Debugging scripts, the asset generator and a QEMU screenshot harness |
 | `boot/`, `limine/` | Bootloader configuration and files |
 | `docs/` | Design notes and development history |
 

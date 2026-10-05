@@ -10,7 +10,6 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::console;
 use crate::port::outb;
@@ -61,7 +60,6 @@ pub static COMMANDS: &[Command] = &[
     Command { name: "apex", summary: "show whether an apex check is currently cached", requires_apex: false, handler: cmd_apex },
     Command { name: "ps", summary: "list running kernel threads (see also: multitasking)", requires_apex: false, handler: cmd_ps },
     Command { name: "kill", summary: "<id>  terminate a running task by ID (see `ps`)", requires_apex: false, handler: cmd_kill },
-    Command { name: "gui", summary: "open the window manager (drag windows by their title bar; Esc to exit)", requires_apex: false, handler: cmd_gui },
     Command { name: "cdemo", summary: "run a small C function (malloc/free) compiled into the kernel -- DOOM groundwork", requires_apex: false, handler: cmd_cdemo },
     Command { name: "cio", summary: "run compiled C printf + file I/O (fopen/fread/fwrite) -- DOOM groundwork", requires_apex: false, handler: cmd_cio },
     Command { name: "doom", summary: "launch DOOM (needs DOOM1.WAD at the filesystem root)", requires_apex: false, handler: cmd_doom },
@@ -276,15 +274,8 @@ fn cmd_kill(rest: &str) {
         None => println!("kill: no live task with ID {id}"),
         Some(name) => {
             if task::kill(id) {
-                if name == "doom" {
-                    // DOOM owns the framebuffer for as long as it's
-                    // running -- its last rendered frame is still sitting
-                    // there even though the task drawing it is now gone,
-                    // so wipe it back to a clean console instead of
-                    // leaving a frozen game screen with nothing left
-                    // updating it.
-                    console::CONSOLE.lock().clear();
-                }
+                // (Killing DOOM also closes its window: the desktop notices
+                // the task is gone.)
                 println!("kill: task #{id} ({name}) terminated");
             } else {
                 println!("kill: task #{id} ({name}) was already terminated");
@@ -299,47 +290,6 @@ fn cmd_ps(_rest: &str) {
         let marker = if is_current { "*" } else { " " };
         println!("{marker} {:<4} {:<10} {:<10} {:>10}", id, name, state.label(), ticks_run);
     }
-    let (a, b) = demo_counters();
-    println!("counter-a's loop count: {a}, counter-b's loop count: {b} (proof both are actually spinning, not just scheduled)");
-}
-
-// --- Demo kernel threads --------------------------------------------------
-//
-// Two background tasks spawned at boot purely to prove the scheduler in
-// task.rs actually preempts and round-robins rather than just compiling:
-// each spins bumping its own counter, so `ps`'s TICKS column (how many
-// timer ticks task.rs actually handed each task) climbing for *all three*
-// tasks -- these two plus the shell -- at once is the visible evidence that
-// this is real preemptive multitasking, not just one thread pretending.
-
-static DEMO_COUNTER_A: AtomicU64 = AtomicU64::new(0);
-static DEMO_COUNTER_B: AtomicU64 = AtomicU64::new(0);
-
-pub fn spawn_demo_tasks() {
-    task::spawn("counter-a", demo_task_a);
-    task::spawn("counter-b", demo_task_b);
-}
-
-fn demo_task_a() {
-    loop {
-        DEMO_COUNTER_A.fetch_add(1, Ordering::Relaxed);
-        core::hint::spin_loop();
-    }
-}
-
-fn demo_task_b() {
-    loop {
-        DEMO_COUNTER_B.fetch_add(1, Ordering::Relaxed);
-        core::hint::spin_loop();
-    }
-}
-
-fn demo_counters() -> (u64, u64) {
-    (DEMO_COUNTER_A.load(Ordering::Relaxed), DEMO_COUNTER_B.load(Ordering::Relaxed))
-}
-
-fn cmd_gui(_rest: &str) {
-    crate::wm::run();
 }
 
 // --- C toolchain demo (DOOM-porting groundwork) ---------------------------
@@ -419,7 +369,6 @@ fn doom_task_entry() {
     let argv: [*const u8; 1] = [argv0];
     unsafe {
         doomgeneric_Create(1, argv.as_ptr());
-        crate::doom_driver::doom_window_init();
         loop {
             doomgeneric_Tick();
         }
@@ -433,15 +382,27 @@ fn doom_task_entry() {
 const DOOM_STACK_SIZE: usize = 1024 * 1024;
 
 fn cmd_doom(_rest: &str) {
-    println!("doom: launching as its own task -- quit from DOOM's own menu to return to the shell, or run `kill <id>` (see `ps`) to stop it early.");
-    // Drop whatever's still queued from typing "doom" + Enter itself,
-    // so DOOM's very first DG_GetKey call doesn't see them as game
-    // input (see clear_doom_events's own doc comment).
-    crate::keyboard::clear_doom_events();
-    match task::spawn_with_stack("doom", doom_task_entry, DOOM_STACK_SIZE) {
-        Some(id) => println!("doom: task #{id} spawned"),
-        None => println!("doom: failed to spawn task (out of task slots?)"),
+    match launch_doom() {
+        Ok(id) => println!("doom: task #{id} spawned -- it opens in its own window. Close the window (or `kill {id}`) to stop it."),
+        Err(e) => println!("doom: {e}"),
     }
+}
+
+/// Starts DOOM as its own task, unless it's already running -- shared by
+/// the `doom` command and the desktop's taskbar.
+pub fn launch_doom() -> Result<u64, &'static str> {
+    if let Some(id) = crate::doom_driver::running_task() {
+        return Ok(id);
+    }
+    if crate::fat16::stat_path("/DOOM1.WAD").is_err() {
+        return Err("DOOM1.WAD not found at the filesystem root (boot with the disk image attached)");
+    }
+    // Drop whatever's still queued in the DOOM key ring, so DOOM's very
+    // first DG_GetKey call doesn't see stale keystrokes as game input.
+    crate::keyboard::clear_doom_events();
+    let id = task::spawn_with_stack("doom", doom_task_entry, DOOM_STACK_SIZE).ok_or("failed to spawn task (out of task slots?)")?;
+    crate::doom_driver::set_running_task(id);
+    Ok(id)
 }
 
 // --- The "big trio" loader ------------------------------------------------

@@ -1,8 +1,10 @@
 //! PS/2 mouse driver -- the "auxiliary device" on the same 8042 controller
 //! the keyboard already uses. `init()` enables it, unmasks IRQ12, and
 //! installs a handler that decodes the classic 3-byte packet format into a
-//! clamped on-screen cursor position + button state, which `wm.rs` polls
-//! every frame.
+//! clamped on-screen cursor position + button state, which the desktop (`ui/desktop.rs`) polls
+//! every frame. A mouse that answers the IntelliMouse "knock" (sample
+//! rates 200, 100, 80) sends a fourth byte with the scroll wheel's
+//! movement, collected for [`take_wheel`].
 
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
@@ -23,6 +25,10 @@ const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_WRITE_TO_MOUSE: u8 = 0xD4;
 const MOUSE_SET_DEFAULTS: u8 = 0xF6;
 const MOUSE_ENABLE_REPORTING: u8 = 0xF4;
+const MOUSE_SET_SAMPLE_RATE: u8 = 0xF3;
+const MOUSE_GET_ID: u8 = 0xF2;
+/// What `MOUSE_GET_ID` answers once the wheel is switched on.
+const ID_INTELLIMOUSE: u8 = 3;
 
 pub const LEFT_BUTTON: u8 = 1 << 0;
 #[allow(dead_code)] // Read via buttons(); not everything using this driver cares about every button yet.
@@ -35,14 +41,24 @@ static POS_Y: AtomicI32 = AtomicI32::new(0);
 static BUTTONS: AtomicU8 = AtomicU8::new(0);
 static SCREEN_W: AtomicI32 = AtomicI32::new(1);
 static SCREEN_H: AtomicI32 = AtomicI32::new(1);
+/// Wheel notches since the last [`take_wheel`]; positive = towards the
+/// user (scroll down).
+static WHEEL: AtomicI32 = AtomicI32::new(0);
+/// 4 with a wheel, else 3.
+static PACKET_SIZE: AtomicU8 = AtomicU8::new(3);
 
 // Packet assembly state. Single producer (IRQ12, which runs with
 // interrupts disabled for its own duration) and single consumer (nothing
 // reads these directly -- only the fully-decoded POS_X/POS_Y/BUTTONS
 // above), so plain `static mut` is safe here the same way keyboard.rs's
 // ring buffer reasons about its own producer side.
-static mut PACKET: [u8; 3] = [0; 3];
+static mut PACKET: [u8; 4] = [0; 4];
 static mut PACKET_INDEX: u8 = 0;
+/// Timer tick of the last byte received. A packet's three bytes arrive
+/// back to back, so a byte arriving after a gap always starts a new packet
+/// -- that's what recovers from a stray byte (such as a late ACK from
+/// `init`) instead of staying misaligned and reading garbage from then on.
+static mut LAST_BYTE_TICK: u64 = 0;
 
 unsafe fn wait_write_ready() {
     unsafe {
@@ -101,6 +117,19 @@ pub unsafe fn init(screen_w: u64, screen_h: u64) {
 
         mouse_write(MOUSE_SET_DEFAULTS);
         mouse_read_ack();
+        // The IntelliMouse knock: these three sample rates in a row turn
+        // the wheel on, and the mouse then reports a different ID.
+        for rate in [200, 100, 80] {
+            mouse_write(MOUSE_SET_SAMPLE_RATE);
+            mouse_read_ack();
+            mouse_write(rate);
+            mouse_read_ack();
+        }
+        mouse_write(MOUSE_GET_ID);
+        mouse_read_ack();
+        if mouse_read_ack() == ID_INTELLIMOUSE {
+            PACKET_SIZE.store(4, Ordering::Relaxed);
+        }
         mouse_write(MOUSE_ENABLE_REPORTING);
         mouse_read_ack();
 
@@ -110,6 +139,16 @@ pub unsafe fn init(screen_w: u64, screen_h: u64) {
         idt::set_handler(pic::PIC2_OFFSET as usize + (IRQ_MOUSE - 8) as usize, isr_stub_44 as *const () as u64);
         pic::unmask(IRQ_MOUSE);
     }
+}
+
+/// Pointer speed in percent of the raw PS/2 movement.
+static SPEED_PERCENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+/// Sub-pixel movement carried over to the next packet, in 1/100 px.
+static mut REM_X: i32 = 0;
+static mut REM_Y: i32 = 0;
+
+pub fn set_speed_percent(percent: u32) {
+    SPEED_PERCENT.store(percent.clamp(10, 400), Ordering::Relaxed);
 }
 
 /// Current cursor position, already clamped to the screen.
@@ -122,8 +161,14 @@ pub fn buttons() -> u8 {
     BUTTONS.load(Ordering::Relaxed)
 }
 
-pub fn left_button_down() -> bool {
-    buttons() & LEFT_BUTTON != 0
+/// Whether the mouse reports a scroll wheel.
+pub fn has_wheel() -> bool {
+    PACKET_SIZE.load(Ordering::Relaxed) == 4
+}
+
+/// Wheel notches turned since the last call (positive = scroll down).
+pub fn take_wheel() -> i32 {
+    WHEEL.swap(0, Ordering::Relaxed)
 }
 
 /// Called by `isr_stub_44` for every mouse interrupt. Assembles the classic
@@ -136,16 +181,32 @@ pub fn left_button_down() -> bool {
 #[unsafe(no_mangle)]
 extern "C" fn irq12_handler() {
     let byte = unsafe { inb(CONTROLLER_DATA) };
+    let now = crate::timer::ticks();
     unsafe {
+        if PACKET_INDEX != 0 && now.wrapping_sub(LAST_BYTE_TICK) > 2 {
+            PACKET_INDEX = 0;
+        }
+        LAST_BYTE_TICK = now;
         if PACKET_INDEX == 0 && byte & 0x08 == 0 {
             pic::send_eoi(IRQ_MOUSE);
             return;
         }
         PACKET[PACKET_INDEX as usize] = byte;
         PACKET_INDEX += 1;
-        if PACKET_INDEX == 3 {
+        if PACKET_INDEX == PACKET_SIZE.load(Ordering::Relaxed) {
             PACKET_INDEX = 0;
             let flags = PACKET[0];
+            if PACKET_SIZE.load(Ordering::Relaxed) == 4 {
+                let dz = PACKET[3] as i8 as i32;
+                if dz != 0 {
+                    WHEEL.fetch_add(dz, Ordering::Relaxed);
+                }
+            }
+            if flags & 0xC0 != 0 {
+                // X/Y overflow: the deltas are meaningless; drop it.
+                pic::send_eoi(IRQ_MOUSE);
+                return;
+            }
             let mut dx = PACKET[1] as i32;
             let mut dy = PACKET[2] as i32;
             if flags & 0x10 != 0 {
@@ -154,6 +215,15 @@ extern "C" fn irq12_handler() {
             if flags & 0x20 != 0 {
                 dy -= 256; // Sign-extend dy from its 9th bit in flags.
             }
+
+            // Pointer speed (a Settings option), keeping the fraction a
+            // slow speed would otherwise drop from small movements.
+            let speed = SPEED_PERCENT.load(Ordering::Relaxed) as i32;
+            let (fx, fy) = (dx * speed + REM_X, dy * speed + REM_Y);
+            dx = fx / 100;
+            dy = fy / 100;
+            REM_X = fx % 100;
+            REM_Y = fy % 100;
 
             let max_x = SCREEN_W.load(Ordering::Relaxed) - 1;
             let max_y = SCREEN_H.load(Ordering::Relaxed) - 1;

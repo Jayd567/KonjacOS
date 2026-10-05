@@ -67,6 +67,7 @@ extern "C" fn irq0_handler() {
     // call might not return here until a *different* task's own next timer
     // tick, and when it finally does, it's because that's genuinely this
     // task's turn again.
+    crate::task::account_tick();
     crate::task::schedule();
 }
 

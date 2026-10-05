@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 
 use crate::paging::{self, PAGE_WRITABLE};
 use crate::pmm;
-use crate::sync::SpinLock;
+use crate::sync::IrqSpinLock;
 
 /// Where the heap lives in virtual memory. Chosen to sit well away from
 /// both the higher-half kernel image (0xffffffff80000000+) and Limine's
@@ -75,7 +75,7 @@ struct FreeList {
     head: Option<NonNull<FreeBlock>>,
 }
 
-// Safety: single-core kernel; all access goes through `HEAP`'s SpinLock.
+// Safety: single-core kernel; all access goes through `HEAP`'s lock.
 unsafe impl Send for FreeList {}
 
 impl FreeList {
@@ -132,7 +132,14 @@ struct Heap {
     limit: u64,
 }
 
-static HEAP: SpinLock<Heap> = SpinLock::new(Heap { free: FreeList::new(), bump: 0, limit: 0 });
+/// Interrupt-safe on purpose. With a plain spinlock, a task preempted
+/// mid-`malloc` still holds the heap; anything that then allocates or frees
+/// with interrupts disabled -- `task::list` building its result under the
+/// `TASKS` lock, or `schedule` reaping a dead task's stack from inside the
+/// timer interrupt -- spins on it forever, and with interrupts off the
+/// holder never runs again to release it. Found when the desktop polled the
+/// task list while DOOM was allocating its way through startup.
+static HEAP: IrqSpinLock<Heap> = IrqSpinLock::new(Heap { free: FreeList::new(), bump: 0, limit: 0 });
 
 pub struct KernelAllocator;
 

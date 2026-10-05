@@ -393,6 +393,14 @@ pub const MAX_OPEN_FILES: usize = 64;
 static TASKS: IrqSpinLock<[Option<Task>; MAX_TASKS]> = IrqSpinLock::new([const { None }; MAX_TASKS]);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+/// Task-table slot of the idle task (see [`spawn_idle`]), or `usize::MAX`
+/// before it exists. `schedule` only ever picks it when nothing else can
+/// run, so a task blocked in [`sleep_ticks`]/`futex_wait` always has
+/// somewhere to switch to, and the CPU halts instead of spinning.
+static IDLE_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Timer ticks that landed while the idle task was running -- the basis
+/// for the desktop's CPU usage meter (see [`idle_ticks`]).
+static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 /// The address space every kernel thread runs in, captured once in
 /// [`init`] (at that point it's still whatever Limine + `heap::init` +
 /// friends left CR3 pointing at). `spawn` hands this to every kernel
@@ -1044,17 +1052,29 @@ pub fn schedule() {
             }
         }
 
+        // The idle task is skipped in the round-robin and only chosen as a
+        // last resort -- otherwise it would take a full timeslice every
+        // round even while real work is waiting.
+        let idle = IDLE_SLOT.load(Ordering::Relaxed);
         let mut next = current;
+        let mut found = false;
         for offset in 1..=MAX_TASKS {
             let candidate = (current + offset) % MAX_TASKS;
+            if candidate == idle {
+                continue;
+            }
             if let Some(task) = &tasks[candidate] {
                 let eligible = task.state == TaskState::Ready
                     || (candidate == current && task.state == TaskState::Running);
                 if eligible {
                     next = candidate;
+                    found = true;
                     break;
                 }
             }
+        }
+        if !found && idle < MAX_TASKS && tasks[idle].is_some() {
+            next = idle;
         }
 
         if next == current {
@@ -1130,9 +1150,66 @@ pub fn schedule() {
 /// Voluntarily gives up the rest of this task's timeslice. Not required --
 /// preemption via the timer means every `Ready` task gets a turn regardless
 /// -- but useful for a task that knows it has nothing to do right now.
-#[allow(dead_code)]
 pub fn yield_now() {
-    schedule();
+    with_interrupts_off(schedule);
+}
+
+/// Runs `f` (something that may switch tasks) with interrupts disabled,
+/// then restores the caller's interrupt flag *after* it resumes.
+///
+/// `switch_to` doesn't save RFLAGS, so a task resumes with whatever IF the
+/// switching-in side happened to have -- off, if that was the timer
+/// interrupt or another task's voluntary switch. Without restoring its own
+/// IF here, a task that yielded with interrupts on could come back with
+/// them off and never be preempted again (found as a whole-machine freeze:
+/// DOOM's sleep loop resumed with IF clear and spun in `schedule` forever,
+/// waiting for timer ticks that could no longer arrive).
+fn with_interrupts_off<R>(f: impl FnOnce() -> R) -> R {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    let r = f();
+    if flags & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti") };
+    }
+    r
+}
+
+/// Spawns the idle task: halts until the next interrupt, forever. See
+/// [`IDLE_SLOT`].
+pub fn spawn_idle() {
+    fn idle() {
+        loop {
+            unsafe { core::arch::asm!("sti; hlt") };
+        }
+    }
+    if let Some(id) = spawn("idle", idle) {
+        let tasks = TASKS.lock();
+        if let Some(slot) = tasks.iter().position(|t| t.as_ref().is_some_and(|t| t.id == id)) {
+            IDLE_SLOT.store(slot, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Called by the timer interrupt once per tick, before scheduling.
+pub fn account_tick() {
+    if CURRENT.load(Ordering::Relaxed) == IDLE_SLOT.load(Ordering::Relaxed) {
+        IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Timer ticks spent idle since boot.
+pub fn idle_ticks() -> u64 {
+    IDLE_TICKS.load(Ordering::Relaxed)
+}
+
+/// Sleeps the calling kernel task for at least `ticks` timer ticks,
+/// letting other tasks (or the idle task) have the CPU meanwhile -- what
+/// the shell and the desktop do between polls instead of spinning on
+/// `hlt`, which would hold on to their whole timeslice.
+pub fn sleep_ticks(ticks: u64) {
+    // `schedule` must not be interrupted by a timer tick partway through
+    // picking the next task (see the safety note at its `switch_to`).
+    with_interrupts_off(|| sleep_until(crate::timer::ticks() + ticks.max(1)));
 }
 
 /// Real `FUTEX_WAIT`: marks the current task [`TaskState::Blocked`] on

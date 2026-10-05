@@ -3,6 +3,17 @@
 //! ASCII, and hands characters to whoever's polling [`read_char`] -- the
 //! shell's input loop.
 //!
+//! Three destinations, decided per keystroke in the interrupt handler:
+//!
+//! - **The desktop** ([`read_desktop_key`]): its shortcuts (Alt+Tab,
+//!   Alt+F4, Super and Super+key, Ctrl+Alt+T), and every key while it has
+//!   asked for them with [`set_capture`] (a menu or the Alt+Tab switcher
+//!   is open, or an app's text field -- Settings' search -- has focus).
+//!   These never reach the shell or DOOM.
+//! - **DOOM**, while its window has focus ([`set_doom_focus`]): press and
+//!   release events, through its own ring.
+//! - **The shell** otherwise: ASCII characters.
+//!
 //! The actual IRQ1 entry point is a hand-written assembly stub
 //! (`isr_stub_33` in the `global_asm!` below) rather than a Rust function
 //! directly, for the same reason `idt.rs`'s exception stubs are assembly:
@@ -15,7 +26,7 @@
 //! assumed an SSE register would survive.
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::idt;
 use crate::pic;
@@ -199,8 +210,266 @@ const LEFT_SHIFT_MAKE: u8 = 0x2A;
 const LEFT_SHIFT_BREAK: u8 = 0xAA;
 const RIGHT_SHIFT_MAKE: u8 = 0x36;
 const RIGHT_SHIFT_BREAK: u8 = 0xB6;
+/// Prefix byte for the "extended" keys: arrows, right Ctrl/Alt, Super...
+const EXTENDED_PREFIX: u8 = 0xE0;
+const CTRL_CODE: u8 = 0x1D;
+const ALT_CODE: u8 = 0x38;
+const CAPS_CODE: u8 = 0x3A;
+/// Left and right Super ("Windows") keys, both E0-prefixed.
+const SUPER_L_CODE: u8 = 0x5B;
+const SUPER_R_CODE: u8 = 0x5C;
 
 static SHIFT_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CTRL_HELD: AtomicBool = AtomicBool::new(false);
+static ALT_HELD: AtomicBool = AtomicBool::new(false);
+static SUPER_HELD: AtomicBool = AtomicBool::new(false);
+/// The last byte was `EXTENDED_PREFIX`.
+static EXTENDED: AtomicBool = AtomicBool::new(false);
+/// Super went down and nothing else has been pressed since: releasing it
+/// is a tap (opens Start), not the end of a Super+key shortcut.
+static SUPER_ALONE: AtomicBool = AtomicBool::new(false);
+/// An Alt+Tab was handled while Alt has been down, so the desktop wants
+/// to hear when Alt comes back up (that's when the switcher commits).
+static ALT_TABBING: AtomicBool = AtomicBool::new(false);
+/// The desktop wants every key (a menu or the switcher is open).
+static CAPTURE: AtomicBool = AtomicBool::new(false);
+static CAPS_ON: AtomicBool = AtomicBool::new(false);
+
+// --- Keys for the desktop -----------------------------------------------------
+
+/// Desktop key codes: printable keys are their lowercase ASCII; these are
+/// the rest.
+pub const KEY_ESC: u8 = 1;
+pub const KEY_ENTER: u8 = 2;
+pub const KEY_TAB: u8 = 3;
+pub const KEY_UP: u8 = 4;
+pub const KEY_DOWN: u8 = 5;
+pub const KEY_LEFT: u8 = 6;
+pub const KEY_RIGHT: u8 = 7;
+pub const KEY_F4: u8 = 8;
+/// Super pressed and released on its own.
+pub const KEY_SUPER: u8 = 9;
+/// Alt released after an Alt+Tab.
+pub const KEY_ALT_UP: u8 = 10;
+pub const KEY_BACKSPACE: u8 = 11;
+pub const KEY_DELETE: u8 = 12;
+pub const KEY_HOME: u8 = 13;
+pub const KEY_END: u8 = 14;
+pub const KEY_PAGE_UP: u8 = 15;
+pub const KEY_PAGE_DOWN: u8 = 16;
+pub const KEY_F2: u8 = 17;
+pub const KEY_F5: u8 = 18;
+
+pub const MOD_SHIFT: u8 = 1;
+pub const MOD_CTRL: u8 = 2;
+pub const MOD_ALT: u8 = 4;
+pub const MOD_SUPER: u8 = 8;
+/// Caps Lock is on.
+pub const MOD_CAPS: u8 = 16;
+
+/// The character a printable desktop key `code` (its unshifted ASCII)
+/// types with `mods` held: Shift (or Caps Lock, for letters) gives the
+/// upper row.
+pub fn typed_char(code: u8, mods: u8) -> u8 {
+    let shift = mods & MOD_SHIFT != 0;
+    if code.is_ascii_lowercase() {
+        return if shift != (mods & MOD_CAPS != 0) { code.to_ascii_uppercase() } else { code };
+    }
+    if shift {
+        if let Some(i) = SCANCODE_ASCII.iter().position(|&c| c == code) {
+            if SCANCODE_ASCII_SHIFT[i] != 0 {
+                return SCANCODE_ASCII_SHIFT[i];
+            }
+        }
+    }
+    code
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DesktopKey {
+    pub code: u8,
+    /// `MOD_*` bits held when it was pressed.
+    pub mods: u8,
+}
+
+const DESK_RING_SIZE: usize = 32;
+static mut DESK_RING: [u16; DESK_RING_SIZE] = [0; DESK_RING_SIZE];
+static DESK_RING_HEAD: AtomicUsize = AtomicUsize::new(0);
+static DESK_RING_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+fn desk_ring_push(code: u8, mods: u8) {
+    let head = DESK_RING_HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % DESK_RING_SIZE;
+    if next == DESK_RING_TAIL.load(Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        DESK_RING[head] = ((mods as u16) << 8) | code as u16;
+    }
+    DESK_RING_HEAD.store(next, Ordering::Release);
+}
+
+/// The next shortcut or captured key for the desktop, if any.
+pub fn read_desktop_key() -> Option<DesktopKey> {
+    let tail = DESK_RING_TAIL.load(Ordering::Relaxed);
+    if tail == DESK_RING_HEAD.load(Ordering::Acquire) {
+        return None;
+    }
+    let v = unsafe { DESK_RING[tail] };
+    DESK_RING_TAIL.store((tail + 1) % DESK_RING_SIZE, Ordering::Release);
+    Some(DesktopKey { code: (v & 0xff) as u8, mods: (v >> 8) as u8 })
+}
+
+/// While on, every key goes to the desktop instead of the shell or DOOM.
+pub fn set_capture(on: bool) {
+    CAPTURE.store(on, Ordering::Relaxed);
+}
+
+fn mods_now() -> u8 {
+    let mut m = 0;
+    if SHIFT_HELD.load(Ordering::Relaxed) {
+        m |= MOD_SHIFT;
+    }
+    if CTRL_HELD.load(Ordering::Relaxed) {
+        m |= MOD_CTRL;
+    }
+    if ALT_HELD.load(Ordering::Relaxed) {
+        m |= MOD_ALT;
+    }
+    if SUPER_HELD.load(Ordering::Relaxed) {
+        m |= MOD_SUPER;
+    }
+    if CAPS_ON.load(Ordering::Relaxed) {
+        m |= MOD_CAPS;
+    }
+    m
+}
+
+/// The desktop key code for a make code, or 0 if the desktop has no use
+/// for it. Arrows arrive both E0-prefixed and as plain numpad codes.
+fn desktop_code(code: u8) -> u8 {
+    match code {
+        0x01 => KEY_ESC,
+        0x1C => KEY_ENTER,
+        0x0F => KEY_TAB,
+        0x48 => KEY_UP,
+        0x50 => KEY_DOWN,
+        0x4B => KEY_LEFT,
+        0x4D => KEY_RIGHT,
+        0x3E => KEY_F4,
+        0x0E => KEY_BACKSPACE,
+        0x53 => KEY_DELETE,
+        0x47 => KEY_HOME,
+        0x4F => KEY_END,
+        0x49 => KEY_PAGE_UP,
+        0x51 => KEY_PAGE_DOWN,
+        0x3C => KEY_F2,
+        0x3F => KEY_F5,
+        c if c < 0x80 && (0x20..0x7f).contains(&SCANCODE_ASCII[c as usize]) => SCANCODE_ASCII[c as usize],
+        _ => 0,
+    }
+}
+
+/// Whether a key pressed with `mods` held is one of the desktop's own
+/// shortcuts rather than input for the shell or DOOM.
+fn is_shortcut(key: u8, mods: u8) -> bool {
+    if key == 0 {
+        return false;
+    }
+    mods & MOD_SUPER != 0
+        || (mods & MOD_ALT != 0 && (key == KEY_TAB || key == KEY_F4))
+        || (mods & (MOD_CTRL | MOD_ALT) == MOD_CTRL | MOD_ALT && key == b't')
+}
+
+/// Handles modifier and desktop keys. Returns `true` if the scancode was
+/// used up here and must not reach the shell or DOOM.
+fn desktop_filter(scancode: u8, extended: bool) -> bool {
+    let pressed = scancode < 0x80;
+    let code = scancode & 0x7f;
+    match code {
+        SUPER_L_CODE | SUPER_R_CODE if extended => {
+            if pressed {
+                if !SUPER_HELD.swap(true, Ordering::Relaxed) {
+                    SUPER_ALONE.store(true, Ordering::Relaxed);
+                }
+            } else {
+                SUPER_HELD.store(false, Ordering::Relaxed);
+                if SUPER_ALONE.swap(false, Ordering::Relaxed) {
+                    desk_ring_push(KEY_SUPER, 0);
+                }
+            }
+            return true;
+        }
+        // The fake shifts some keyboards wrap extended keys in.
+        0x2A | 0x36 if extended => return true,
+        CTRL_CODE => CTRL_HELD.store(pressed, Ordering::Relaxed),
+        CAPS_CODE if pressed => {
+            CAPS_ON.fetch_xor(true, Ordering::Relaxed);
+        }
+        ALT_CODE => {
+            ALT_HELD.store(pressed, Ordering::Relaxed);
+            if !pressed && ALT_TABBING.swap(false, Ordering::Relaxed) {
+                desk_ring_push(KEY_ALT_UP, 0);
+            }
+        }
+        _ => {}
+    }
+    if !pressed {
+        return false;
+    }
+    let modifier = matches!(code, CTRL_CODE | ALT_CODE | 0x2A | 0x36);
+    if !modifier {
+        SUPER_ALONE.store(false, Ordering::Relaxed);
+    }
+    let key = desktop_code(code);
+    let mods = mods_now();
+    if is_shortcut(key, mods) || (CAPTURE.load(Ordering::Relaxed) && key != 0) {
+        if key == KEY_TAB && mods & MOD_ALT != 0 {
+            ALT_TABBING.store(true, Ordering::Relaxed);
+        }
+        desk_ring_push(key, mods);
+        return true;
+    }
+    false
+}
+
+/// Where keystrokes go: `false` = the ASCII ring (the shell, via the
+/// desktop's Terminal window), `true` = the DOOM event ring. The desktop
+/// flips this as keyboard focus moves between windows, so typing in the
+/// Terminal doesn't steer DOOM and vice versa.
+static DOOM_FOCUS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_doom_focus(doom: bool) {
+    let had = DOOM_FOCUS.load(Ordering::Relaxed);
+    if doom && !had {
+        clear_doom_events();
+    }
+    if !doom && had {
+        // DOOM won't see the releases of keys still held as focus moves
+        // away (Alt, after an Alt+Tab, most of all): release them now so
+        // it doesn't keep strafing or running when it comes back.
+        for code in [0x1D, 0x2A, 0x36, 0x38, 0x48, 0x4B, 0x4D, 0x50] {
+            let doomkey = SCANCODE_DOOMKEY[code];
+            if doomkey != 0 {
+                doom_ring_push(false, doomkey);
+            }
+        }
+    }
+    DOOM_FOCUS.store(doom, Ordering::Relaxed);
+}
+
+/// Queues `text` as if it had been typed -- how the desktop's menus run
+/// shell commands (`reboot`, `cat <file>`, ...) through the real shell, so
+/// they get its normal behaviour, apex password prompt included.
+pub fn inject(text: &str) {
+    // The ring is single-producer (the IRQ handler); keep it that way by
+    // pushing with interrupts off.
+    unsafe { core::arch::asm!("cli") };
+    for b in text.bytes() {
+        ring_push(b);
+    }
+    unsafe { core::arch::asm!("sti") };
+}
 
 // --- Single-producer/single-consumer ring buffer -------------------------
 //
@@ -265,6 +534,17 @@ pub unsafe fn init() {
 extern "C" fn irq1_handler() {
     let scancode = unsafe { inb(DATA_PORT) };
 
+    if scancode == EXTENDED_PREFIX {
+        EXTENDED.store(true, Ordering::Relaxed);
+        unsafe { pic::send_eoi(IRQ_KEYBOARD) };
+        return;
+    }
+    let extended = EXTENDED.swap(false, Ordering::Relaxed);
+    if desktop_filter(scancode, extended) {
+        unsafe { pic::send_eoi(IRQ_KEYBOARD) };
+        return;
+    }
+
     match scancode {
         LEFT_SHIFT_MAKE | RIGHT_SHIFT_MAKE => {
             SHIFT_HELD.store(true, Ordering::Relaxed);
@@ -272,7 +552,7 @@ extern "C" fn irq1_handler() {
         LEFT_SHIFT_BREAK | RIGHT_SHIFT_BREAK => {
             SHIFT_HELD.store(false, Ordering::Relaxed);
         }
-        code if code < 0x80 => {
+        code if code < 0x80 && !DOOM_FOCUS.load(Ordering::Relaxed) => {
             let shift = SHIFT_HELD.load(Ordering::Relaxed);
             let table = if shift { &SCANCODE_ASCII_SHIFT } else { &SCANCODE_ASCII };
             let ch = table[code as usize];
@@ -288,7 +568,7 @@ extern "C" fn irq1_handler() {
     // needs press *and* release events for movement keys, which the
     // ASCII ring above never reports at all (it's make-code-only).
     let (pressed, code) = if scancode < 0x80 { (true, scancode) } else { (false, scancode - 0x80) };
-    if (code as usize) < 128 {
+    if (code as usize) < 128 && DOOM_FOCUS.load(Ordering::Relaxed) {
         let doomkey = SCANCODE_DOOMKEY[code as usize];
         if doomkey != 0 {
             doom_ring_push(pressed, doomkey);

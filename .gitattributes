@@ -2,3 +2,12 @@
 kernel/csrc/doom/** linguist-vendored
 kernel/csrc/doom_include/** linguist-vendored
 limine/** linguist-vendored
+
+# Baked pixel/glyph data (see tools/gen_desktop_assets.py), never text.
+kernel/assets/** binary
+
+# Licence texts for the bundled fonts and icons: keep them as checked in.
+kernel/assets/licenses/** -binary text eol=lf
+
+# Shell scripts run under Linux/WSL even from a Windows checkout.
+*.sh text eol=lf
