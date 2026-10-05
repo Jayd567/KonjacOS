@@ -1,0 +1,48 @@
+name: Release
+
+# Push a tag like v0.2.0 to build the bootable images and publish a GitHub
+# Release. The release notes come from that version's section in CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso mtools dosfstools zip
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release images
+        run: make MODE=release VERSION=${{ github.ref_name }} release
+
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## / { if (found) exit; if ($0 ~ "^## \\[?v?" v "\\]?([ ]|$)") { found=1; next } }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: KonjacOS ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: dist/*

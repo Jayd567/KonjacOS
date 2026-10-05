@@ -1,7 +1,7 @@
 # Toward `java -jar`: the first new blocker, `statx`
 
 With `java -version` reaching a real, clean `exit_group` (see
-`docs/java-version.md`), the natural next real test is a `java -jar` run
+`java-version.md`), the natural next real test is a `java -jar` run
 that actually loads and executes bytecode, not just prints a banner and
 exits -- the real next milestone on the way to a `java -jar
 minecraft_server.jar`-shaped goal.
@@ -50,7 +50,7 @@ same `Error: An unexpected error occurred while trying to open file
 
 A targeted GDB trace (filtered `linux_syscall_handler` entry breakpoints,
 the same low-overhead technique the `mkdir`/`hsperfdata` investigation in
-`docs/java-version.md` used, watching `open`/`openat`/`fstat`/`statx`/
+`java-version.md` used, watching `open`/`openat`/`fstat`/`statx`/
 `pread64`/`read`/`lseek`/`mmap`) shows the *real* `statx("/hello.jar")`
 call succeeding (`ret=0`), then a real `openat("/hello.jar")` succeeding
 (`ret=3`), then a sequence of `lseek`+`read` pairs against that fd that
@@ -118,7 +118,7 @@ syscall).
 reaches the *exact same* steady-state safepoint-polling futex loop
 (`FUTEX_WAIT_BITSET`, `ETIMEDOUT`, repeating) that a real `java -version`
 run reaches before its own eventual clean `exit_group` (see
-`docs/java-version.md`). This strongly suggests the `Error:` line is a
+`java-version.md`). This strongly suggests the `Error:` line is a
 real but non-fatal warning from one specific attribute-read call (most
 likely the launcher's own CDS-archive-related jar check, which has its
 own independent, tolerant error handling separate from the main
@@ -262,7 +262,7 @@ this document spent the previous sections characterizing indirectly
 through syscall traces. A `getdents64` (syscall 217) unimplemented-
 syscall line also appeared in this run, from the disk's `hsperfdata_root`
 already existing from an earlier manual test in the same session (the
-"already exists" validation dance -- see `docs/java-version.md` --
+"already exists" validation dance -- see `java-version.md` --
 which this kernel still doesn't support); worth ruling out as a
 contributing factor on a genuinely fresh disk before chasing anything
 deeper.
@@ -300,7 +300,7 @@ This is suggestive but **not, on its own, conclusive** -- a real,
 healthy timed wait can legitimately be "mid-flight" at any single
 instant merely because the observation happened to land during one; the
 same steady-state pattern (several `FUTEX_WAIT_BITSET` calls cycling
-through wait/timeout/reissue) is exactly what `docs/java-version.md`
+through wait/timeout/reissue) is exactly what `java-version.md`
 documented for a real, *successful* `java -version` run's safepoint
 polling, before it eventually reached `exit_group`.
 
@@ -392,8 +392,7 @@ calls `System.exit(1)`:
 The two hangs look identical. `ps` shows the same pile of `blocked`
 threads (5, 6, 9-17). Both serial logs end with task 6 on the same untimed
 wait at `0x700176dc34`, with several workers (11, 13, 14, 15) parked on a
-shared address `0x7078000d84`. Screenshot:
-[`trace-java-exit1-hang.png`](trace-java-exit1-hang.png).
+shared address `0x7078000d84`.
 
 So there are two separate problems:
 
