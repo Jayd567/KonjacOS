@@ -2,10 +2,6 @@
 //! plus glyph rendering using the embedded font in `font.rs`. `console.rs`
 //! builds the actual scrolling text console on top of `draw_char`/`scroll_up`.
 
-extern crate alloc;
-
-use alloc::vec::Vec;
-
 use crate::font::{FONT8X8, GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::limine::Framebuffer;
 
@@ -76,31 +72,22 @@ impl Canvas {
         self.fill_rect(0, 0, self.fb.width, self.fb.height, r, g, b);
     }
 
-    /// Draws a small "boot splash": a dark background, a horizontal
-    /// gradient bar, and a border -- enough to see at a glance that the
-    /// framebuffer, pixel format, and pitch were all parsed correctly.
-    pub fn draw_boot_splash(&mut self) {
-        self.clear(18, 18, 24);
-
-        let bar_y = self.height() / 2 - 20;
-        let bar_h = 40;
-        let w = self.width();
-        for x in 0..w {
-            let t = x as f32 / w as f32;
-            let r = (20.0 + t * 100.0) as u8;
-            let g = (80.0 + t * 120.0) as u8;
-            let b = (200.0 - t * 80.0) as u8;
-            for y in bar_y..bar_y + bar_h {
-                self.put_pixel(x, y, r, g, b);
+    /// Draws the boot logo: the three-bar "K" (see `ui/assets.rs`),
+    /// white on black, centred. The desktop picks up from exactly this
+    /// frame for its boot animation.
+    pub fn draw_boot_logo(&mut self) {
+        self.clear(0, 0, 0);
+        let (lw, lh, mask) = crate::ui::assets::logo();
+        let x0 = (self.width() as i32 - lw) / 2;
+        let y0 = (self.height() as i32 - lh) / 2;
+        for y in 0..lh {
+            for x in 0..lw {
+                let a = mask[(y * lw + x) as usize];
+                if a != 0 && x0 + x >= 0 && y0 + y >= 0 {
+                    self.put_pixel((x0 + x) as u64, (y0 + y) as u64, a, a, a);
+                }
             }
         }
-
-        let border = 4;
-        let (w, h) = (self.width(), self.height());
-        self.fill_rect(0, 0, w, border, 240, 240, 240);
-        self.fill_rect(0, h - border, w, border, 240, 240, 240);
-        self.fill_rect(0, 0, border, h, 240, 240, 240);
-        self.fill_rect(w - border, 0, border, h, 240, 240, 240);
     }
 
     /// Draws one glyph from the embedded 8x8 font at pixel position
@@ -148,64 +135,27 @@ impl Canvas {
         }
     }
 
-    /// Unpacks the raw colour value that a previous `pack`/write left at
-    /// `(x, y)` back into 8-bit channels, using this framebuffer's own
-    /// channel shifts (never assume a fixed byte order -- see `pack`).
-    #[inline]
-    unsafe fn get_pixel_unchecked(&self, x: u64, y: u64) -> (u8, u8, u8) {
-        let offset = y * self.fb.pitch + x * (u64::from(self.fb.bpp) / 8);
-        let colour = unsafe {
-            let ptr = self.fb.address.add(offset as usize) as *const u32;
-            ptr.read_volatile()
-        };
-        let r = (colour >> self.fb.red_mask_shift) as u8;
-        let g = (colour >> self.fb.green_mask_shift) as u8;
-        let b = (colour >> self.fb.blue_mask_shift) as u8;
-        (r, g, b)
-    }
-
-    /// Alpha-blends `(r, g, b)` over whatever is already on screen at
-    /// `(x, y)`, weighted by `alpha` (0 = leave untouched, 255 = fully
-    /// opaque). `wm.rs` uses this to draw the real cursor-pack bitmap
-    /// (which carries a genuine per-pixel alpha channel, not just a 1-bit
-    /// mask) with proper soft edges instead of a hard-edged cutout.
-    pub fn blend_pixel(&mut self, x: u64, y: u64, r: u8, g: u8, b: u8, alpha: u8) {
-        if x >= self.fb.width || y >= self.fb.height || alpha == 0 {
-            return;
-        }
-        if alpha == 255 {
-            self.put_pixel(x, y, r, g, b);
-            return;
-        }
-        let (br, bg, bb) = unsafe { self.get_pixel_unchecked(x, y) };
-        let a = u16::from(alpha);
-        let inv = 255 - a;
-        let out_r = ((u16::from(r) * a + u16::from(br) * inv) / 255) as u8;
-        let out_g = ((u16::from(g) * a + u16::from(bg) * inv) / 255) as u8;
-        let out_b = ((u16::from(b) * a + u16::from(bb) * inv) / 255) as u8;
-        unsafe { self.put_pixel_unchecked(x, y, self.pack(out_r, out_g, out_b)) };
-    }
-
-    /// Copies every raw pixel byte currently on screen out into a `Vec`.
-    /// `wm.rs` uses this to freeze "the desktop" once before drawing
-    /// floating windows over it, so each frame can cheaply restore a clean
-    /// background by blitting this back rather than tracking exactly what
-    /// moved and needs erasing.
-    pub fn snapshot(&self) -> Vec<u8> {
-        let len = (self.fb.pitch * self.fb.height) as usize;
-        let mut buf = alloc::vec![0u8; len];
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.fb.address, buf.as_mut_ptr(), len);
-        }
-        buf
-    }
-
-    /// Writes a buffer from [`snapshot`](Self::snapshot) back to the
-    /// framebuffer verbatim.
-    pub fn blit(&mut self, data: &[u8]) {
-        let len = ((self.fb.pitch * self.fb.height) as usize).min(data.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), self.fb.address, len);
+    /// Copies the `(x, y, w, h)` rectangle of an off-screen `0x00RRGGBB`
+    /// buffer (`stride` pixels per row, same size as the screen) to the
+    /// framebuffer -- how the desktop puts each finished frame on screen,
+    /// one changed region at a time. A plain row copy when the
+    /// framebuffer's layout is the usual 0x00RRGGBB, repacked per pixel
+    /// otherwise.
+    pub fn present(&mut self, src: &[u32], stride: usize, x: usize, y: usize, w: usize, h: usize) {
+        let w = w.min((self.fb.width as usize).saturating_sub(x));
+        let h = h.min((self.fb.height as usize).saturating_sub(y));
+        let native = self.fb.bpp == 32 && self.fb.red_mask_shift == 16 && self.fb.green_mask_shift == 8 && self.fb.blue_mask_shift == 0;
+        for row in y..y + h {
+            let line = &src[row * stride + x..row * stride + x + w];
+            let dst = unsafe { self.fb.address.add(row * self.fb.pitch as usize + x * 4) as *mut u32 };
+            if native {
+                unsafe { core::ptr::copy_nonoverlapping(line.as_ptr(), dst, w) };
+            } else {
+                for (i, &p) in line.iter().enumerate() {
+                    let c = self.pack((p >> 16) as u8, (p >> 8) as u8, p as u8);
+                    unsafe { dst.add(i).write_volatile(c) };
+                }
+            }
         }
     }
 

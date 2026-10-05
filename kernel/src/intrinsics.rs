@@ -5,8 +5,10 @@
 //! Because we compile against the `x86_64-unknown-linux-gnu` target (see
 //! `.cargo/config.toml`), `compiler_builtins` assumes libc will supply
 //! `mem*`, since on a normal Linux binary it always would. We have no libc,
-//! so we define them ourselves. They're intentionally simple, byte-at-a-time
-//! implementations -- correctness over speed for a first kernel.
+//! so we define them ourselves. `memcpy`/`memset` (and `memmove`'s forward
+//! case) use the CPU's own `rep movsb`/`rep stosb` string instructions,
+//! which are both simple and fast -- the desktop compositor moves whole
+//! frames through them. Everything else is a plain byte loop.
 //!
 //! `strlen` joined this list once `cfile.rs` started using
 //! `core::ffi::CStr::from_ptr` (part of the DOOM-porting groundwork's libc
@@ -23,12 +25,17 @@ pub extern "C" fn rust_eh_personality() {}
 /// (use `memmove` if they might).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        unsafe {
-            *dest.add(i) = *src.add(i);
-        }
-        i += 1;
+    // The ABI guarantees the direction flag is clear on entry, so this
+    // copies forwards -- which also makes it a correct `memmove` whenever
+    // `dest < src`.
+    unsafe {
+        core::arch::asm!(
+            "rep movsb",
+            inout("rcx") n => _,
+            inout("rdi") dest => _,
+            inout("rsi") src => _,
+            options(nostack, preserves_flags)
+        );
     }
     dest
 }
@@ -37,12 +44,14 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
 /// `dest` must be valid for `n` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        unsafe {
-            *dest.add(i) = c as u8;
-        }
-        i += 1;
+    unsafe {
+        core::arch::asm!(
+            "rep stosb",
+            inout("rcx") n => _,
+            inout("rdi") dest => _,
+            in("al") c as u8,
+            options(nostack, preserves_flags)
+        );
     }
     dest
 }
@@ -55,6 +64,10 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
     if (dest as usize) < (src as usize) {
         unsafe { memcpy(dest, src, n) }
     } else {
+        // Overlapping with `dest` above `src`: copy backwards. Done as a
+        // byte loop rather than `std; rep movsb` -- an interrupt landing
+        // mid-copy would otherwise run its handler with the direction flag
+        // set, which every other `rep` in the kernel assumes is clear.
         let mut i = n;
         while i != 0 {
             i -= 1;

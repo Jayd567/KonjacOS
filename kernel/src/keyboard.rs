@@ -202,6 +202,32 @@ const RIGHT_SHIFT_BREAK: u8 = 0xB6;
 
 static SHIFT_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Where keystrokes go: `false` = the ASCII ring (the shell, via the
+/// desktop's Terminal window), `true` = the DOOM event ring. The desktop
+/// flips this as keyboard focus moves between windows, so typing in the
+/// Terminal doesn't steer DOOM and vice versa.
+static DOOM_FOCUS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_doom_focus(doom: bool) {
+    if doom && !DOOM_FOCUS.load(Ordering::Relaxed) {
+        clear_doom_events();
+    }
+    DOOM_FOCUS.store(doom, Ordering::Relaxed);
+}
+
+/// Queues `text` as if it had been typed -- how the desktop's menus run
+/// shell commands (`reboot`, `cat <file>`, ...) through the real shell, so
+/// they get its normal behaviour, apex password prompt included.
+pub fn inject(text: &str) {
+    // The ring is single-producer (the IRQ handler); keep it that way by
+    // pushing with interrupts off.
+    unsafe { core::arch::asm!("cli") };
+    for b in text.bytes() {
+        ring_push(b);
+    }
+    unsafe { core::arch::asm!("sti") };
+}
+
 // --- Single-producer/single-consumer ring buffer -------------------------
 //
 // Producer: the IRQ1 handler (interrupt context). Consumer: the shell's
@@ -272,7 +298,7 @@ extern "C" fn irq1_handler() {
         LEFT_SHIFT_BREAK | RIGHT_SHIFT_BREAK => {
             SHIFT_HELD.store(false, Ordering::Relaxed);
         }
-        code if code < 0x80 => {
+        code if code < 0x80 && !DOOM_FOCUS.load(Ordering::Relaxed) => {
             let shift = SHIFT_HELD.load(Ordering::Relaxed);
             let table = if shift { &SCANCODE_ASCII_SHIFT } else { &SCANCODE_ASCII };
             let ch = table[code as usize];
@@ -288,7 +314,7 @@ extern "C" fn irq1_handler() {
     // needs press *and* release events for movement keys, which the
     // ASCII ring above never reports at all (it's make-code-only).
     let (pressed, code) = if scancode < 0x80 { (true, scancode) } else { (false, scancode - 0x80) };
-    if (code as usize) < 128 {
+    if (code as usize) < 128 && DOOM_FOCUS.load(Ordering::Relaxed) {
         let doomkey = SCANCODE_DOOMKEY[code as usize];
         if doomkey != 0 {
             doom_ring_push(pressed, doomkey);

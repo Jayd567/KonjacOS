@@ -39,7 +39,7 @@ endif
 # data disk is also attached -- without this, some BIOSes try the (non-
 # bootable) data disk first, which can stall for several seconds or more
 # before it falls through to the CD-ROM.
-QEMU_FLAGS := -m 256M -serial stdio -no-reboot -no-shutdown -boot order=d
+QEMU_FLAGS := -m 256M -serial stdio -no-reboot -no-shutdown -boot order=d -rtc base=localtime
 
 .PHONY: all
 all: iso

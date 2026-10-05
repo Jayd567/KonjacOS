@@ -447,6 +447,13 @@ pub fn list_current_dir() -> Result<Vec<DirEntry>, &'static str> {
     list_dir_at(CWD.lock().location)
 }
 
+/// Lists the directory at `path` without changing the current directory
+/// -- what the desktop's Files window browses with, so it never moves the
+/// shell's own working directory out from under it.
+pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, &'static str> {
+    list_dir_at(resolve_dir(path)?)
+}
+
 /// Formats an arbitrary display name (`readme.txt`, `README`, ...) into
 /// FAT's fixed 8.3 on-disk form for comparison -- uppercased, space
 /// padded, truncated to 8+3.

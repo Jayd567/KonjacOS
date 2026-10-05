@@ -1,7 +1,7 @@
 //! PS/2 mouse driver -- the "auxiliary device" on the same 8042 controller
 //! the keyboard already uses. `init()` enables it, unmasks IRQ12, and
 //! installs a handler that decodes the classic 3-byte packet format into a
-//! clamped on-screen cursor position + button state, which `wm.rs` polls
+//! clamped on-screen cursor position + button state, which the desktop (`ui/desktop.rs`) polls
 //! every frame.
 
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
@@ -43,6 +43,11 @@ static SCREEN_H: AtomicI32 = AtomicI32::new(1);
 // ring buffer reasons about its own producer side.
 static mut PACKET: [u8; 3] = [0; 3];
 static mut PACKET_INDEX: u8 = 0;
+/// Timer tick of the last byte received. A packet's three bytes arrive
+/// back to back, so a byte arriving after a gap always starts a new packet
+/// -- that's what recovers from a stray byte (such as a late ACK from
+/// `init`) instead of staying misaligned and reading garbage from then on.
+static mut LAST_BYTE_TICK: u64 = 0;
 
 unsafe fn wait_write_ready() {
     unsafe {
@@ -122,10 +127,6 @@ pub fn buttons() -> u8 {
     BUTTONS.load(Ordering::Relaxed)
 }
 
-pub fn left_button_down() -> bool {
-    buttons() & LEFT_BUTTON != 0
-}
-
 /// Called by `isr_stub_44` for every mouse interrupt. Assembles the classic
 /// 3-byte packet (button flags + sign bits, dx, dy), and on the third byte
 /// updates the public position/button state. Y is inverted (PS/2 reports
@@ -136,7 +137,12 @@ pub fn left_button_down() -> bool {
 #[unsafe(no_mangle)]
 extern "C" fn irq12_handler() {
     let byte = unsafe { inb(CONTROLLER_DATA) };
+    let now = crate::timer::ticks();
     unsafe {
+        if PACKET_INDEX != 0 && now.wrapping_sub(LAST_BYTE_TICK) > 2 {
+            PACKET_INDEX = 0;
+        }
+        LAST_BYTE_TICK = now;
         if PACKET_INDEX == 0 && byte & 0x08 == 0 {
             pic::send_eoi(IRQ_MOUSE);
             return;
@@ -146,6 +152,11 @@ extern "C" fn irq12_handler() {
         if PACKET_INDEX == 3 {
             PACKET_INDEX = 0;
             let flags = PACKET[0];
+            if flags & 0xC0 != 0 {
+                // X/Y overflow: the deltas are meaningless; drop it.
+                pic::send_eoi(IRQ_MOUSE);
+                return;
+            }
             let mut dx = PACKET[1] as i32;
             let mut dy = PACKET[2] as i32;
             if flags & 0x10 != 0 {

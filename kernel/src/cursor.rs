@@ -29,7 +29,7 @@ pub const HOTSPOT_Y: i32 = 1;
 static ARROW_RGBA: &[u8] = include_bytes!("../assets/cursor_arrow.rgba");
 
 /// Returns `(r, g, b, a)` for pixel `(x, y)` within the cursor bitmap, or
-/// `None` if it's out of bounds. `wm.rs` walks the whole `WIDTH x HEIGHT`
+/// `None` if it's out of bounds. The desktop (`ui/desktop.rs`) walks the whole `WIDTH x HEIGHT`
 /// box and skips fully-transparent (`a == 0`) pixels itself.
 pub fn pixel(x: u32, y: u32) -> Option<(u8, u8, u8, u8)> {
     if x >= WIDTH || y >= HEIGHT {

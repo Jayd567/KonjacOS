@@ -75,8 +75,8 @@ fn run_command(line: &str) {
 }
 
 /// Never returns: brings up the prompt and processes keystrokes forever,
-/// idling on `hlt` between them so the CPU isn't spinning at 100% waiting
-/// for someone to type.
+/// sleeping a tick between polls so the CPU isn't spinning waiting for
+/// someone to type.
 pub fn run() -> ! {
     println!();
     println!("KonjacOS shell. Type `help` for a list of commands.");
@@ -115,12 +115,10 @@ pub fn run() -> ! {
                 }
             }
             Some(_) => {} // Unmapped control byte; ignore.
-            None => unsafe {
-                // Idle until the next interrupt -- either a keystroke or
-                // the next timer tick, which is what keeps the blink
-                // reasonably responsive without a busy-wait.
-                core::arch::asm!("hlt");
-            },
+            // Nothing typed: sleep until the next timer tick (10ms --
+            // imperceptible as typing latency), giving the CPU to other
+            // tasks rather than holding on to this timeslice.
+            None => crate::task::sleep_ticks(1),
         }
     }
 }
