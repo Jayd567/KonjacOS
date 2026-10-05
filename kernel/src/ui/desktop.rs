@@ -15,7 +15,12 @@
 //!   running ones), the tray (CPU, memory, clock) on the right.
 //! - Glass **windows** in between, resizable from any edge or corner.
 //!   Maximizing fills exactly the work area between the two bars, never
-//!   sliding under the taskbar.
+//!   sliding under the taskbar. Dragging a window to the left or right
+//!   edge snaps it to that half, to the top maximizes it.
+//! - **Keyboard shortcuts** (see `keyboard.rs` for how they're kept from
+//!   the shell): Alt+Tab with a glass switcher, Alt+F4, Super for Start,
+//!   Super+arrows to snap, Super+D/E/I, Ctrl+Alt+T; arrows, Enter and Esc
+//!   in menus and Start.
 //! - **Right-click menus** almost everywhere: the desktop, icons, the
 //!   taskbar, title bars, and whatever apps offer for their own content.
 //!
@@ -44,13 +49,14 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use super::apps::{open_command, Action, App, AppKind, ContextItem, MouseEvent, Reply, ACCENT, TEXT, TEXT_DIM};
+use super::apps::{open_command, Action, App, AppKind, ContextItem, MouseEvent, Reply, accent, TEXT, TEXT_DIM};
 use super::assets;
 use super::font;
 use super::glass::{self, Glass, GlassStyle, Scratch};
 use super::icon_ids as icon;
 use super::icons::{self, Icon, Target};
 use super::math::{smoothstep, Spring};
+use super::settings;
 use super::surface::{blend, rgb, Painter, Rect, Surface};
 use super::sysmon;
 use crate::cursor::{self, Shape as Cursor};
@@ -66,13 +72,15 @@ const CELL_GAP: i32 = 4;
 /// Most taskbar slots there can be (Start + every app).
 const MAX_ITEMS: usize = 1 + AppKind::ALL.len();
 
-/// Damage z-levels, bottom to top (windows take `L_WIN + z index`).
+/// Damage z-levels, bottom to top (windows take [`win_level`], two apart
+/// so a snap preview fits just beneath the window being dragged).
 const L_DESK: u16 = 1;
 const L_WIN: u16 = 10;
 const L_TOPBAR: u16 = 150;
 const L_TASKBAR: u16 = 200;
 const L_START: u16 = 300;
 const L_MENU: u16 = 310;
+const L_SWITCHER: u16 = 320;
 const L_TOOLTIP: u16 = 400;
 /// Things drawn over everything but the pointer: dragged icons and the
 /// rubber band.
@@ -82,8 +90,11 @@ const L_CURSOR: u16 = 1000;
 /// backdrop a recomputing panel samples), so it invalidates nothing.
 const L_RENDER_ONLY: u16 = u16::MAX;
 
-/// Ticks between two clicks for them to count as a double-click.
-const DOUBLE_CLICK_TICKS: u64 = 40;
+/// The damage level of window `i` (0 = bottom).
+fn win_level(i: usize) -> u16 {
+    L_WIN + 2 * i as u16
+}
+
 /// Hover time before a taskbar tooltip appears.
 const TOOLTIP_DELAY: u64 = 45;
 /// How long the "app starting" pointer shows after launching something.
@@ -260,7 +271,7 @@ struct StartMenu {
     hover: Option<usize>,
 }
 
-const START_W: i32 = 540;
+const START_W: i32 = 620;
 const START_H: i32 = 236;
 const TILE_W: i32 = 76;
 const TILE_H: i32 = 80;
@@ -279,11 +290,32 @@ struct Tooltip {
 #[derive(Clone, Copy)]
 enum Layer {
     Win(usize),
+    Snap,
     Taskbar,
     Start,
     Menu,
+    Switcher,
     Tooltip,
 }
+
+/// Where a window being dragged will snap to if dropped now.
+struct SnapPreview {
+    rect: Rect,
+    alpha: f32,
+    glass: Glass,
+}
+
+/// The Alt+Tab switcher: the open windows' apps, front to back.
+struct Switcher {
+    apps: Vec<AppKind>,
+    sel: usize,
+    spring: Spring,
+    glass: Glass,
+}
+
+const SWITCH_TILE_W: i32 = 100;
+const SWITCH_TILE_H: i32 = 96;
+const SWITCH_PAD: i32 = 18;
 
 /// What the held left button is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,6 +377,12 @@ pub struct Desktop {
     ram: String,
     ram_detail: String,
     now: u64,
+    snap: Option<SnapPreview>,
+    switcher: Option<Switcher>,
+    /// Whether the keyboard driver is sending every key here.
+    capture: bool,
+    settings_rev: u64,
+    wallpaper: u8,
 }
 
 impl Desktop {
@@ -352,10 +390,11 @@ impl Desktop {
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
         let (mx, my) = mouse::position();
         let (pinned, desk_icons) = icons::load_config();
+        let prefs = settings::get();
         let mut d = Desktop {
             canvas,
             bb: Surface::new(w, h),
-            wall: assets::wallpaper(w, h),
+            wall: settings::wallpaper(prefs.wallpaper, w, h),
             scratch: Scratch::new(((w / 2 + 64) * (h / 2 + 64)) as usize),
             windows: Vec::new(),
             taskbar: Glass::default(),
@@ -389,6 +428,11 @@ impl Desktop {
             ram: String::new(),
             ram_detail: String::new(),
             now: timer::ticks(),
+            snap: None,
+            switcher: None,
+            capture: false,
+            settings_rev: settings::revision(),
+            wallpaper: prefs.wallpaper,
         };
         let wa = d.work_area();
         icons::tidy(&mut d.icons, wa);
@@ -588,6 +632,29 @@ impl Desktop {
         None
     }
 
+    /// The two halves of the work area windows snap to.
+    fn halves(&self) -> (Rect, Rect) {
+        let wa = self.work_area();
+        let lw = wa.w / 2 - 4;
+        (Rect::new(wa.x, wa.y, lw, wa.h), Rect::new(wa.x + lw + 8, wa.y, wa.w - lw - 8, wa.h))
+    }
+
+    fn switcher_rect(&self) -> Rect {
+        let n = self.switcher.as_ref().map_or(1, |sw| sw.apps.len()) as i32;
+        let w = n * SWITCH_TILE_W + (n - 1) * 8 + 2 * SWITCH_PAD;
+        let h = SWITCH_TILE_H + 2 * SWITCH_PAD;
+        let s = self.screen();
+        Rect::new((s.w - w) / 2, (s.h - h) / 2 - 40, w, h)
+    }
+
+    fn switcher_drawn(&self) -> Rect {
+        let r = self.switcher_rect();
+        let v = self.switcher.as_ref().map_or(1.0, |sw| sw.spring.value);
+        let k = 0.92 + 0.08 * v;
+        let (w, h) = ((r.w as f32 * k) as i32, (r.h as f32 * k) as i32);
+        Rect::new(r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h)
+    }
+
     fn icon_area(&self) -> Rect {
         self.work_area()
     }
@@ -622,12 +689,12 @@ impl Desktop {
 
     fn damage_window(&mut self, i: usize) {
         let r = self.windows[i].drawn().expand(glass::WINDOW.reach());
-        self.damage(r, L_WIN + i as u16);
+        self.damage(r, win_level(i));
     }
 
     fn damage_client(&mut self, i: usize) {
         let d = self.windows[i].drawn();
-        self.damage(Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H), L_WIN + i as u16);
+        self.damage(Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H), win_level(i));
     }
 
     fn damage_cursor(&mut self) {
@@ -667,9 +734,13 @@ impl Desktop {
 
     fn glass_layers(&self) -> Vec<(Layer, u16, Rect, &'static GlassStyle)> {
         let mut v = Vec::new();
+        let top = self.windows.len().saturating_sub(1);
         for (i, w) in self.windows.iter().enumerate() {
+            if let (Some(sp), true) = (&self.snap, i == top) {
+                v.push((Layer::Snap, win_level(top) - 1, sp.rect, &glass::MENU));
+            }
             if !w.minimized {
-                v.push((Layer::Win(i), L_WIN + i as u16, w.drawn(), &glass::WINDOW));
+                v.push((Layer::Win(i), win_level(i), w.drawn(), &glass::WINDOW));
             }
         }
         v.push((Layer::Taskbar, L_TASKBAR, self.taskbar_rect(), &glass::TASKBAR));
@@ -678,6 +749,9 @@ impl Desktop {
         }
         if let Some(m) = &self.menu {
             v.push((Layer::Menu, L_MENU, m.drawn(), &glass::MENU));
+        }
+        if self.switcher.is_some() {
+            v.push((Layer::Switcher, L_SWITCHER, self.switcher_drawn(), &glass::MENU));
         }
         if let Some(t) = &self.tooltip {
             v.push((Layer::Tooltip, L_TOOLTIP, t.rect, &glass::TOOLTIP));
@@ -691,6 +765,8 @@ impl Desktop {
             Layer::Taskbar => &mut self.taskbar,
             Layer::Start => &mut self.start.glass,
             Layer::Menu => &mut self.menu.as_mut().unwrap().glass,
+            Layer::Snap => &mut self.snap.as_mut().unwrap().glass,
+            Layer::Switcher => &mut self.switcher.as_mut().unwrap().glass,
             Layer::Tooltip => &mut self.tooltip.as_mut().unwrap().glass,
         }
     }
@@ -760,6 +836,8 @@ impl Desktop {
         let band = self.band_rect();
         let tray_hover = self.tray_hover.map(|z| self.tray_zones()[z]);
         let cursor_img = cursor::image(self.cursor);
+        let top = self.windows.len().saturating_sub(1);
+        let switcher_drawn = self.switcher_drawn();
 
         // Occlusion: if a window's opaque content (DOOM's frame, Sketch's
         // paper) covers this whole region, nothing beneath it can show --
@@ -774,7 +852,7 @@ impl Desktop {
             (r.intersect(&clip) == clip).then_some(i)
         });
 
-        let Desktop { bb, wall, scratch, windows, taskbar, start, menu, tooltip, hover_alpha, topbar_hover, icons: desk_icons, icon_hover, mx, my, clock, date, cpu, ram, cursor_frame, .. } = self;
+        let Desktop { bb, wall, scratch, windows, taskbar, start, menu, tooltip, hover_alpha, topbar_hover, icons: desk_icons, icon_hover, mx, my, clock, date, cpu, ram, cursor_frame, snap, switcher, .. } = self;
         let (sw, sh) = (bb.w, bb.h);
 
         if first.is_none() {
@@ -790,7 +868,15 @@ impl Desktop {
         }
 
         for (i, w) in windows.iter_mut().enumerate() {
-            if w.minimized || first.is_some_and(|f| i < f) {
+            if first.is_some_and(|f| i < f) {
+                continue;
+            }
+            if let (Some(sp), true) = (snap.as_mut(), i == top) {
+                let op = (sp.alpha * 255.0) as u8;
+                sp.glass.render(bb, sp.rect, &glass::MENU, clip, op, scratch);
+                bb.painter(clip).fill_squircle(sp.rect, 30.0, TEXT, (sp.alpha * 22.0) as u8);
+            }
+            if w.minimized {
                 continue;
             }
             if first == Some(i) {
@@ -871,6 +957,15 @@ impl Desktop {
             paint_menu(&mut mp, m);
         }
 
+        if let Some(sw) = switcher {
+            let op = (smoothstep(0.0, 0.5, sw.spring.value) * 255.0) as u8;
+            sw.glass.render(bb, switcher_drawn, &glass::MENU, clip, op, scratch);
+            let mut p = bb.painter(clip);
+            p.alpha = (smoothstep(0.6, 1.0, sw.spring.value) * 255.0) as u8;
+            let mut sp = p.sub(switcher_drawn);
+            paint_switcher(&mut sp, sw);
+        }
+
         if let Some(t) = tooltip {
             let op = (t.alpha * 255.0) as u8;
             t.glass.render(bb, t.rect, &glass::TOOLTIP, clip, op, scratch);
@@ -891,14 +986,14 @@ impl Desktop {
         }
         if !band.is_empty() {
             let mut p = bb.painter(clip);
-            p.fill_rect(band, ACCENT, 40);
+            p.fill_rect(band, accent(), 40);
             for edge in [
                 Rect::new(band.x, band.y, band.w, 1),
                 Rect::new(band.x, band.bottom() - 1, band.w, 1),
                 Rect::new(band.x, band.y, 1, band.h),
                 Rect::new(band.right() - 1, band.y, 1, band.h),
             ] {
-                p.fill_rect(edge, ACCENT, 200);
+                p.fill_rect(edge, accent(), 200);
             }
         }
 
@@ -1047,6 +1142,289 @@ impl Desktop {
         self.damage_window(i);
     }
 
+    /// Where dropping window `i` with the pointer at `(x, y)` snaps it:
+    /// the top edge maximizes, the side edges take half the work area
+    /// (resizable windows only).
+    fn snap_target(&self, i: usize, x: i32, y: i32) -> Option<Rect> {
+        let s = self.screen();
+        let (left, right) = self.halves();
+        if y <= 1 {
+            Some(self.work_area())
+        } else if !self.windows[i].app.resizable() {
+            None
+        } else if x <= 1 {
+            Some(left)
+        } else if x >= s.w - 2 {
+            Some(right)
+        } else {
+            None
+        }
+    }
+
+    fn snap_level(&self) -> u16 {
+        win_level(self.windows.len().saturating_sub(1)) - 1
+    }
+
+    /// Shows (or moves, or hides) the snap preview.
+    fn set_snap(&mut self, target: Option<Rect>) {
+        if self.snap.as_ref().map(|sp| sp.rect) == target {
+            return;
+        }
+        let level = self.snap_level();
+        if let Some(sp) = self.snap.take() {
+            self.damage(sp.rect.expand(glass::MENU.reach()), level);
+        }
+        if let Some(rect) = target {
+            self.snap = Some(SnapPreview { rect, alpha: 0.0, glass: Glass::default() });
+            self.damage(rect.expand(glass::MENU.reach()), level);
+        }
+    }
+
+    /// Puts window `i` at `target`, remembering where it was so that
+    /// restoring (or dragging it away) puts it back.
+    fn snap_window(&mut self, i: usize, target: Rect) {
+        self.damage_window(i);
+        let w = &mut self.windows[i];
+        if w.restore.is_none() {
+            w.restore = Some(w.rect);
+        }
+        w.rect = target;
+        let (cw, ch) = w.client_size();
+        w.app.resized(cw, ch);
+        self.damage_window(i);
+    }
+
+    /// Super+arrow on the active window: halves, maximize, restore or
+    /// minimize.
+    fn snap_active(&mut self, key: u8) {
+        let Some(i) = self.active() else { return };
+        let (left, right) = self.halves();
+        let wa = self.work_area();
+        let rect = self.windows[i].rect;
+        match key {
+            keyboard::KEY_LEFT | keyboard::KEY_RIGHT => {
+                if !self.windows[i].app.resizable() {
+                    return;
+                }
+                let target = if key == keyboard::KEY_LEFT { left } else { right };
+                if rect == target {
+                    self.toggle_maximize(i); // Already there: restore.
+                } else {
+                    self.snap_window(i, target);
+                }
+            }
+            keyboard::KEY_UP if rect != wa => self.snap_window(i, wa),
+            keyboard::KEY_DOWN => {
+                if self.windows[i].restore.is_some() {
+                    self.toggle_maximize(i);
+                } else {
+                    self.minimize(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Keyboard -------------------------------------------------------------
+
+    fn poll_keys(&mut self) {
+        while let Some(k) = keyboard::read_desktop_key() {
+            self.on_key(k);
+        }
+        let want = self.menu.is_some() || self.start.open || self.switcher.is_some();
+        if want != self.capture {
+            self.capture = want;
+            keyboard::set_capture(want);
+        }
+    }
+
+    fn on_key(&mut self, k: keyboard::DesktopKey) {
+        use keyboard::*;
+        let (shift, ctrl, alt, sup) = (k.mods & MOD_SHIFT != 0, k.mods & MOD_CTRL != 0, k.mods & MOD_ALT != 0, k.mods & MOD_SUPER != 0);
+        if self.switcher.is_some() {
+            match k.code {
+                KEY_TAB if shift => self.switcher_step(-1),
+                KEY_TAB | KEY_RIGHT => self.switcher_step(1),
+                KEY_LEFT => self.switcher_step(-1),
+                KEY_ALT_UP | KEY_ENTER => self.switcher_commit(),
+                KEY_ESC => self.close_switcher(),
+                _ => {}
+            }
+            return;
+        }
+        match k.code {
+            KEY_TAB if alt => self.open_switcher(shift),
+            KEY_ALT_UP => {}
+            KEY_F4 if alt => {
+                self.close_menu();
+                self.close_start();
+                if let Some(i) = self.active() {
+                    self.close_window(i);
+                }
+            }
+            KEY_SUPER => {
+                self.close_menu();
+                if self.start.open {
+                    self.close_start();
+                } else {
+                    self.open_start();
+                }
+            }
+            KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN if sup => {
+                self.close_menu();
+                self.close_start();
+                self.snap_active(k.code);
+            }
+            b'd' if sup => self.run_cmd(Cmd::ShowDesktop, None),
+            b'e' if sup => self.launch(AppKind::Files),
+            b'i' if sup => self.launch(AppKind::Settings),
+            b't' if ctrl && alt => self.launch(AppKind::Terminal),
+            _ if self.menu.is_some() => self.menu_key(k.code),
+            _ if self.start.open => self.start_key(k.code),
+            _ => {}
+        }
+    }
+
+    /// Arrows, Enter and Esc in an open menu.
+    fn menu_key(&mut self, code: u8) {
+        let Some(m) = &mut self.menu else { return };
+        match code {
+            keyboard::KEY_ESC => self.close_menu(),
+            keyboard::KEY_UP | keyboard::KEY_DOWN => {
+                let enabled: Vec<usize> = (0..m.items.len()).filter(|&i| m.items[i].cmd.is_some()).collect();
+                if enabled.is_empty() {
+                    return;
+                }
+                let pos = m.hover.and_then(|h| enabled.iter().position(|&i| i == h));
+                let next = match (pos, code == keyboard::KEY_DOWN) {
+                    (None, true) => 0,
+                    (None, false) => enabled.len() - 1,
+                    (Some(p), true) => (p + 1) % enabled.len(),
+                    (Some(p), false) => (p + enabled.len() - 1) % enabled.len(),
+                };
+                m.hover = Some(enabled[next]);
+                let r = m.rect;
+                self.damage(r, L_MENU);
+            }
+            keyboard::KEY_ENTER => {
+                if let Some(i) = m.hover {
+                    self.activate_menu_item(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Arrows, Enter, Esc and type-to-find in the Start menu.
+    fn start_key(&mut self, code: u8) {
+        let n = AppKind::ALL.len();
+        let cur = self.start.hover.filter(|&h| h < n);
+        let hover = match code {
+            keyboard::KEY_ESC => {
+                self.close_start();
+                return;
+            }
+            keyboard::KEY_RIGHT | keyboard::KEY_DOWN => Some(cur.map_or(0, |c| (c + 1) % n)),
+            keyboard::KEY_LEFT | keyboard::KEY_UP => Some(cur.map_or(n - 1, |c| (c + n - 1) % n)),
+            keyboard::KEY_ENTER => {
+                if let Some(i) = cur {
+                    self.close_start();
+                    self.launch(AppKind::ALL[i]);
+                }
+                return;
+            }
+            c if c.is_ascii_alphanumeric() => {
+                // The next app (after the highlighted one) starting with
+                // that letter.
+                let from = cur.map_or(0, |c| c + 1);
+                (0..n).map(|k| (from + k) % n).find(|&i| AppKind::ALL[i].name().as_bytes()[0].to_ascii_lowercase() == c)
+            }
+            _ => return,
+        };
+        if hover.is_some() && hover != self.start.hover {
+            self.start.hover = hover;
+            let r = self.start_rect();
+            self.damage(r, L_START);
+        }
+    }
+
+    fn activate_menu_item(&mut self, i: usize) {
+        let Some(m) = &self.menu else { return };
+        let (id, target, cmd) = (m.id, m.target, m.items[i].cmd);
+        if let Some(cmd) = cmd {
+            self.close_menu();
+            if id == MenuId::Power {
+                self.close_start();
+            }
+            self.run_cmd(cmd, target);
+        }
+    }
+
+    fn open_switcher(&mut self, reverse: bool) {
+        let apps: Vec<AppKind> = self.windows.iter().rev().map(|w| w.kind).collect();
+        if apps.is_empty() {
+            return;
+        }
+        self.close_menu();
+        self.close_start();
+        self.hide_tooltip();
+        let n = apps.len();
+        let sel = if n == 1 { 0 } else if reverse { n - 1 } else { 1 };
+        let mut spring = Spring::new(0.0);
+        spring.target = 1.0;
+        self.switcher = Some(Switcher { apps, sel, spring, glass: Glass::default() });
+        let r = self.switcher_rect();
+        self.damage(r.expand(glass::MENU.reach()), L_SWITCHER);
+    }
+
+    fn switcher_step(&mut self, by: isize) {
+        if let Some(sw) = &mut self.switcher {
+            let n = sw.apps.len() as isize;
+            sw.sel = ((sw.sel as isize + by).rem_euclid(n)) as usize;
+            let r = self.switcher_rect();
+            self.damage(r, L_SWITCHER);
+        }
+    }
+
+    fn close_switcher(&mut self) {
+        if self.switcher.is_some() {
+            let r = self.switcher_rect();
+            self.switcher = None;
+            self.damage(r.expand(glass::MENU.reach()), L_SWITCHER);
+        }
+    }
+
+    fn switcher_commit(&mut self) {
+        let kind = self.switcher.as_ref().map(|sw| sw.apps[sw.sel]);
+        self.close_switcher();
+        if let Some(i) = kind.and_then(|k| self.window_of(k)) {
+            self.windows[i].minimized = false;
+            self.focus(i);
+        }
+    }
+
+    // --- Settings ---------------------------------------------------------------
+
+    /// Picks up a change made in Settings: a new wallpaper, glass that
+    /// must be recomputed everywhere, a reformatted clock, a new accent.
+    fn apply_settings(&mut self) {
+        let rev = settings::revision();
+        if rev == self.settings_rev {
+            return;
+        }
+        self.settings_rev = rev;
+        let s = settings::get();
+        if s.wallpaper != self.wallpaper {
+            self.wallpaper = s.wallpaper;
+            self.wall = settings::wallpaper(s.wallpaper, self.bb.w, self.bb.h);
+        }
+        self.sys_seq = u64::MAX;
+        // Level 0: below everything, so every glass panel recomputes.
+        let screen = self.screen();
+        self.damage(screen, 0);
+        self.save();
+    }
+
     /// Taskbar click: launch, restore, focus or minimize.
     fn taskbar_click(&mut self, kind: AppKind) {
         if kind == AppKind::Doom && self.window_of(kind).is_none() {
@@ -1108,7 +1486,7 @@ impl Desktop {
         } else if let Some(r) = reply.damage {
             let d = self.windows[i].drawn();
             let client = Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H);
-            self.damage(r.offset(client.x, client.y).intersect(&client), L_WIN + i as u16);
+            self.damage(r.offset(client.x, client.y).intersect(&client), win_level(i));
         }
         match reply.action {
             Some(Action::Shell(cmd)) => self.shell_command(&cmd),
@@ -1286,6 +1664,7 @@ impl Desktop {
             MenuId::System => alloc::vec![
                 item("About KonjacOS", Cmd::Open(AppKind::About)),
                 item("System Monitor", Cmd::Open(AppKind::Monitor)),
+                item("Settings", Cmd::Open(AppKind::Settings)),
                 SEPARATOR,
                 item("Restart...", Cmd::Shell("reboot\n")),
                 item("Shut Down...", Cmd::Shell("halt\n")),
@@ -1473,6 +1852,8 @@ impl Desktop {
                     } else {
                         self.move_window(win, x - ox, y - oy);
                     }
+                    let target = self.snap_target(win, x, y);
+                    self.set_snap(target);
                 }
                 return;
             }
@@ -1580,7 +1961,7 @@ impl Desktop {
             let hover = if over == Some(i) { w.btn_at(x - d.x, y - d.y) } else { None };
             if hover != w.btn_hover {
                 self.windows[i].btn_hover = hover;
-                self.damage(Rect::new(d.x, d.y, d.w, TITLE_H), L_WIN + i as u16);
+                self.damage(Rect::new(d.x, d.y, d.w, TITLE_H), win_level(i));
             }
         }
         if let Some(i) = over {
@@ -1596,6 +1977,15 @@ impl Desktop {
     fn on_release(&mut self) {
         let grab = core::mem::replace(&mut self.grab, Grab::None);
         match grab {
+            Grab::Move { win, .. } => {
+                if let Some(sp) = self.snap.take() {
+                    let level = self.snap_level();
+                    self.damage(sp.rect.expand(glass::MENU.reach()), level);
+                    if win < self.windows.len() {
+                        self.snap_window(win, sp.rect);
+                    }
+                }
+            }
             Grab::Client { kind } => {
                 if let Some(i) = self.window_of(kind) {
                     let d = self.windows[i].drawn();
@@ -1631,18 +2021,14 @@ impl Desktop {
     fn on_press(&mut self) {
         let (x, y) = (self.mx, self.my);
         let (lt, lx, ly) = self.last_click;
-        let double = self.now - lt <= DOUBLE_CLICK_TICKS && (x - lx).abs() < 6 && (y - ly).abs() < 6;
+        let double = self.now - lt <= settings::double_click_ticks() && (x - lx).abs() < 6 && (y - ly).abs() < 6;
         self.last_click = if double { (0, x, y) } else { (self.now, x, y) };
 
         if let Some(m) = &self.menu {
-            let (id, rect, target, hit) = (m.id, m.rect, m.target, m.item_at(x, y));
+            let (id, rect, hit) = (m.id, m.rect, m.item_at(x, y));
             if rect.contains(x, y) {
-                if let Some(cmd) = hit.and_then(|i| self.menu.as_ref().unwrap().items[i].cmd) {
-                    self.close_menu();
-                    if id == MenuId::Power {
-                        self.close_start();
-                    }
-                    self.run_cmd(cmd, target);
+                if let Some(i) = hit {
+                    self.activate_menu_item(i);
                 }
                 return;
             }
@@ -1774,6 +2160,7 @@ impl Desktop {
                         item("Terminal", Cmd::Open(AppKind::Terminal)),
                         item("Files", Cmd::Open(AppKind::Files)),
                         item("System Monitor", Cmd::Open(AppKind::Monitor)),
+                        item("Settings", Cmd::Open(AppKind::Settings)),
                         SEPARATOR,
                         item("Show Desktop", Cmd::ShowDesktop),
                         SEPARATOR,
@@ -1865,6 +2252,7 @@ impl Desktop {
                     item_if("Arrange Icons", Cmd::ArrangeIcons, !self.icons.is_empty()),
                     item("Show Desktop", Cmd::ShowDesktop),
                     SEPARATOR,
+                    item("Settings", Cmd::Open(AppKind::Settings)),
                     item("About KonjacOS", Cmd::Open(AppKind::About)),
                 ];
                 self.context_menu(items, None);
@@ -1964,7 +2352,7 @@ impl Desktop {
                 if !self.windows[i].minimized {
                     let d = self.windows[i].drawn();
                     let client = Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H);
-                    self.damage(r.offset(client.x, client.y).intersect(&client), L_WIN + i as u16);
+                    self.damage(r.offset(client.x, client.y).intersect(&client), win_level(i));
                 }
             }
         }
@@ -1976,7 +2364,11 @@ impl Desktop {
             let (mut clock, mut date, mut cpu, mut ram) = (String::new(), String::new(), String::new(), String::new());
             let t = s.time;
             let h12 = if t.hour % 12 == 0 { 12 } else { t.hour % 12 };
-            let _ = write!(clock, "{}:{:02} {}", h12, t.minute, if t.hour < 12 { "AM" } else { "PM" });
+            let _ = if settings::get().clock_24h {
+                write!(clock, "{}:{:02}", t.hour, t.minute)
+            } else {
+                write!(clock, "{}:{:02} {}", h12, t.minute, if t.hour < 12 { "AM" } else { "PM" })
+            };
             let _ = write!(date, "{}/{}/{}", t.month, t.day, t.year);
             let _ = write!(cpu, "{}%", s.cpu);
             let pct = if s.mem_total > 0 { s.mem_used * 100 / s.mem_total } else { 0 };
@@ -2070,6 +2462,26 @@ impl Desktop {
                     m.spring.snap(1.0);
                 }
                 self.damage(before, L_MENU);
+            }
+        }
+
+        if let Some(sp) = &mut self.snap {
+            if sp.alpha < 1.0 {
+                sp.alpha = (sp.alpha + 0.2).min(1.0);
+                let r = sp.rect;
+                let level = self.snap_level();
+                self.damage(r, level);
+            }
+        }
+
+        if let Some(sw) = &mut self.switcher {
+            if !sw.spring.settled() {
+                sw.spring.step(320.0, 22.0);
+                if sw.spring.settled() {
+                    sw.spring.snap(1.0);
+                }
+                let r = self.switcher_rect().expand(glass::MENU.reach());
+                self.damage(r, L_SWITCHER);
             }
         }
     }
@@ -2231,7 +2643,7 @@ fn paint_start(p: &mut Painter, hover: Option<usize>) {
             p.fill_squircle(r, 12.0, TEXT, 34);
         }
         let (iw, ih, m) = assets::icon(kind.taskbar_icons().1);
-        p.draw_mask(r.x + (r.w - iw) / 2, r.y + 12, iw, ih, m, ACCENT, 255);
+        p.draw_mask(r.x + (r.w - iw) / 2, r.y + 12, iw, ih, m, accent(), 255);
         let label = kind.short_name();
         p.text(&font::SMALL, r.x + (r.w - font::SMALL.width(label)) / 2, r.y + 54, label, TEXT, 255);
     }
@@ -2244,7 +2656,7 @@ fn paint_start(p: &mut Painter, hover: Option<usize>) {
         p.fill_squircle(ur, 12.0, TEXT, 34);
     }
     let avatar = Rect::new(ur.x + 8, ur.y + 6, 30, 30);
-    p.fill_squircle(avatar, 15.0, ACCENT, 230);
+    p.fill_squircle(avatar, 15.0, accent(), 230);
     let (iw, ih, m) = assets::icon(icon::PERSON_20_FILLED);
     p.draw_mask(avatar.x + (avatar.w - iw) / 2, avatar.y + (avatar.h - ih) / 2, iw, ih, m, rgb(18, 40, 38), 255);
     p.text_shadowed(&font::UI_BOLD, avatar.right() + 10, ur.y + 4, "konjac", TEXT, 255);
@@ -2256,6 +2668,21 @@ fn paint_start(p: &mut Painter, hover: Option<usize>) {
     }
     let (iw, ih, m) = assets::icon(icon::POWER_20);
     p.draw_mask(pr.x + (pr.w - iw) / 2, pr.y + (pr.h - ih) / 2, iw, ih, m, TEXT, 255);
+}
+
+fn paint_switcher(p: &mut Painter, sw: &Switcher) {
+    for (i, kind) in sw.apps.iter().enumerate() {
+        let r = Rect::new(SWITCH_PAD + i as i32 * (SWITCH_TILE_W + 8), SWITCH_PAD, SWITCH_TILE_W, SWITCH_TILE_H);
+        if i == sw.sel {
+            p.fill_squircle(r, 16.0, TEXT, 40);
+        }
+        let tile = Rect::new(r.x + (r.w - 52) / 2, r.y + 10, 52, 52);
+        p.fill_squircle(tile, 16.0, kind.tint(), 235);
+        let (iw, ih, m) = assets::icon(kind.taskbar_icons().1);
+        p.draw_mask(tile.x + (tile.w - iw) / 2, tile.y + (tile.h - ih) / 2, iw, ih, m, TEXT, 255);
+        let label = kind.short_name();
+        p.text_shadowed(&font::SMALL, r.x + (r.w - font::SMALL.width(label)) / 2, tile.bottom() + 8, label, TEXT, if i == sw.sel { 255 } else { 190 });
+    }
 }
 
 fn paint_menu(p: &mut Painter, m: &Menu) {
@@ -2308,6 +2735,8 @@ pub fn run() {
         last = now;
         d.now = now;
         d.poll_input();
+        d.poll_keys();
+        d.apply_settings();
         d.poll_sources();
         for _ in 0..steps {
             d.animate();

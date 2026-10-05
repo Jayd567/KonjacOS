@@ -79,6 +79,9 @@ ICONS = [
     ("PERSON_20_FILLED", "person", 20, "filled"),
     ("ERASER_20", "eraser", 20, "regular"),
     ("DELETE_20", "delete", 20, "regular"),
+    ("SETTINGS_32", "settings", 32, "regular"),
+    ("SETTINGS_32_FILLED", "settings", 32, "filled"),
+    ("SETTINGS_20", "settings", 20, "regular"),
 ]
 
 # Cursor pack files in `cursor::Shape` order (kernel/src/cursor.rs).

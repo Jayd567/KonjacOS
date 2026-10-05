@@ -38,3 +38,6 @@ pub const APP_32: usize = 33; // app_generic 32px filled
 pub const PERSON_20_FILLED: usize = 34; // person 20px filled
 pub const ERASER_20: usize = 35; // eraser 20px regular
 pub const DELETE_20: usize = 36; // delete 20px regular
+pub const SETTINGS_32: usize = 37; // settings 32px regular
+pub const SETTINGS_32_FILLED: usize = 38; // settings 32px filled
+pub const SETTINGS_20: usize = 39; // settings 20px regular

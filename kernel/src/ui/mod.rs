@@ -10,6 +10,7 @@ mod glass;
 mod icon_ids;
 mod icons;
 mod math;
+mod settings;
 mod sketch;
 mod surface;
 mod sysmon;

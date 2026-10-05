@@ -22,7 +22,8 @@ use crate::doom_driver;
 
 pub const TEXT: u32 = rgb(240, 243, 246);
 pub const TEXT_DIM: u32 = rgb(178, 188, 196);
-pub const ACCENT: u32 = rgb(120, 214, 196);
+/// The accent colour, chosen in Settings.
+pub use super::settings::accent;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppKind {
@@ -31,12 +32,13 @@ pub enum AppKind {
     Monitor,
     Doom,
     Sketch,
+    Settings,
     About,
 }
 
 impl AppKind {
     /// Every app, in Start menu order.
-    pub const ALL: [AppKind; 6] = [AppKind::Terminal, AppKind::Files, AppKind::Monitor, AppKind::Doom, AppKind::Sketch, AppKind::About];
+    pub const ALL: [AppKind; 7] = [AppKind::Terminal, AppKind::Files, AppKind::Monitor, AppKind::Doom, AppKind::Sketch, AppKind::Settings, AppKind::About];
 
     /// A stable name for saving it in `/DESKTOP.CFG`.
     pub fn id(self) -> &'static str {
@@ -46,6 +48,7 @@ impl AppKind {
             AppKind::Monitor => "monitor",
             AppKind::Doom => "doom",
             AppKind::Sketch => "sketch",
+            AppKind::Settings => "settings",
             AppKind::About => "about",
         }
     }
@@ -61,6 +64,7 @@ impl AppKind {
             AppKind::Monitor => "Monitor",
             AppKind::Doom => "DOOM",
             AppKind::Sketch => "Sketch",
+            AppKind::Settings => "Settings",
             AppKind::About => "About KonjacOS",
         }
     }
@@ -81,6 +85,7 @@ impl AppKind {
             AppKind::Monitor => rgb(34, 160, 140),
             AppKind::Doom => rgb(196, 48, 40),
             AppKind::Sketch => rgb(214, 84, 150),
+            AppKind::Settings => rgb(92, 102, 118),
             AppKind::About => rgb(64, 116, 214),
         }
     }
@@ -93,6 +98,7 @@ impl AppKind {
             AppKind::Monitor => (icon::MONITOR_32, icon::MONITOR_32_FILLED),
             AppKind::Doom => (icon::DOOM_32, icon::DOOM_32_FILLED),
             AppKind::Sketch => (icon::SKETCH_32, icon::SKETCH_32_FILLED),
+            AppKind::Settings => (icon::SETTINGS_32, icon::SETTINGS_32_FILLED),
             AppKind::About => (icon::ABOUT_32, icon::ABOUT_32_FILLED),
         }
     }
@@ -104,6 +110,7 @@ impl AppKind {
             AppKind::Monitor => icon::MONITOR_20,
             AppKind::Doom => icon::DOOM_20,
             AppKind::Sketch => icon::SKETCH_20,
+            AppKind::Settings => icon::SETTINGS_20,
             AppKind::About => icon::ABOUT_20,
         }
     }
@@ -115,6 +122,7 @@ impl AppKind {
             AppKind::Monitor => Box::new(Monitor::new()),
             AppKind::Doom => Box::new(Doom::new()),
             AppKind::Sketch => Box::new(super::sketch::Sketch::new()),
+            AppKind::Settings => Box::new(super::settings::SettingsApp::new()),
             AppKind::About => Box::new(About { link_hover: false }),
         }
     }
@@ -318,7 +326,7 @@ impl App for Terminal {
         }
         let (cc, cr, on) = self.cursor;
         if on && cr < self.rows {
-            p.fill_rect(Rect::new(TERM_PAD + cc as i32 * cw, TERM_PAD - 6 + cr as i32 * ch + 1, 2, ch - 3), ACCENT, 255);
+            p.fill_rect(Rect::new(TERM_PAD + cc as i32 * cw, TERM_PAD - 6 + cr as i32 * ch + 1, 2, ch - 3), accent(), 255);
         }
     }
 
@@ -516,13 +524,13 @@ impl App for Files {
             let y = FILES_TOOLBAR + 26 + i as i32 * FILES_ROW;
             let row = Rect::new(14, y, w - 28, FILES_ROW - 2);
             if self.selected == Some(i) {
-                list_p.fill_squircle(row, 9.0, ACCENT, 60);
+                list_p.fill_squircle(row, 9.0, accent(), 60);
             } else if self.hover == Some(i) {
                 list_p.fill_squircle(row, 9.0, TEXT, 22);
             }
             let ic = if e.is_dir { icon::FOLDER_20_FILLED } else { file_icon(&e.name) };
             let (iw, ih, m) = assets::icon(ic);
-            list_p.draw_mask(24, y + 4, iw, ih, m, if e.is_dir { ACCENT } else { TEXT_DIM }, 255);
+            list_p.draw_mask(24, y + 4, iw, ih, m, if e.is_dir { accent() } else { TEXT_DIM }, 255);
             list_p.text(&font::UI, 54, y + 6, &e.name, TEXT, 255);
             if !e.is_dir {
                 human_size(e.size, &mut size);
@@ -651,7 +659,7 @@ impl App for Monitor {
             let x0 = graph.x + i as i32 * graph.w / n;
             let x1 = graph.x + (i as i32 + 1) * graph.w / n;
             let bh = (v as i32 * graph.h / 100).max(1);
-            p.fill_rect(Rect::new(x0, graph.bottom() - bh, (x1 - x0 - 1).max(1), bh), ACCENT, 200);
+            p.fill_rect(Rect::new(x0, graph.bottom() - bh, (x1 - x0 - 1).max(1), bh), accent(), 200);
         }
 
         // Memory card.
@@ -670,7 +678,7 @@ impl App for Monitor {
         p.fill_squircle(bar, 5.0, TEXT, 40);
         let fill = (bar.w as u64 * pct / 100) as i32;
         if fill > 0 {
-            p.fill_squircle(Rect::new(bar.x, bar.y, fill.max(10), bar.h), 5.0, ACCENT, 230);
+            p.fill_squircle(Rect::new(bar.x, bar.y, fill.max(10), bar.h), 5.0, accent(), 230);
         }
 
         // Task table.
@@ -690,7 +698,7 @@ impl App for Monitor {
             let _ = write!(buf, "{}", t.id);
             tp.text(&font::UI, cols[0], y, &buf, TEXT_DIM, 255);
             tp.text(&font::UI, cols[1], y, t.name, TEXT, 255);
-            let color = if t.state == "running" { ACCENT } else { TEXT_DIM };
+            let color = if t.state == "running" { accent() } else { TEXT_DIM };
             tp.text(&font::UI, cols[2], y, t.state, color, 255);
         }
     }
@@ -844,9 +852,9 @@ impl App for About {
         }
 
         let link = Self::link_rect(w);
-        p.text(&font::UI, link.x + 4, link.y + 3, ABOUT_LINK, ACCENT, 255);
+        p.text(&font::UI, link.x + 4, link.y + 3, ABOUT_LINK, accent(), 255);
         if self.link_hover {
-            p.fill_rect(Rect::new(link.x + 4, link.y + 20, link.w - 8, 1), ACCENT, 255);
+            p.fill_rect(Rect::new(link.x + 4, link.y + 20, link.w - 8, 1), accent(), 255);
         }
     }
 }

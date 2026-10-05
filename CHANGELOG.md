@@ -30,9 +30,17 @@ ready-to-boot images.
     a text cursor, a pen, a link hand, "not allowed", a spinner while an
     app starts, and more. All 17 come from the same cursor pack as the
     arrow.
+  - Window snapping: drag a window to the left or right edge for half
+    the screen, or to the top to maximize, with a glass preview of where
+    it will land.
+  - Keyboard shortcuts: Alt+Tab (with a glass app switcher), Alt+F4,
+    Super for Start, Super+arrows to snap, Super+D (show desktop),
+    Super+E (Files), Super+I (Settings), Ctrl+Alt+T (Terminal), and
+    arrows/Enter/Esc in menus and Start.
   - Tooltips on the tray's memory, CPU and clock.
   - Apps: Terminal (the shell), Files, Monitor, DOOM, Sketch (a small
-    drawing app) and About.
+    drawing app), Settings (wallpaper, accent colour, glass strength,
+    pointer and double-click speed, 12/24-hour clock) and About.
 - The `doom` command and the taskbar both open DOOM in a desktop window.
 
 ### Changed

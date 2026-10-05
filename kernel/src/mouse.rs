@@ -117,6 +117,16 @@ pub unsafe fn init(screen_w: u64, screen_h: u64) {
     }
 }
 
+/// Pointer speed in percent of the raw PS/2 movement.
+static SPEED_PERCENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+/// Sub-pixel movement carried over to the next packet, in 1/100 px.
+static mut REM_X: i32 = 0;
+static mut REM_Y: i32 = 0;
+
+pub fn set_speed_percent(percent: u32) {
+    SPEED_PERCENT.store(percent.clamp(10, 400), Ordering::Relaxed);
+}
+
 /// Current cursor position, already clamped to the screen.
 pub fn position() -> (i32, i32) {
     (POS_X.load(Ordering::Relaxed), POS_Y.load(Ordering::Relaxed))
@@ -165,6 +175,15 @@ extern "C" fn irq12_handler() {
             if flags & 0x20 != 0 {
                 dy -= 256; // Sign-extend dy from its 9th bit in flags.
             }
+
+            // Pointer speed (a Settings option), keeping the fraction a
+            // slow speed would otherwise drop from small movements.
+            let speed = SPEED_PERCENT.load(Ordering::Relaxed) as i32;
+            let (fx, fy) = (dx * speed + REM_X, dy * speed + REM_Y);
+            dx = fx / 100;
+            dy = fy / 100;
+            REM_X = fx % 100;
+            REM_Y = fy % 100;
 
             let max_x = SCREEN_W.load(Ordering::Relaxed) - 1;
             let max_y = SCREEN_H.load(Ordering::Relaxed) - 1;

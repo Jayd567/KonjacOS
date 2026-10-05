@@ -49,9 +49,15 @@ corner has About, the system monitor, Restart and Shut Down. Typing goes
 to the shell (or to DOOM, while its window is in front).
 
 The desktop starts empty: right-click an app, or a file or folder in
-Files, and choose "Create Shortcut" to put it there. Pins and shortcuts
-are saved to `DESKTOP.CFG` on the disk. Right-click almost anything for
-a menu, and resize windows from any edge or corner.
+Files, and choose "Create Shortcut" to put it there. Pins, shortcuts
+and Settings are saved to `DESKTOP.CFG` on the disk. Right-click almost
+anything for a menu, resize windows from any edge or corner, and drag
+them to a screen edge to snap them.
+
+Keyboard shortcuts: Alt+Tab, Alt+F4, Super (Start), Super+arrows (snap),
+Super+D (show desktop), Super+E (Files), Super+I (Settings),
+Ctrl+Alt+T (Terminal). In QEMU, click into the window first so it has
+grabbed the keyboard, or the host OS may take Alt+Tab and Super itself.
 
 Things to try in the Terminal:
 

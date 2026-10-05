@@ -13,7 +13,8 @@
 //! dir 1 0 /DOCS
 //! ```
 //!
-//! (`col row` then the app id or absolute path, which may contain spaces.)
+//! (`col row` then the app id or absolute path, which may contain spaces),
+//! plus `set <key> <value>` lines for Settings (see `settings.rs`).
 
 extern crate alloc;
 
@@ -21,7 +22,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use super::apps::{file_icon, AppKind, ACCENT, TEXT};
+use super::apps::{file_icon, AppKind, accent, TEXT};
 use super::assets;
 use super::font;
 use super::icon_ids as icon;
@@ -70,6 +71,11 @@ pub fn load_config() -> (Vec<AppKind>, Vec<Icon>) {
     for line in text.lines() {
         let mut f = line.trim().splitn(4, ' ');
         match (f.next(), f.next(), f.next(), f.next()) {
+            (Some("set"), Some(key), Some(value), None) => {
+                let mut s = super::settings::get();
+                super::settings::parse_line(&mut s, key, value);
+                super::settings::set(s);
+            }
             (Some("pin"), Some(id), None, None) => {
                 if let Some(k) = AppKind::from_id(id) {
                     if !pinned.contains(&k) {
@@ -100,6 +106,7 @@ pub fn load_config() -> (Vec<AppKind>, Vec<Icon>) {
 /// a disk this quietly does nothing; they just last until shutdown.
 pub fn save_config(pinned: &[AppKind], icons: &[Icon]) {
     let mut out = String::new();
+    super::settings::write_lines(&mut out);
     for k in pinned {
         let _ = writeln!(out, "pin {}", k.id());
     }
@@ -189,7 +196,7 @@ pub fn paint(p: &mut Painter, cell: Rect, ic: &Icon, hover: bool, alpha: u8) {
     let a = |v: u32| (v * alpha as u32 / 255) as u8;
     let hit = hit_rect(cell);
     if ic.selected {
-        p.fill_squircle(hit, 14.0, ACCENT, a(105));
+        p.fill_squircle(hit, 14.0, accent(), a(105));
     } else if hover {
         p.fill_squircle(hit, 14.0, TEXT, a(34));
     }

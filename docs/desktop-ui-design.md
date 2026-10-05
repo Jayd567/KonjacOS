@@ -32,6 +32,9 @@ Added since the brief:
 | Resizing from edges and corners | `Desktop::edge_at` (grips that a window in front blocks), `resize_window` (per-app minimum sizes from `App::min_size`) |
 | Right-click menus | `Desktop::on_right_press`; apps offer their own entries through `App::context_menu` / `context_cmd`; greyed-out entries are `MenuItem`s with no command |
 | Desktop shortcuts and pinning | `icons.rs`: shortcuts made with "Create Shortcut", on a grid, saved with the pinned apps to `/DESKTOP.CFG`; `Desktop` handles selection, dragging and rubber-band select. The taskbar is `Desktop::task_apps`: pinned apps, then any other running ones |
+| Window snapping | `Desktop::snap_target` / `set_snap` (a glass `SnapPreview` layered just under the dragged window) / `snap_window`; `restore` remembers the pre-snap size |
+| Keyboard shortcuts | `keyboard.rs` `desktop_filter` keeps shortcuts (and everything while a menu is open, via `set_capture`) away from the shell and DOOM; `Desktop::on_key` acts on them, including the Alt+Tab `Switcher` |
+| Settings | `settings.rs`: one global `Settings` with a revision counter the desktop watches (`apply_settings`); drawn gradient wallpapers; saved as `set` lines in `/DESKTOP.CFG` |
 | Pointer shapes | `cursor.rs` (all 17 cursors from the pack, two of them animated); `Desktop::pick_cursor` picks one from the current drag or what's under the pointer, apps answer for their client area through `App::cursor` |
 
 Differences from the brief:

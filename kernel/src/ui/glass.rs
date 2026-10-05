@@ -32,6 +32,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use super::math::{hash2, smoothstep, sqrt};
 use super::surface::{blend, squircle_sdf, Rect, Surface};
 
@@ -121,6 +123,14 @@ pub const TOOLTIP: GlassStyle = GlassStyle {
     shadow: 10,
     shadow_alpha: 0.25,
 };
+
+/// How strong the glass is (a Settings option): 0 = clear (less blur and
+/// frost, more of the wallpaper shows), 1 = balanced, 2 = frosted.
+static LEVEL: AtomicU8 = AtomicU8::new(1);
+
+pub fn set_level(level: u8) {
+    LEVEL.store(level.min(2), Ordering::Relaxed);
+}
 
 impl GlassStyle {
     /// How far outside the panel the backdrop must already be composed
@@ -515,7 +525,13 @@ impl Glass {
         let mean = ((sum_r / cells) as i32, (sum_g / cells) as i32, (sum_b / cells) as i32);
 
         // Three box passes ~ a Gaussian with sigma ~ blur / 2.
-        let r = (((s.blur >> shift) + 1) / 2).max(1) as usize;
+        let level = LEVEL.load(Ordering::Relaxed);
+        let blur = match level {
+            0 => s.blur * 3 / 5,
+            2 => s.blur * 13 / 10,
+            _ => s.blur,
+        };
+        let r = (((blur >> shift) + 1) / 2).max(1) as usize;
         for _ in 0..3 {
             box_blur(pr, tmp, lw, lh, r);
             box_blur(pg, tmp, lw, lh, r);
@@ -532,6 +548,11 @@ impl Glass {
         let k256 = |v: f32| (v * 256.0) as i32;
         let (tint_k, sat, base_dark, frost_dark, frost_light, edge_sharp) =
             (k256(s.tint), k256(s.saturation), k256(s.base_dark), k256(s.frost_dark), k256(s.frost_light), k256(s.edge_sharp));
+        let base_dark = match level {
+            0 => base_dark * 2 / 3,
+            2 => base_dark + 26,
+            _ => base_dark,
+        };
 
         // The glass's colour response to whatever is behind it.
         let grade = |mut r: i32, mut g: i32, mut b: i32| -> (i32, i32, i32) {
