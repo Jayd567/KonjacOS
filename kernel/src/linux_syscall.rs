@@ -410,10 +410,14 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // not silently pretended away.
         SYS_RT_SIGPROCMASK => 0,
         SYS_RT_SIGRETURN => sys_rt_sigreturn(),
-        SYS_EXIT | SYS_EXIT_GROUP => {
+        SYS_EXIT => {
             // Never returns.
             task::task_exit();
         }
+        // exit_group ends every thread in the process, not just the caller.
+        // HotSpot's System.exit relies on this: the VMThread calls exit()
+        // while every other Java thread is parked at a safepoint.
+        SYS_EXIT_GROUP => task::exit_group(),
         _ => {
             println!("linux_syscall: unimplemented syscall number {number} (a0={a0:#x} a1={a1:#x} a2={a2:#x} a3={a3:#x} a4={a4:#x})");
             ENOSYS

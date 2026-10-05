@@ -25,10 +25,10 @@ The first public release of KonjacOS.
 - DOOM (shareware), playable in a window.
 - A basic window manager with draggable windows.
 - OpenJDK 21 starts: `java -version` and simple programs launched with
-  `java -cp` run to completion.
+  `java -cp` run to completion, including programs that call
+  `System.exit`.
 
 ### Known issues
 
-- Java programs that call `System.exit` hang, which also stops
-  `java -jar` from finishing.
+- `java -jar` cannot open jar files yet.
 - No networking yet.

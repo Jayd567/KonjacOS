@@ -916,6 +916,30 @@ pub fn exit_current() -> ! {
     task_exit()
 }
 
+/// Real Linux `exit_group(2)`: terminates every task sharing the caller's
+/// address space (its sibling threads), then exits the caller itself.
+/// Siblings are only marked `Terminated`; `schedule` reaps them, and the
+/// last one reaped frees the shared address space, exactly as for [`kill`].
+/// A kernel thread (whose `cr3` is the shared kernel one) only exits
+/// itself.
+pub fn exit_group() -> ! {
+    {
+        let mut tasks = TASKS.lock();
+        let current = CURRENT.load(Ordering::Relaxed);
+        let cr3 = tasks[current].as_ref().map(|t| t.cr3);
+        if let Some(cr3) = cr3.filter(|&c| c != KERNEL_CR3.load(Ordering::Relaxed)) {
+            for (i, slot) in tasks.iter_mut().enumerate() {
+                if let Some(task) = slot {
+                    if i != current && task.cr3 == cr3 {
+                        task.state = TaskState::Terminated;
+                    }
+                }
+            }
+        }
+    }
+    task_exit()
+}
+
 /// Terminates *another* task by ID -- for example the shell's `kill`
 /// command stopping a runaway or unwanted task (DOOM included) without
 /// waiting for it to exit on its own. Unlike [`exit_current`], this doesn't

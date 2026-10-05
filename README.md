@@ -94,8 +94,8 @@ Add `MODE=release` to any of these for an optimized build.
 
 ## Roadmap
 
-1. **Java.** Fix the `System.exit` hang so `java -jar` works, then run
-   larger Java programs.
+1. **Java.** Get `java -jar` opening jar files, then run larger Java
+   programs.
 2. **Networking.** A loopback TCP/IP stack, since even singleplayer
    Minecraft talks to a local server over a socket.
 3. **Graphics.** OpenGL support for LWJGL, most likely through a software

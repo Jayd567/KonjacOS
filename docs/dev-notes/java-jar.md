@@ -409,3 +409,46 @@ So there are two separate problems:
    successful `-cp` runs too, so neither is jar-specific on its own. The
    next step is to make the launcher print the actual exception, or try
    `java -cp /hello.jar Hello`, to see which call fails.
+
+## Resolved: `exit_group` only ended the calling thread
+
+Temporary instrumentation (reverted) logged a frame-pointer walk of the
+user stack on every untimed futex wait and on every `exit`/`exit_group`,
+plus each shared library's load address. Symbolized against the
+`openjdk-21-dbg` debug info for the exact `libjvm.so` on the disk:
+
+- Task 6 (`JavaMain`): `JVM_Halt` -> `vm_exit` -> `VMThread::execute`
+  -> `wait_until_executed`, waiting on `VMOperation_lock`.
+- Tasks 11, 13, 14, 15 (signal, monitor deflation, C1, C2 threads):
+  `SafepointSynchronize::block`, correctly parked for a safepoint.
+- Task 8: **the VMThread**. It ran `VM_Exit` at that safepoint and
+  called glibc `exit()`, which ended in `exit_group(1)`.
+
+This kernel handled `exit_group` exactly like `exit`, so only the VMThread
+died and every other thread stayed parked forever. The process had in fact
+finished `System.exit` correctly.
+
+Fix: `exit_group` now marks every task sharing the caller's address space
+as terminated, then exits the caller. The scheduler reaps them, and the
+last one frees the address space.
+
+Results after the fix (`ps` afterwards shows only the kernel's own tasks):
+
+| Command | Result |
+| --- | --- |
+| `java -cp / ExitOne` | prints, exits, all threads gone |
+| `java -cp / ExitZero` | prints, exits, all threads gone |
+| `java -cp / Hello world` | prints, exits |
+| `java -version` | prints banner, exits |
+| `java -jar /hello.jar world` | prints the `Error:` line, then exits |
+
+Remaining issues:
+
+1. `-jar` still fails to open the jar (the `IOException` behind the
+   `Error:` line). Suspects: `statfs` (137) and `socket` (41) are
+   unimplemented, though both also appear in successful runs.
+2. In 1 of 6 `System.exit` runs, glibc printed `free(): invalid pointer`
+   during `exit()` and called `tgkill` (234, unimplemented) to abort.
+   This happens before `exit_group`, so it is unrelated to this fix.
+3. `MAX_TASKS` is 16, and this JVM already uses every slot (3 kernel
+   tasks plus 13 JVM threads). Larger Java programs will need more.
