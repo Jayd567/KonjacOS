@@ -6,13 +6,13 @@
 //! - A fully transparent **top bar**: the "K" system menu, the active
 //!   app's name, and Window/Help menus. Its dropdowns are separate panes
 //!   of glass floating over whatever is underneath.
-//! - **Desktop icons** on the wallpaper (see `icons.rs`): every app plus
-//!   the root of the disk. Drag them around, rubber-band select them, drop
-//!   an app on the taskbar to pin it.
-//! - A floating glass **taskbar** at the bottom: Start plus the pinned
-//!   and running apps centred (regular icons, filled when hovered or
-//!   active, a pill under running ones), the tray (CPU, memory, clock) on
-//!   the right.
+//! - **Desktop shortcuts** on the wallpaper (see `icons.rs`), made with
+//!   "Create Shortcut" from any app's or file's right-click menu. Drag
+//!   them around, rubber-band select them.
+//! - A floating glass **taskbar** at the bottom: Start, then the apps
+//!   pinned from their right-click menus and whatever else is running,
+//!   centred (regular icons, filled when hovered or active, a pill under
+//!   running ones), the tray (CPU, memory, clock) on the right.
 //! - Glass **windows** in between, resizable from any edge or corner.
 //!   Maximizing fills exactly the work area between the two bars, never
 //!   sliding under the taskbar.
@@ -176,8 +176,9 @@ enum Cmd {
     App(u32),
     OpenIcon(usize),
     ShowInFiles(usize),
+    RemoveIcon(usize),
+    ShortcutTo(AppKind),
     ArrangeIcons,
-    RefreshIcons,
     ShowDesktop,
 }
 
@@ -350,6 +351,7 @@ impl Desktop {
     fn new(canvas: Canvas) -> Self {
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
         let (mx, my) = mouse::position();
+        let (pinned, desk_icons) = icons::load_config();
         let mut d = Desktop {
             canvas,
             bb: Surface::new(w, h),
@@ -360,7 +362,7 @@ impl Desktop {
             start: StartMenu { open: false, spring: Spring::new(0.0), glass: Glass::default(), hover: None },
             menu: None,
             tooltip: None,
-            pinned: AppKind::PINNED.to_vec(),
+            pinned,
             hover_item: None,
             tip: None,
             hover_since: 0,
@@ -368,7 +370,7 @@ impl Desktop {
             hover_alpha: [0.0; MAX_ITEMS],
             tray_hover: None,
             topbar_hover: None,
-            icons: icons::load(),
+            icons: desk_icons,
             icon_hover: None,
             damage: Vec::new(),
             mx,
@@ -389,7 +391,7 @@ impl Desktop {
             now: timer::ticks(),
         };
         let wa = d.work_area();
-        icons::arrange(&mut d.icons, wa);
+        icons::tidy(&mut d.icons, wa);
         d
     }
 
@@ -1108,8 +1110,10 @@ impl Desktop {
             let client = Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H);
             self.damage(r.offset(client.x, client.y).intersect(&client), L_WIN + i as u16);
         }
-        if let Some(Action::Shell(cmd)) = reply.action {
-            self.shell_command(&cmd);
+        match reply.action {
+            Some(Action::Shell(cmd)) => self.shell_command(&cmd),
+            Some(Action::Shortcut { path, is_dir }) => self.add_shortcut(if is_dir { Target::Dir(path) } else { Target::File(path) }),
+            None => {}
         }
     }
 
@@ -1121,6 +1125,11 @@ impl Desktop {
         }
         self.hide_tooltip();
         self.damage_taskbar();
+        self.save();
+    }
+
+    fn save(&self) {
+        icons::save_config(&self.pinned, &self.icons);
     }
 
     // --- Desktop icons ------------------------------------------------------
@@ -1167,55 +1176,38 @@ impl Desktop {
         for i in 0..self.icons.len() {
             self.damage_icon(i);
         }
+        self.save();
     }
 
-    /// Re-reads the disk's root folder; icons that are still there keep
-    /// their place, new ones go in the first free cells.
-    fn refresh_icons(&mut self) {
-        for i in 0..self.icons.len() {
-            self.damage_icon(i);
+    /// Puts a shortcut to `target` in the first free cell -- or, if there
+    /// already is one, just selects it.
+    fn add_shortcut(&mut self, target: Target) {
+        if let Some(i) = self.icons.iter().position(|ic| ic.target == target) {
+            self.select_icons(|j, _| j == i);
+            return;
         }
         let area = self.icon_area();
-        let mut fresh = icons::load();
-        let mut taken = Vec::new();
-        let mut placed = alloc::vec![false; fresh.len()];
-        for (n, ic) in fresh.iter_mut().enumerate() {
-            if let Some(old) = self.icons.iter().find(|o| o.target == ic.target) {
-                ic.col = old.col;
-                ic.row = old.row;
-                taken.push((ic.col, ic.row));
-                placed[n] = true;
-            }
-        }
-        for (n, ic) in fresh.iter_mut().enumerate() {
-            if !placed[n] {
-                let (c, r) = icons::nearest_free(area, 0, 0, &taken);
-                ic.col = c;
-                ic.row = r;
-                taken.push((c, r));
-            }
-        }
-        self.icons = fresh;
-        self.icon_hover = None;
-        for i in 0..self.icons.len() {
-            self.damage_icon(i);
-        }
+        let taken: Vec<(i32, i32)> = self.icons.iter().map(|ic| (ic.col, ic.row)).collect();
+        let (col, row) = icons::nearest_free(area, 0, 0, &taken);
+        self.select_icons(|_, _| false);
+        let mut ic = Icon::new(target, col, row);
+        ic.selected = true;
+        self.icons.push(ic);
+        self.damage_icon(self.icons.len() - 1);
+        self.save();
     }
 
-    /// Where a drop of the selected icons, dragged by `(dx, dy)`, would
-    /// pin something: any selected app that isn't on the taskbar yet.
-    fn droppable_apps(&self) -> Vec<AppKind> {
-        self.icons.iter().filter(|ic| ic.selected).filter_map(|ic| ic.app()).filter(|k| !self.pinned.contains(k)).collect()
+    fn remove_icon(&mut self, i: usize) {
+        if i < self.icons.len() {
+            self.damage_icon(i);
+            self.icons.remove(i);
+            self.icon_hover = None;
+            self.save();
+        }
     }
 
     fn drop_icons(&mut self, dx: i32, dy: i32) {
         let (x, y) = (self.mx, self.my);
-        if self.taskbar_rect().contains(x, y) {
-            for kind in self.droppable_apps() {
-                self.set_pinned(kind, true);
-            }
-            return;
-        }
         if !self.on_desktop(x, y) {
             return;
         }
@@ -1234,6 +1226,7 @@ impl Desktop {
             taken.push((col, row));
             self.damage_icon(i);
         }
+        self.save();
     }
 
     // --- Commands -----------------------------------------------------------
@@ -1272,8 +1265,9 @@ impl Desktop {
             }
             Cmd::OpenIcon(i) => self.open_icon(i),
             Cmd::ShowInFiles(i) => self.show_icon_in_files(i),
+            Cmd::RemoveIcon(i) => self.remove_icon(i),
+            Cmd::ShortcutTo(kind) => self.add_shortcut(Target::App(kind)),
             Cmd::ArrangeIcons => self.arrange_icons(),
-            Cmd::RefreshIcons => self.refresh_icons(),
             Cmd::ShowDesktop => {
                 for i in 0..self.windows.len() {
                     if !self.windows[i].minimized {
@@ -1360,12 +1354,16 @@ impl Desktop {
     }
 
     /// The right-click menu for app `kind` on the taskbar, Start or the
-    /// desktop: open it, pin or unpin it, close its window.
+    /// desktop: open it, pin or unpin it, make a desktop shortcut, close
+    /// its window.
     fn app_menu(&self, kind: AppKind, open: Cmd, open_label: &'static str) -> Vec<MenuItem> {
         let running = self.window_of(kind).is_some();
+        let has_shortcut = self.icons.iter().any(|ic| ic.target == Target::App(kind));
         let mut items = alloc::vec![item(open_label, open), SEPARATOR];
         items.push(if self.pinned.contains(&kind) { item("Unpin from Taskbar", Cmd::Unpin(kind)) } else { item("Pin to Taskbar", Cmd::Pin(kind)) });
+        items.push(item_if("Create Shortcut", Cmd::ShortcutTo(kind), !has_shortcut));
         if running {
+            items.push(SEPARATOR);
             items.push(item("Close Window", Cmd::Close));
         }
         items
@@ -1837,20 +1835,26 @@ impl Desktop {
                 if !self.icons[i].selected {
                     self.select_icons(|j, _| j == i);
                 }
-                let items = match &self.icons[i].target {
+                let (mut items, target) = match &self.icons[i].target {
                     Target::App(kind) => {
                         let kind = *kind;
-                        let items = self.app_menu(kind, Cmd::OpenIcon(i), "Open");
-                        self.context_menu(items, Some(kind));
-                        return;
+                        let running = self.window_of(kind).is_some();
+                        let mut items = alloc::vec![item("Open", Cmd::OpenIcon(i)), SEPARATOR];
+                        items.push(if self.pinned.contains(&kind) { item("Unpin from Taskbar", Cmd::Unpin(kind)) } else { item("Pin to Taskbar", Cmd::Pin(kind)) });
+                        if running {
+                            items.push(item("Close Window", Cmd::Close));
+                        }
+                        (items, Some(kind))
                     }
-                    Target::Dir(_) => alloc::vec![item("Open", Cmd::OpenIcon(i))],
+                    Target::Dir(_) => (alloc::vec![item("Open", Cmd::OpenIcon(i)), item("Show in Files", Cmd::ShowInFiles(i))], None),
                     Target::File(path) => {
                         let can_open = open_command(path).is_some();
-                        alloc::vec![item_if("Open", Cmd::OpenIcon(i), can_open), item("Show in Files", Cmd::ShowInFiles(i))]
+                        (alloc::vec![item_if("Open", Cmd::OpenIcon(i), can_open), item("Show in Files", Cmd::ShowInFiles(i))], None)
                     }
                 };
-                self.context_menu(items, None);
+                items.push(SEPARATOR);
+                items.push(item("Remove Shortcut", Cmd::RemoveIcon(i)));
+                self.context_menu(items, target);
             }
             None => {
                 self.select_icons(|_, _| false);
@@ -1858,8 +1862,7 @@ impl Desktop {
                     item("Open Terminal", Cmd::Open(AppKind::Terminal)),
                     item("Open Files", Cmd::Open(AppKind::Files)),
                     SEPARATOR,
-                    item("Arrange Icons", Cmd::ArrangeIcons),
-                    item("Refresh", Cmd::RefreshIcons),
+                    item_if("Arrange Icons", Cmd::ArrangeIcons, !self.icons.is_empty()),
                     item("Show Desktop", Cmd::ShowDesktop),
                     SEPARATOR,
                     item("About KonjacOS", Cmd::Open(AppKind::About)),
@@ -1878,19 +1881,7 @@ impl Desktop {
         match self.grab {
             Grab::Move { .. } => return Cursor::Move,
             Grab::Resize { edges, .. } => return edge_cursor(edges),
-            Grab::IconDrag { .. } => {
-                return if self.taskbar_rect().contains(x, y) {
-                    if self.droppable_apps().is_empty() {
-                        Cursor::No
-                    } else {
-                        Cursor::Pin
-                    }
-                } else if self.on_desktop(x, y) {
-                    Cursor::Move
-                } else {
-                    Cursor::No
-                };
-            }
+            Grab::IconDrag { .. } => return if self.on_desktop(x, y) { Cursor::Move } else { Cursor::No },
             Grab::Band { .. } => return Cursor::Cross,
             Grab::Client { kind } => {
                 if let Some(i) = self.window_of(kind) {
@@ -1917,6 +1908,7 @@ impl Desktop {
             if m.rect.contains(x, y) {
                 return match m.row_at(x, y) {
                     Some(i) if m.items[i].cmd.is_none() => Cursor::No,
+                    Some(i) if matches!(m.items[i].cmd, Some(Cmd::Pin(_))) => Cursor::Pin,
                     Some(_) if m.id == MenuId::Help => Cursor::Help,
                     _ => Cursor::Arrow,
                 };

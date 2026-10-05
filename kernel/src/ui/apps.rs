@@ -37,9 +37,22 @@ pub enum AppKind {
 impl AppKind {
     /// Every app, in Start menu order.
     pub const ALL: [AppKind; 6] = [AppKind::Terminal, AppKind::Files, AppKind::Monitor, AppKind::Doom, AppKind::Sketch, AppKind::About];
-    /// What the taskbar starts out with; the rest can be pinned by dragging
-    /// their desktop icon onto it, or from their right-click menu.
-    pub const PINNED: [AppKind; 5] = [AppKind::Terminal, AppKind::Files, AppKind::Monitor, AppKind::Doom, AppKind::About];
+
+    /// A stable name for saving it in `/DESKTOP.CFG`.
+    pub fn id(self) -> &'static str {
+        match self {
+            AppKind::Terminal => "terminal",
+            AppKind::Files => "files",
+            AppKind::Monitor => "monitor",
+            AppKind::Doom => "doom",
+            AppKind::Sketch => "sketch",
+            AppKind::About => "about",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<AppKind> {
+        AppKind::ALL.into_iter().find(|k| k.id() == id)
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -123,6 +136,8 @@ pub enum MouseEvent {
 pub enum Action {
     /// Type `command` into the shell and bring the Terminal forward.
     Shell(String),
+    /// Put a shortcut to `path` (a folder if `is_dir`) on the desktop.
+    Shortcut { path: String, is_dir: bool },
 }
 
 #[derive(Default)]
@@ -553,8 +568,8 @@ impl App for Files {
     fn context_menu(&mut self, _x: i32, y: i32, _w: i32, _h: i32) -> Vec<ContextItem> {
         self.selected = self.row_at(y);
         match self.selected {
-            Some(i) if self.entries[i].is_dir => alloc::vec![("Open", Some(0))],
-            Some(i) => alloc::vec![("Open", open_command(&self.entries[i].name).map(|_| 0))],
+            Some(i) if self.entries[i].is_dir => alloc::vec![("Open", Some(0)), ("", None), ("Create Shortcut", Some(3))],
+            Some(i) => alloc::vec![("Open", open_command(&self.entries[i].name).map(|_| 0)), ("", None), ("Create Shortcut", Some(3))],
             None => alloc::vec![("Up One Level", (self.path != "/").then_some(1)), ("Refresh", Some(2))],
         }
     }
@@ -565,6 +580,10 @@ impl App for Files {
             (1, _) => {
                 self.up();
                 Reply::repaint(true)
+            }
+            (3, Some(i)) => {
+                let (path, is_dir) = (self.child(&self.entries[i].name), self.entries[i].is_dir);
+                Reply { action: Some(Action::Shortcut { path, is_dir }), ..Reply::default() }
             }
             _ => {
                 self.load();

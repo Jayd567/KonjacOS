@@ -13,15 +13,17 @@ ready-to-boot images.
     blur that grows with how high a panel floats, Snell's-law refraction
     with colour fringing at the rim, a tint taken from the backdrop, a
     dither layer and a top-edge light catch.
-  - A floating taskbar with Start, pinned apps and a live tray (CPU,
-    memory, clock), and a transparent top bar with glass dropdown menus.
+  - A floating taskbar with Start, the running apps and any you pin
+    from their right-click menu, and a live tray (CPU, memory, clock);
+    a transparent top bar with glass dropdown menus.
   - Windows that drag, resize from any edge or corner, maximize (above
     the taskbar), minimize and close, with spring animations and
     hit-testing that follows their rounded corners.
-  - Desktop icons for every app and for the files and folders at the
-    root of the disk. Double-click to open, drag to rearrange,
-    rubber-band to select several, or drop an app on the taskbar to pin
-    it there.
+  - Desktop shortcuts: the desktop starts empty, and "Create Shortcut"
+    in the right-click menu of any app (in Start or on the taskbar) or
+    any file or folder (in Files) puts one there. Double-click to open,
+    drag to rearrange, rubber-band to select several. Shortcuts and
+    pinned apps are saved to `DESKTOP.CFG` on the disk.
   - Right-click menus on the desktop, icons, taskbar items, the Start
     button, title bars, and inside the Terminal, Files and Sketch.
   - Mouse pointers that change with what's under them: resize arrows,

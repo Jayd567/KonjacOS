@@ -42,15 +42,16 @@ The ISO boots on its own, but without the disk image there are no files
 to browse and no DOOM. For a smoother desktop, add `-accel whpx` on
 Windows, `-accel kvm` on Linux or `-accel hvf` on macOS.
 
-KonjacOS boots to the desktop with the Terminal open. The taskbar has
-Start, Terminal, Files, Monitor, DOOM and About; the "K" in the top-left
+KonjacOS boots to the desktop with the Terminal open. Start lists every
+app; the taskbar shows the ones that are running plus any you pin
+(right-click an app, then "Pin to Taskbar"). The "K" in the top-left
 corner has About, the system monitor, Restart and Shut Down. Typing goes
 to the shell (or to DOOM, while its window is in front).
 
-The desktop has icons for every app (including Sketch, a small drawing
-app) and for the files on the disk. Drag icons around, drop an app on
-the taskbar to pin it, and right-click almost anything for a menu.
-Windows resize from any edge or corner.
+The desktop starts empty: right-click an app, or a file or folder in
+Files, and choose "Create Shortcut" to put it there. Pins and shortcuts
+are saved to `DESKTOP.CFG` on the disk. Right-click almost anything for
+a menu, and resize windows from any edge or corner.
 
 Things to try in the Terminal:
 

@@ -1,17 +1,33 @@
-//! Desktop icons: every app, plus whatever is in the root of the disk.
-//! They sit on a grid in the work area, filled column by column from the
-//! top left like other desktops, and keep the cell you drag them to.
+//! Desktop icons. The desktop starts out empty; right-clicking an app
+//! (in Start or on the taskbar) or a file or folder (in Files) offers
+//! "Create Shortcut", which puts one here. Shortcuts sit on a grid in the
+//! work area and keep the cell you drag them to.
+//!
+//! They're saved, along with the taskbar's pinned apps, to
+//! `/DESKTOP.CFG` on the disk -- one per line:
+//!
+//! ```text
+//! pin terminal
+//! app 0 0 sketch
+//! file 0 1 /README.TXT
+//! dir 1 0 /DOCS
+//! ```
+//!
+//! (`col row` then the app id or absolute path, which may contain spaces.)
 
 extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 use super::apps::{file_icon, AppKind, ACCENT, TEXT};
 use super::assets;
 use super::font;
 use super::icon_ids as icon;
 use super::surface::{rgb, Painter, Rect};
+
+const CONFIG: &str = "/DESKTOP.CFG";
 
 pub const CELL_W: i32 = 88;
 pub const CELL_H: i32 = 96;
@@ -34,31 +50,67 @@ pub struct Icon {
 }
 
 impl Icon {
-    pub fn app(&self) -> Option<AppKind> {
-        match self.target {
-            Target::App(k) => Some(k),
-            _ => None,
-        }
+    pub fn new(target: Target, col: i32, row: i32) -> Self {
+        let label = match &target {
+            Target::App(k) => String::from(k.short_name()),
+            Target::Dir(p) | Target::File(p) => String::from(p.rsplit('/').next().unwrap_or(p)),
+        };
+        Icon { target, label, col, row, selected: false }
     }
 }
 
-/// The icons for the desktop: apps first, then folders, then files.
-pub fn load() -> Vec<Icon> {
-    let mut icons: Vec<Icon> = AppKind::ALL
-        .iter()
-        .map(|&k| Icon { target: Target::App(k), label: String::from(k.short_name()), col: 0, row: 0, selected: false })
-        .collect();
-    if let Ok(mut list) = crate::fat16::list_dir("/") {
-        list.retain(|e| e.name != "." && e.name != "..");
-        list.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())));
-        for e in list {
-            let mut path = String::from("/");
-            path.push_str(&e.name);
-            let target = if e.is_dir { Target::Dir(path) } else { Target::File(path) };
-            icons.push(Icon { target, label: e.name, col: 0, row: 0, selected: false });
+/// Reads `/DESKTOP.CFG`: the pinned apps and the shortcuts. Missing or
+/// unreadable means a fresh desktop -- nothing pinned, no shortcuts.
+pub fn load_config() -> (Vec<AppKind>, Vec<Icon>) {
+    let (mut pinned, mut icons) = (Vec::new(), Vec::new());
+    let Ok(data) = crate::fat16::read_file(CONFIG) else { return (pinned, icons) };
+    // Not `String::from_utf8_lossy`: it needs unwinding support this
+    // kernel can't link (see `cfile.rs`). We wrote the file, so it's UTF-8.
+    let text = core::str::from_utf8(&data).unwrap_or("");
+    for line in text.lines() {
+        let mut f = line.trim().splitn(4, ' ');
+        match (f.next(), f.next(), f.next(), f.next()) {
+            (Some("pin"), Some(id), None, None) => {
+                if let Some(k) = AppKind::from_id(id) {
+                    if !pinned.contains(&k) {
+                        pinned.push(k);
+                    }
+                }
+            }
+            (Some(kind), Some(col), Some(row), Some(rest)) => {
+                let (Ok(col), Ok(row)) = (col.parse(), row.parse()) else { continue };
+                let target = match kind {
+                    "app" => match AppKind::from_id(rest) {
+                        Some(k) => Target::App(k),
+                        None => continue,
+                    },
+                    "file" => Target::File(String::from(rest)),
+                    "dir" => Target::Dir(String::from(rest)),
+                    _ => continue,
+                };
+                icons.push(Icon::new(target, col, row));
+            }
+            _ => {}
         }
     }
-    icons
+    (pinned, icons)
+}
+
+/// Writes the pinned apps and shortcuts back to `/DESKTOP.CFG`. Without
+/// a disk this quietly does nothing; they just last until shutdown.
+pub fn save_config(pinned: &[AppKind], icons: &[Icon]) {
+    let mut out = String::new();
+    for k in pinned {
+        let _ = writeln!(out, "pin {}", k.id());
+    }
+    for ic in icons {
+        let _ = match &ic.target {
+            Target::App(k) => writeln!(out, "app {} {} {}", ic.col, ic.row, k.id()),
+            Target::File(p) => writeln!(out, "file {} {} {}", ic.col, ic.row, p),
+            Target::Dir(p) => writeln!(out, "dir {} {} {}", ic.col, ic.row, p),
+        };
+    }
+    let _ = crate::fat16::write_file(CONFIG, out.as_bytes());
 }
 
 /// How many rows of icons fit in `area`.
@@ -69,6 +121,21 @@ pub fn rows(area: Rect) -> i32 {
 /// How many columns fit in `area`.
 pub fn cols(area: Rect) -> i32 {
     ((area.w - 8) / CELL_W).max(1)
+}
+
+/// Moves any icon that's off the grid (the screen got smaller) or
+/// sharing a cell onto the nearest free one.
+pub fn tidy(icons: &mut [Icon], area: Rect) {
+    let mut taken: Vec<(i32, i32)> = Vec::new();
+    for ic in icons.iter_mut() {
+        let on_grid = ic.col >= 0 && ic.row >= 0 && ic.col < cols(area) && ic.row < rows(area);
+        if !on_grid || taken.contains(&(ic.col, ic.row)) {
+            let (c, r) = nearest_free(area, ic.col.max(0), ic.row.max(0), &taken);
+            ic.col = c;
+            ic.row = r;
+        }
+        taken.push((ic.col, ic.row));
+    }
 }
 
 /// Lays every icon out in order, column by column.
