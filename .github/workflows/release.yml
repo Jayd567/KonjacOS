@@ -1,10 +1,19 @@
 name: Release
 
-# Push a tag like v0.2.0 to build the bootable images and publish a GitHub
-# Release. The release notes come from that version's section in CHANGELOG.md.
+# Push a tag like v0.2.0, or run this workflow from the Actions tab with a
+# version, to build the bootable images and publish a GitHub Release. The
+# release notes come from that version's section in CHANGELOG.md.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.2.0 (creates the tag)"
+        required: true
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
 
 permissions:
   contents: write
@@ -26,11 +35,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release images
-        run: make MODE=release VERSION=${{ github.ref_name }} release
+        run: make MODE=release VERSION=$VERSION release
 
       - name: Extract release notes
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${VERSION#v}"
           awk -v v="$version" '
             /^## / { if (found) exit; if ($0 ~ "^## \\[?v?" v "\\]?([ ]|$)") { found=1; next } }
             found { print }
@@ -43,6 +52,8 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          name: KonjacOS ${{ github.ref_name }}
+          name: KonjacOS ${{ env.VERSION }}
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           body_path: release-notes.md
           files: dist/*
