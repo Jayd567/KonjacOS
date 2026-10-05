@@ -24,11 +24,11 @@ The first public release of KonjacOS.
   musl programs, including threads, futexes and signals.
 - DOOM (shareware), playable in a window.
 - A basic window manager with draggable windows.
-- OpenJDK 21 starts: `java -version` and simple programs launched with
-  `java -cp` run to completion, including programs that call
-  `System.exit`.
+- OpenJDK 21: `java -version`, `java -cp` and `java -jar` run simple
+  programs to completion, including programs that call `System.exit`.
 
 ### Known issues
 
-- `java -jar` cannot open jar files yet.
+- Larger Java programs are untested and will likely need more Linux
+  system calls.
 - No networking yet.

@@ -178,6 +178,42 @@ fn fat_entry(l: Layout, cluster: u32) -> Result<u16, &'static str> {
     Ok(u16::from_le_bytes([buf[offset_in_sector], buf[offset_in_sector + 1]]))
 }
 
+/// Volume geometry and free space, for `statfs`.
+pub struct VolumeStats {
+    pub cluster_bytes: u64,
+    pub total_clusters: u64,
+    pub free_clusters: u64,
+}
+
+/// Reports the volume's cluster size, data-cluster count and free-cluster
+/// count. FAT16 keeps no free-space counter, so this counts free entries in
+/// FAT copy 0, reading it one sector at a time rather than once per cluster.
+pub fn volume_stats() -> Result<VolumeStats, &'static str> {
+    let l = layout()?;
+    let total_clusters = (l.total_sectors - l.data_start_lba) / l.sectors_per_cluster;
+    let entries_per_sector = l.bytes_per_sector / 2;
+    let end = 2 + total_clusters;
+    let mut free = 0u64;
+    let mut cluster = 2u32;
+    while cluster < end {
+        let sector_in_fat = cluster / entries_per_sector;
+        let buf = read_sector(l.fat_start_lba + sector_in_fat)?;
+        let last = core::cmp::min(end, (sector_in_fat + 1) * entries_per_sector);
+        while cluster < last {
+            let off = ((cluster % entries_per_sector) * 2) as usize;
+            if u16::from_le_bytes([buf[off], buf[off + 1]]) == FAT_FREE {
+                free += 1;
+            }
+            cluster += 1;
+        }
+    }
+    Ok(VolumeStats {
+        cluster_bytes: (l.sectors_per_cluster * l.bytes_per_sector) as u64,
+        total_clusters: total_clusters as u64,
+        free_clusters: free,
+    })
+}
+
 /// Yields every sector (as an LBA) that makes up a directory's entries,
 /// whether that's the root directory's fixed region or an ordinary
 /// cluster chain. A disk read error or a FAT read error partway through a

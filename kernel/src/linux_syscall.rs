@@ -84,6 +84,9 @@ const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_UNLINKAT: u64 = 263;
 const SYS_STATX: u64 = 332;
+const SYS_STATFS: u64 = 137;
+const FIRST_FILE_FD: usize = 3;
+const SYS_FSTATFS: u64 = 138;
 const SYS_MKDIRAT: u64 = 258;
 const SYS_FLOCK: u64 = 73;
 const SYS_FCHDIR: u64 = 81;
@@ -182,6 +185,7 @@ const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ETIMEDOUT: i64 = -110;
 const ENOENT: i64 = -2;
+const EIO: i64 = -5;
 const EEXIST: i64 = -17;
 const ENOTDIR: i64 = -20;
 const EISDIR: i64 = -21;
@@ -311,6 +315,8 @@ extern "C" fn linux_syscall_handler(number: u64, a0: u64, a1: u64, a2: u64, a3: 
         // already honestly refuses a directory target regardless.
         SYS_UNLINKAT => sys_unlink(a1),
         SYS_STATX => sys_statx(a1, a4),
+        SYS_STATFS => sys_statfs(a0, a1),
+        SYS_FSTATFS => sys_fstatfs(a0, a1),
         // flock: advisory, cooperative locking against *other processes*
         // -- there's never a second process here to contend with, so
         // accepting it as a no-op is honest, not a shortcut around real
@@ -866,7 +872,11 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     };
 
     match opened {
-        Ok((data, extra)) => task::with_current_open_files(|table| match table.iter().position(|f| f.is_none()) {
+        // fds 0-2 are always stdin/stdout/stderr (the console) for Linux
+        // programs, so new files start at 3, the lowest number Linux would
+        // hand out. Returning 0-2 made reads/writes on those files hit the
+        // console, and made Java treat a closing jar file as stdio.
+        Ok((data, extra)) => task::with_current_open_files(|table| match (FIRST_FILE_FD..table.len()).find(|&i| table[i].is_none()) {
             Some(fd) => {
                 table[fd] = Some(OpenFile { data, pos: 0, ino, extra: extra.map(alloc::boxed::Box::new) });
                 fd as i64
@@ -1056,6 +1066,59 @@ fn sys_statx(path_ptr: u64, statxbuf_ptr: u64) -> i64 {
     };
     write_statx(statxbuf_ptr, size, ino, is_dir);
     0
+}
+
+const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+const ST_VALID: u64 = 0x20;
+
+/// Linux `statfs(2)`. Paths on the disk report the real FAT16 geometry:
+/// one block per cluster, with total and free counts from the FAT itself.
+/// The synthetic `/proc` files report an empty procfs, as on Linux.
+fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> i64 {
+    let Some(path) = read_c_string(path_ptr) else {
+        return EINVAL;
+    };
+    if synthetic_proc_file(&path).is_some() || path == "/proc" || path.starts_with("/proc/") {
+        write_statfs(buf_ptr, PROC_SUPER_MAGIC, 4096, 0, 0);
+        return 0;
+    }
+    if fat16::stat_path(&path).is_err() {
+        return ENOENT;
+    }
+    statfs_disk(buf_ptr)
+}
+
+/// Linux `fstatfs(2)`: same as [`sys_statfs`] for any open descriptor.
+/// Every real file lives on the one FAT16 volume; stdio reports it too.
+fn sys_fstatfs(fd: u64, buf_ptr: u64) -> i64 {
+    let open = fd <= 2 || task::with_current_open_files(|t| t.get(fd as usize).map(|f| f.is_some())).unwrap_or(false);
+    if !open {
+        return EBADF;
+    }
+    statfs_disk(buf_ptr)
+}
+
+fn statfs_disk(buf_ptr: u64) -> i64 {
+    match fat16::volume_stats() {
+        Ok(v) => {
+            write_statfs(buf_ptr, MSDOS_SUPER_MAGIC, v.cluster_bytes, v.total_clusters, v.free_clusters);
+            0
+        }
+        Err(_) => EIO,
+    }
+}
+
+/// Real Linux x86_64 `struct statfs`, 120 bytes: f_type, f_bsize, f_blocks,
+/// f_bfree, f_bavail, f_files, f_ffree (u64 each), f_fsid (2 x i32),
+/// f_namelen, f_frsize, f_flags, then 4 spare u64s. FAT has no inodes, so
+/// f_files/f_ffree are 0, matching Linux's vfat driver.
+fn write_statfs(buf_ptr: u64, fs_type: u64, block: u64, blocks: u64, free: u64) {
+    let fields: [u64; 15] = [fs_type, block, blocks, free, free, 0, 0, 0, 255, block, ST_VALID, 0, 0, 0, 0];
+    let buf = buf_ptr as *mut u64;
+    for (i, v) in fields.iter().enumerate() {
+        unsafe { buf.add(i).write(*v) };
+    }
 }
 
 const STATX_TYPE: u32 = 0x1;

@@ -56,7 +56,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::paging;
 use crate::sync::IrqSpinLock;
 
-pub const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 64;
 const STACK_SIZE: usize = 32 * 1024;
 
 /// Where a ring-3 task's heap starts, for `syscall.rs`'s `SYS_BRK` --
@@ -388,7 +388,7 @@ pub fn hash_path(path: &str) -> u64 {
     if hash == 0 { 1 } else { hash }
 }
 
-pub const MAX_OPEN_FILES: usize = 16;
+pub const MAX_OPEN_FILES: usize = 64;
 
 static TASKS: IrqSpinLock<[Option<Task>; MAX_TASKS]> = IrqSpinLock::new([const { None }; MAX_TASKS]);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -1030,7 +1030,7 @@ pub fn schedule() {
                 // that hasn't even run its last instruction yet. Only the
                 // last thread out actually tears it down -- a simple linear
                 // scan under the same `TASKS` lock this whole loop already
-                // holds, cheap at `MAX_TASKS` = 16 and always consistent
+                // holds, cheap at `MAX_TASKS` = 64 and always consistent
                 // since nothing else can be mutating the table concurrently.
                 if let Some(t) = &tasks[i] {
                     let cr3 = t.cr3;

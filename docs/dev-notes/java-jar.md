@@ -452,3 +452,35 @@ Remaining issues:
    This happens before `exit_group`, so it is unrelated to this fix.
 3. `MAX_TASKS` is 16, and this JVM already uses every slot (3 kernel
    tasks plus 13 JVM threads). Larger Java programs will need more.
+
+## Resolved: `java -jar` runs
+
+Three changes, tested together in one boot (`hello.exe`, a `statfs`
+check, `java -jar`, `java -version`, `System.exit(1)`, then `ps` showing
+only the kernel's own tasks):
+
+1. **`MAX_TASKS` 16 -> 64.** The JVM alone was using 13 of 16 slots.
+   Each live task costs a 32 KiB kernel stack, so 64 tasks is about 2 MiB
+   of the 96 MiB heap at most.
+2. **`statfs`/`fstatfs` (137/138).** Disk paths report the real FAT16
+   geometry (`f_type` `0x4d44`, one block per 8 KiB cluster, total and
+   free clusters counted from FAT copy 0). On the test disk this gave
+   51170 blocks with 23706 free, matching an independent count of the
+   image and `mdir`'s free-bytes figure exactly. `/proc` paths report an
+   empty procfs. `userprogs/statfs_glibc.c` prints the fields.
+   This removed syscall 137 from Java startup but did **not** change the
+   `-jar` result.
+3. **The actual `-jar` bug: `open` returned fds 0-2.** With
+   `-Dsun.java.launcher.diag=true` the launcher printed the real
+   exception: `java.io.IOException: No such file or directory` from
+   `FileDescriptor.close0`, while `java -cp /hello.jar Hello` already
+   worked. The kernel's `open` took the lowest free table slot starting
+   at 0, so the jar became fd 0. The JDK never closes fds 0-2; it opens
+   `/dev/null` and `dup2`s it over them instead, and `/dev/null` does not
+   exist here, hence `ENOENT`. It also meant reads and writes on such a
+   file went to the console. `open` now starts at fd 3, as on Linux, and
+   the per-process fd table grew from 16 to 64 entries.
+
+Still unimplemented but harmless in these runs: `socket` (41),
+`getdents64` (217, when `/tmp/hsperfdata_root` already exists), `dup`
+(32), `tgkill` (234).

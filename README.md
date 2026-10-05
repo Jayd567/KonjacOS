@@ -20,7 +20,8 @@ The long-term goal is to run Minecraft: Java Edition.
 - A Linux compatibility layer that runs unmodified glibc and musl
   programs, including threads and signals.
 - DOOM, playable in a window.
-- OpenJDK 21: `java -version` and simple Java programs run to completion.
+- OpenJDK 21: `java -version`, and simple Java programs run from a
+  folder or a `.jar` file.
 
 ## Download and run
 
@@ -94,8 +95,8 @@ Add `MODE=release` to any of these for an optimized build.
 
 ## Roadmap
 
-1. **Java.** Get `java -jar` opening jar files, then run larger Java
-   programs.
+1. **Java.** Run larger Java programs and fill in the remaining Linux
+   system calls they need.
 2. **Networking.** A loopback TCP/IP stack, since even singleplayer
    Minecraft talks to a local server over a socket.
 3. **Graphics.** OpenGL support for LWJGL, most likely through a software

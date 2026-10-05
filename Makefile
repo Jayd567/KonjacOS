@@ -141,6 +141,11 @@ io-fixture:
 	python3 -c "from pathlib import Path; Path('$(DISK_ROOT)/IOPAT.BIN').write_bytes(bytes((i*37+i//251)&255 for i in range(65539)))"
 	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/IOCHK.ELF $(DISK_ROOT)/IOPAT.BIN ::/; fi
 
+.PHONY: statfs-fixture
+statfs-fixture:
+	gcc -O2 userprogs/statfs_glibc.c -o $(DISK_ROOT)/STATFS.ELF
+	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/STATFS.ELF ::/STATFS.ELF; fi
+
 .PHONY: largefile-fixture
 largefile-fixture:
 	gcc -O2 userprogs/largefile_glibc.c -o $(DISK_ROOT)/BIGCHK.ELF
