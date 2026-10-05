@@ -353,3 +353,60 @@ synchronization primitive lives at that guest virtual address, which
 needs matching it against HotSpot's own real source (`src/hotspot/os/
 posix/`'s `Parker`/`PlatformMonitor`, most likely) rather than anything
 further this kernel's own tooling alone can resolve.
+
+## Correction: task 5 is just `pthread_join`; the real hang is `System.exit`
+
+The section above treated task 5's single untimed wait as the deadlock.
+It isn't. The `java` launcher never runs Java code on its primordial
+thread: `ContinueInNewThread` starts a new thread for `JavaMain` and then
+`pthread_join`s it. glibc's join is an untimed futex wait on the child's
+`CLONE_CHILD_CLEARTID` word, which this kernel clears and wakes in
+`task_exit`. So task 5 waiting forever is expected for as long as the
+`JavaMain` thread (task 6) stays alive.
+
+**Confirmed directly**, with temporary instrumentation in `block_until`
+(log every untimed wait, plus any task whose `child_tidptr` equals the
+wait address; reverted afterwards):
+
+```
+TMPDBG wait task 5 (run:elf) addr=0x7001c36990 untimed
+TMPDBG   == child_tidptr of task 6 (thread) state=Ready
+```
+
+In the successful `java -cp / Hello world` control run, task 6 exits with
+`child_tidptr=Some(7001c36990)` and task 5 then exits immediately, so the
+join path works.
+
+**The hang isn't jar-specific.** That `Error:` line comes from the Java
+side of the launcher (`LauncherHelper`), which reports a failure and then
+calls `System.exit(1)`. `-version` and a normal `main` return never take
+that path. Test program `userprogs/java/ExitOne.java` prints a line and
+calls `System.exit(1)`:
+
+| Command | Result |
+| --- | --- |
+| `java -cp / Hello world` | prints, all threads exit, clean |
+| `java -cp / ExitOne world` | prints `ExitOne: calling System.exit(1)`, then hangs |
+| `java -jar /hello.jar world` | prints `Error: ...`, then hangs |
+
+The two hangs look identical. `ps` shows the same pile of `blocked`
+threads (5, 6, 9-17). Both serial logs end with task 6 on the same untimed
+wait at `0x700176dc34`, with several workers (11, 13, 14, 15) parked on a
+shared address `0x7078000d84`. Screenshot:
+[`trace-java-exit1-hang.png`](trace-java-exit1-hang.png).
+
+So there are two separate problems:
+
+1. **`System.exit` never finishes** (the hang). `Runtime.exit` goes to
+   `Shutdown`, then `halt0`, then `vm_exit`. That queues a `VM_Exit`
+   operation for the VMThread, which has to bring every Java thread to a
+   safepoint before calling `::exit`. The next step is to find which
+   thread task 6 is waiting on at `0x700176dc34` (most likely the
+   VMThread handshake or safepoint, or the `Threads_lock`), and what the
+   workers parked on `0x7078000d84` are waiting for.
+2. **The `IOException` behind the `Error:` line** (why `-jar` takes the
+   exit path at all). Both runs also print `unimplemented syscall number
+   137` (`statfs`) and `41` (`socket`, `AF_UNIX`). These show up in the
+   successful `-cp` runs too, so neither is jar-specific on its own. The
+   next step is to make the launcher print the actual exception, or try
+   `java -cp /hello.jar Hello`, to see which call fails.

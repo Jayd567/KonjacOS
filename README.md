@@ -3456,6 +3456,17 @@ See item 44 for the matched-binary evidence and actual futex failure.
     kernel's own tooling. See [docs/java-jar.md](docs/java-jar.md) for
     the full evidence.
 
+    **Correction:** task 5's wait turned out to be expected. It is the
+    launcher's `pthread_join` on the `JavaMain` thread, confirmed by its
+    wait address matching task 6's `CLONE_CHILD_CLEARTID` word. The real
+    hang is `System.exit`: `java -cp / ExitOne` (a program that just
+    calls `System.exit(1)`) hangs with exactly the same threads and the
+    same final waits as `-jar`, while a normal `main` return exits
+    cleanly. `-jar` only lands there because `LauncherHelper` hits an
+    `IOException` opening the jar and exits through `System.exit(1)`.
+    The next two targets are the `VM_Exit`/safepoint path and that
+    `IOException` (`statfs` is unimplemented and is the first suspect).
+
 The [OSDev Wiki](https://wiki.osdev.org/) is the standard reference for all
 of the above once you're ready for it.
 
