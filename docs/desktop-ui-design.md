@@ -25,6 +25,15 @@ where the implementation differs.
 | Work area excludes the taskbar | `Desktop::work_area`; maximize fills exactly that |
 | Background system-metrics thread | `sysmon.rs`: samples CPU (idle-task ticks), memory, tasks and the RTC clock twice a second |
 
+Added since the brief:
+
+| Feature | Where |
+| --- | --- |
+| Resizing from edges and corners | `Desktop::edge_at` (grips that a window in front blocks), `resize_window` (per-app minimum sizes from `App::min_size`) |
+| Right-click menus | `Desktop::on_right_press`; apps offer their own entries through `App::context_menu` / `context_cmd`; greyed-out entries are `MenuItem`s with no command |
+| Desktop icons | `icons.rs`: apps plus the disk's root folder on a grid; `Desktop` handles selection, dragging, rubber-band select and pin-by-drop |
+| Pointer shapes | `cursor.rs` (all 17 cursors from the pack, two of them animated); `Desktop::pick_cursor` picks one from the current drag or what's under the pointer, apps answer for their client area through `App::cursor` |
+
 Differences from the brief:
 
 - The desktop is a kernel task, not a userspace process -- there's no

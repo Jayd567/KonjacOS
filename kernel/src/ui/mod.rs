@@ -8,7 +8,9 @@ mod desktop;
 mod font;
 mod glass;
 mod icon_ids;
+mod icons;
 mod math;
+mod sketch;
 mod surface;
 mod sysmon;
 

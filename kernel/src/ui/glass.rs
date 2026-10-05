@@ -310,6 +310,13 @@ impl Shape {
                 let py = (y - m) as f32 + 0.5 - hh;
                 for x in 0..sw {
                     let px = (x - m) as f32 + 0.5 - hw;
+                    // Skip the panel's own interior without evaluating the
+                    // SDF: the shadow never shows there, and this pass
+                    // reruns on every frame of a live resize.
+                    let (ax, ay) = (px.abs(), py.abs());
+                    if (ax < hw - r && ay < hh - 1.0) || (ay < hh - r && ax < hw - 1.0) {
+                        continue;
+                    }
                     let own = (0.5 - squircle_sdf(px, py, hw, hh, r)).clamp(0.0, 1.0);
                     if own >= 1.0 {
                         continue;

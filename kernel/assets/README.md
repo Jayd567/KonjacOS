@@ -2,12 +2,12 @@
 
 Raw pixel and glyph data baked into the kernel with `include_bytes!`. The
 kernel has no image or font decoders, so everything here is decoded
-offline. `tools/gen_desktop_assets.py` regenerates all of it except the
-cursor; the script's docstring describes each file's layout.
+offline. `tools/gen_desktop_assets.py` regenerates all of it; the
+script's docstring describes each file's layout.
 
 | File | What | Source |
 | --- | --- | --- |
-| `cursor_arrow.rgba` | Mouse pointer | "Minimalistic Modern Cursor Set" by Dante Berlin (CC BY) |
+| `cursors.kcur` | All 17 mouse pointers, including the animated busy/working ones | ["Minimalistic Modern Cursor Set"](http://www.rw-designer.com/cursor-set/material-design-best-edition-by) by Dante Berlin ([CC BY](https://creativecommons.org/licenses/by/4.0/)) |
 | `wallpaper.rgb` | Desktop wallpaper, 1280x800 | Photo by [MagicPattern](https://unsplash.com/@magicpattern) on Unsplash ([Unsplash License](https://unsplash.com/license)) |
 | `logo_k*.a8` | The "K" boot logo, three sizes | KonjacOS's own logo |
 | `icons.kico` | Taskbar, window and file icons | [Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons), MIT, (c) Microsoft |

@@ -15,10 +15,22 @@ ready-to-boot images.
     dither layer and a top-edge light catch.
   - A floating taskbar with Start, pinned apps and a live tray (CPU,
     memory, clock), and a transparent top bar with glass dropdown menus.
-  - Windows that drag, maximize (above the taskbar), minimize and close,
-    with spring animations and hit-testing that follows their rounded
-    corners.
-  - Apps: Terminal (the shell), Files, Monitor, DOOM and About.
+  - Windows that drag, resize from any edge or corner, maximize (above
+    the taskbar), minimize and close, with spring animations and
+    hit-testing that follows their rounded corners.
+  - Desktop icons for every app and for the files and folders at the
+    root of the disk. Double-click to open, drag to rearrange,
+    rubber-band to select several, or drop an app on the taskbar to pin
+    it there.
+  - Right-click menus on the desktop, icons, taskbar items, the Start
+    button, title bars, and inside the Terminal, Files and Sketch.
+  - Mouse pointers that change with what's under them: resize arrows,
+    a text cursor, a pen, a link hand, "not allowed", a spinner while an
+    app starts, and more. All 17 come from the same cursor pack as the
+    arrow.
+  - Tooltips on the tray's memory, CPU and clock.
+  - Apps: Terminal (the shell), Files, Monitor, DOOM, Sketch (a small
+    drawing app) and About.
 - The `doom` command and the taskbar both open DOOM in a desktop window.
 
 ### Changed

@@ -11,6 +11,8 @@ Inputs (pass paths on the command line, or let the defaults find them):
   --assets     a folder holding the Fluent System Icons fonts + JSON maps
                and the Inter / JetBrains Mono .ttf files (see README of
                this script's output section below)
+  --cursors    the "material-design-best-edition-by" cursor pack folder
+               (.cur and .ani files)
 
 Outputs:
   kernel/assets/wallpaper.rgb   "KWAL" u16 w, u16 h, then RGB888 rows
@@ -19,6 +21,7 @@ Outputs:
   kernel/assets/logo_k_small.a8 same, sized for the Start button
   kernel/assets/icons.kico      "KICO" u16 count, entries (u16 size, u32 off), A8
   kernel/assets/font_*.kfnt     "KFNT" glyph atlas, see write_font()
+  kernel/assets/cursors.kcur    "KCUR" mouse pointers, see write_cursors()
   kernel/src/ui/icon_ids.rs     generated constants naming each icon
 """
 
@@ -67,6 +70,23 @@ ICONS = [
     ("ARROW_UP_20", "arrow_up", 20, "regular"),
     ("HARD_DRIVE_20", "hard_drive", 20, "regular"),
     ("POWER_20", "power", 20, "regular"),
+    ("SKETCH_32", "paint_brush", 32, "regular"),
+    ("SKETCH_32_FILLED", "paint_brush", 32, "filled"),
+    ("SKETCH_20", "paint_brush", 20, "regular"),
+    ("DOCUMENT_TEXT_32", "document_text", 32, "filled"),
+    ("DOCUMENT_32", "document", 32, "filled"),
+    ("APP_32", "app_generic", 32, "filled"),
+    ("PERSON_20_FILLED", "person", 20, "filled"),
+    ("ERASER_20", "eraser", 20, "regular"),
+    ("DELETE_20", "delete", 20, "regular"),
+]
+
+# Cursor pack files in `cursor::Shape` order (kernel/src/cursor.rs).
+CURSORS = [
+    "arrow.cur", "text.cur", "link.cur", "move.cur",
+    "vertical.cur", "horizontal.cur", "dgn1.cur", "dgn2.cur",
+    "unavail.cur", "cross.cur", "helpsel.cur", "pen.cur",
+    "person.cur", "pin.cur", "up.cur", "busy.ani", "working.ani",
 ]
 
 # (output name, ttf path relative to --assets, pixel size)
@@ -166,6 +186,72 @@ def write_icons(assets: Path) -> None:
     IDS_OUT.write_text("\n".join(lines) + "\n")
 
 
+def parse_cur(data: bytes):
+    """One .cur image: (RGBA bytes top-down, w, h, hotspot x, hotspot y).
+    The pack's cursors are all 32bpp DIBs with real per-pixel alpha."""
+    w, h, _, _, hx, hy, _, off = struct.unpack_from("<BBBBHHII", data, 6)
+    w, h = w or 256, h or 256
+    hsz, _, _, _, bpp = struct.unpack_from("<IiiHH", data, off)
+    if bpp != 32:
+        raise ValueError(f"expected a 32bpp cursor, got {bpp}bpp")
+    px = data[off + hsz : off + hsz + w * h * 4]
+    im = Image.frombytes("RGBA", (w, h), px, "raw", "BGRA", 0, -1)
+    return im.tobytes(), w, h, hx, hy
+
+
+def parse_ani(data: bytes):
+    """A RIFF "ACON": frames (each a .cur) plus per-frame display times in
+    jiffies (1/60 s). Returns (frames, jiffies per frame)."""
+    frames, rates, default_rate = [], None, 1
+    i = 12
+    while i < len(data):
+        cid, size = data[i : i + 4], struct.unpack_from("<I", data, i + 4)[0]
+        body = data[i + 8 : i + 8 + size]
+        if cid == b"anih":
+            default_rate = struct.unpack_from("<9I", body)[7]
+        elif cid == b"rate":
+            rates = struct.unpack_from(f"<{size // 4}I", body)
+        elif cid == b"seq ":
+            raise ValueError("animated cursors with a 'seq ' chunk aren't supported")
+        elif cid == b"LIST" and body[:4] == b"fram":
+            j = 4
+            while j < len(body):
+                fsize = struct.unpack_from("<I", body, j + 4)[0]
+                if body[j : j + 4] == b"icon":
+                    frames.append(parse_cur(body[j + 8 : j + 8 + fsize]))
+                j += 8 + fsize + (fsize & 1)
+        i += 8 + size + (size & 1)
+    # Frames are shown for a fixed time each; the pack only varies it on
+    # the odd last frame, so the most common time stands for all of them.
+    rate = max(set(rates), key=rates.count) if rates else default_rate
+    return frames, rate
+
+
+def write_cursors(folder: Path) -> None:
+    """KCUR layout: magic, u16 count, then per cursor {u16 w, u16 h,
+    i16 hotspot x, i16 hotspot y, u16 frames, u16 ticks per frame (100 Hz),
+    u32 offset}, then each cursor's frames as top-down RGBA8."""
+    header = b"KCUR" + struct.pack("<H", len(CURSORS))
+    table, blob = b"", b""
+    base = len(header) + 16 * len(CURSORS)
+    for name in CURSORS:
+        data = (folder / name).read_bytes()
+        if name.endswith(".ani"):
+            frames, jiffies = parse_ani(data)
+            # Keep roughly 15 frames a second: plenty for a spinner, and
+            # half the size for the pack's 30 fps "busy" animation.
+            step = max(1, round((100 / 15) / (jiffies * 100 / 60)))
+            frames = frames[::step]
+            ticks = max(1, round(jiffies * step * 100 / 60))
+        else:
+            frames, ticks = [parse_cur(data)], 0
+        _, w, h, hx, hy = frames[0]
+        table += struct.pack("<HHhhHHI", w, h, hx, hy, len(frames), ticks, base + len(blob))
+        for px, *_ in frames:
+            blob += px
+    (ASSETS_OUT / "cursors.kcur").write_bytes(header + table + blob)
+
+
 def write_font(ttf: Path, size: int, name: str) -> None:
     """KFNT layout: magic, u16 size, u16 ascent, u16 descent, u16 first,
     u16 count, then per glyph {i16 left, i16 top, u16 w, u16 h,
@@ -201,6 +287,7 @@ def main() -> None:
     ap.add_argument("--wallpaper", type=Path, default=downloads / "magicpattern-87PP9Zd7MNo-unsplash.jpg")
     ap.add_argument("--logo", type=Path, default=downloads / "IconsForKonjac" / "BootupLogo.png")
     ap.add_argument("--assets", type=Path, default=ROOT / ".cache" / "assets")
+    ap.add_argument("--cursors", type=Path, default=downloads / "material-design-best-edition-by")
     args = ap.parse_args()
 
     ASSETS_OUT.mkdir(parents=True, exist_ok=True)
@@ -209,6 +296,7 @@ def main() -> None:
     write_logo(args.logo, 64, "logo_k_mid.a8")
     write_logo(args.logo, 22, "logo_k_small.a8")
     write_icons(args.assets)
+    write_cursors(args.cursors)
     for name, rel, size in FONTS:
         write_font(args.assets / rel, size, name)
     print("assets written to", ASSETS_OUT)

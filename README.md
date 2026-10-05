@@ -47,6 +47,11 @@ Start, Terminal, Files, Monitor, DOOM and About; the "K" in the top-left
 corner has About, the system monitor, Restart and Shut Down. Typing goes
 to the shell (or to DOOM, while its window is in front).
 
+The desktop has icons for every app (including Sketch, a small drawing
+app) and for the files on the disk. Drag icons around, drop an app on
+the taskbar to pin it, and right-click almost anything for a menu.
+Windows resize from any edge or corner.
+
 Things to try in the Terminal:
 
 ```

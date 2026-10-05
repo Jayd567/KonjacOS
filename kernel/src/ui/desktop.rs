@@ -6,11 +6,18 @@
 //! - A fully transparent **top bar**: the "K" system menu, the active
 //!   app's name, and Window/Help menus. Its dropdowns are separate panes
 //!   of glass floating over whatever is underneath.
+//! - **Desktop icons** on the wallpaper (see `icons.rs`): every app plus
+//!   the root of the disk. Drag them around, rubber-band select them, drop
+//!   an app on the taskbar to pin it.
 //! - A floating glass **taskbar** at the bottom: Start plus the pinned
-//!   apps centred (regular icons, filled when hovered or active, a pill
-//!   under running ones), the tray (CPU, memory, clock) on the right.
-//! - Glass **windows** in between. Maximizing fills exactly the work area
-//!   between the two bars, never sliding under the taskbar.
+//!   and running apps centred (regular icons, filled when hovered or
+//!   active, a pill under running ones), the tray (CPU, memory, clock) on
+//!   the right.
+//! - Glass **windows** in between, resizable from any edge or corner.
+//!   Maximizing fills exactly the work area between the two bars, never
+//!   sliding under the taskbar.
+//! - **Right-click menus** almost everywhere: the desktop, icons, the
+//!   taskbar, title bars, and whatever apps offer for their own content.
 //!
 //! ## Rendering
 //!
@@ -26,7 +33,9 @@
 //!
 //! Windows are hit-tested front to back with the same squircle SDF they're
 //! drawn with, so clicking just outside a rounded corner reaches whatever
-//! is behind it.
+//! is behind it. The pointer's shape follows what's under it (see
+//! [`Desktop::pick_cursor`]): resize arrows on window edges, an I-beam
+//! over text, a pen over Sketch's paper, and so on.
 
 extern crate alloc;
 
@@ -35,16 +44,18 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use super::apps::{Action, App, AppKind, MouseEvent, Reply, ACCENT, TEXT, TEXT_DIM};
+use super::apps::{open_command, Action, App, AppKind, ContextItem, MouseEvent, Reply, ACCENT, TEXT, TEXT_DIM};
 use super::assets;
 use super::font;
 use super::glass::{self, Glass, GlassStyle, Scratch};
 use super::icon_ids as icon;
+use super::icons::{self, Icon, Target};
 use super::math::{smoothstep, Spring};
 use super::surface::{blend, rgb, Painter, Rect, Surface};
 use super::sysmon;
+use crate::cursor::{self, Shape as Cursor};
 use crate::framebuffer::Canvas;
-use crate::{cursor, doom_driver, keyboard, mouse, task, timer};
+use crate::{doom_driver, keyboard, mouse, task, timer};
 
 const TOPBAR_H: i32 = 30;
 const TASKBAR_H: i32 = 60;
@@ -52,15 +63,20 @@ const TASKBAR_MARGIN: i32 = 8;
 const TITLE_H: i32 = 40;
 const CELL: i32 = 52;
 const CELL_GAP: i32 = 4;
-const ITEMS: usize = 1 + AppKind::PINNED.len();
+/// Most taskbar slots there can be (Start + every app).
+const MAX_ITEMS: usize = 1 + AppKind::ALL.len();
 
 /// Damage z-levels, bottom to top (windows take `L_WIN + z index`).
+const L_DESK: u16 = 1;
 const L_WIN: u16 = 10;
 const L_TOPBAR: u16 = 150;
 const L_TASKBAR: u16 = 200;
 const L_START: u16 = 300;
 const L_MENU: u16 = 310;
 const L_TOOLTIP: u16 = 400;
+/// Things drawn over everything but the pointer: dragged icons and the
+/// rubber band.
+const L_DRAG: u16 = 900;
 const L_CURSOR: u16 = 1000;
 /// Damage that must be recomposed but changed nothing visible (the extra
 /// backdrop a recomputing panel samples), so it invalidates nothing.
@@ -70,6 +86,21 @@ const L_RENDER_ONLY: u16 = u16::MAX;
 const DOUBLE_CLICK_TICKS: u64 = 40;
 /// Hover time before a taskbar tooltip appears.
 const TOOLTIP_DELAY: u64 = 45;
+/// How long the "app starting" pointer shows after launching something.
+const LAUNCH_TICKS: u64 = 60;
+/// How far the pointer must move with the button down before a press on
+/// an icon becomes a drag.
+const DRAG_THRESHOLD: i32 = 4;
+
+/// Resize grips: how far outside and inside a window's edge they reach,
+/// and how far along an edge a corner grip extends.
+const GRIP_OUT: i32 = 6;
+const GRIP_IN: i32 = 5;
+const GRIP_CORNER: i32 = 22;
+const EDGE_L: u8 = 1;
+const EDGE_R: u8 = 2;
+const EDGE_T: u8 = 4;
+const EDGE_B: u8 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Btn {
@@ -116,6 +147,10 @@ impl Window {
     fn btn_at(&self, lx: i32, ly: i32) -> Option<Btn> {
         [Btn::Min, Btn::Max, Btn::Close].into_iter().find(|&b| self.btn_rect(b).contains(lx, ly))
     }
+
+    fn resizable(&self) -> bool {
+        self.restore.is_none() && self.app.resizable()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,20 +159,32 @@ enum MenuId {
     Window,
     Help,
     Power,
+    Context,
 }
 
 #[derive(Clone, Copy)]
 enum Cmd {
     Open(AppKind),
     Shell(&'static str),
+    /// These act on the menu's target app's window, else the active one.
     Minimize,
-    Maximize,
+    ToggleMaximize,
     Close,
+    Pin(AppKind),
+    Unpin(AppKind),
+    /// One of the target app's own context-menu entries.
+    App(u32),
+    OpenIcon(usize),
+    ShowInFiles(usize),
+    ArrangeIcons,
+    RefreshIcons,
+    ShowDesktop,
 }
 
 struct MenuItem {
     /// Empty label = separator.
     label: &'static str,
+    /// `None` on a labelled item = greyed out.
     cmd: Option<Cmd>,
 }
 
@@ -145,6 +192,14 @@ const SEPARATOR: MenuItem = MenuItem { label: "", cmd: None };
 const MENU_ITEM_H: i32 = 30;
 const MENU_SEP_H: i32 = 11;
 const MENU_PAD: i32 = 6;
+
+fn item(label: &'static str, cmd: Cmd) -> MenuItem {
+    MenuItem { label, cmd: Some(cmd) }
+}
+
+fn item_if(label: &'static str, cmd: Cmd, enabled: bool) -> MenuItem {
+    MenuItem { label, cmd: enabled.then_some(cmd) }
+}
 
 struct Menu {
     id: MenuId,
@@ -156,6 +211,8 @@ struct Menu {
     hover: Option<usize>,
     spring: Spring,
     glass: Glass,
+    /// The app whose window the window commands act on.
+    target: Option<AppKind>,
 }
 
 impl Menu {
@@ -166,7 +223,8 @@ impl Menu {
         Rect::new(self.rect.x, y, w, h)
     }
 
-    fn item_at(&self, x: i32, y: i32) -> Option<usize> {
+    /// The labelled row under `(x, y)`, enabled or not.
+    fn row_at(&self, x: i32, y: i32) -> Option<usize> {
         if !self.rect.contains(x, y) {
             return None;
         }
@@ -174,29 +232,44 @@ impl Menu {
         for (i, item) in self.items.iter().enumerate() {
             let h = if item.label.is_empty() { MENU_SEP_H } else { MENU_ITEM_H };
             if y >= top && y < top + h {
-                return item.cmd.is_some().then_some(i);
+                return (!item.label.is_empty()).then_some(i);
             }
             top += h;
         }
         None
     }
+
+    /// The enabled item under `(x, y)`.
+    fn item_at(&self, x: i32, y: i32) -> Option<usize> {
+        self.row_at(x, y).filter(|&i| self.items[i].cmd.is_some())
+    }
+}
+
+fn menu_size(items: &[MenuItem]) -> (i32, i32) {
+    let width = items.iter().map(|it| font::UI.width(it.label)).max().unwrap_or(0) + 56;
+    let height = 2 * MENU_PAD + items.iter().map(|it| if it.label.is_empty() { MENU_SEP_H } else { MENU_ITEM_H }).sum::<i32>();
+    (width, height)
 }
 
 struct StartMenu {
     open: bool,
     spring: Spring,
     glass: Glass,
-    /// 0..5 = app tiles, 5 = power button.
+    /// One of the `START_*` hit codes, or a tile index.
     hover: Option<usize>,
 }
 
-const START_W: i32 = 436;
+const START_W: i32 = 540;
 const START_H: i32 = 236;
 const TILE_W: i32 = 76;
 const TILE_H: i32 = 80;
+const TILE_GAP: i32 = 6;
+/// Start menu hit codes after the app tiles (`0..AppKind::ALL.len()`).
+const START_POWER: usize = 100;
+const START_USER: usize = 101;
 
 struct Tooltip {
-    text: &'static str,
+    text: String,
     rect: Rect,
     alpha: f32,
     glass: Glass,
@@ -211,6 +284,25 @@ enum Layer {
     Tooltip,
 }
 
+/// What the held left button is doing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grab {
+    None,
+    /// Moving window `win` by its title bar, `(ox, oy)` from its corner.
+    Move { win: usize, ox: i32, oy: i32 },
+    /// Resizing window `win` by `edges`, from `start` with the pointer
+    /// at `(mx, my)`.
+    Resize { win: usize, edges: u8, start: Rect, mx: i32, my: i32 },
+    /// Pressed inside an app's client area: it gets `Drag`s and an `Up`.
+    Client { kind: AppKind },
+    /// Pressed on an icon; becomes `IconDrag` once the pointer moves.
+    IconPress { x: i32, y: i32 },
+    /// Dragging the selected icons, which started at `(x, y)`.
+    IconDrag { x: i32, y: i32 },
+    /// Rubber-band selection from `(x, y)`.
+    Band { x: i32, y: i32 },
+}
+
 pub struct Desktop {
     canvas: Canvas,
     bb: Surface,
@@ -221,24 +313,36 @@ pub struct Desktop {
     start: StartMenu,
     menu: Option<Menu>,
     tooltip: Option<Tooltip>,
+    pinned: Vec<AppKind>,
     hover_item: Option<usize>,
+    /// What a tooltip would be about: the hovered taskbar item or tray
+    /// entry, and since when.
+    tip: Option<(Rect, String)>,
     hover_since: u64,
     /// Set by a click on a taskbar item: no tooltip again until the
     /// pointer leaves it.
     tooltip_suppressed: bool,
-    hover_alpha: [f32; ITEMS],
+    hover_alpha: [f32; MAX_ITEMS],
+    tray_hover: Option<usize>,
     topbar_hover: Option<MenuId>,
+    icons: Vec<Icon>,
+    icon_hover: Option<usize>,
     damage: Vec<(Rect, u16)>,
     mx: i32,
     my: i32,
     buttons: u8,
-    drag: Option<(usize, i32, i32)>,
+    grab: Grab,
     last_click: (u64, i32, i32),
+    cursor: Cursor,
+    cursor_frame: u16,
+    launching_until: u64,
     sys_seq: u64,
     clock: String,
     date: String,
+    long_date: String,
     cpu: String,
     ram: String,
+    ram_detail: String,
     now: u64,
 }
 
@@ -246,7 +350,7 @@ impl Desktop {
     fn new(canvas: Canvas) -> Self {
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
         let (mx, my) = mouse::position();
-        Desktop {
+        let mut d = Desktop {
             canvas,
             bb: Surface::new(w, h),
             wall: assets::wallpaper(w, h),
@@ -256,24 +360,37 @@ impl Desktop {
             start: StartMenu { open: false, spring: Spring::new(0.0), glass: Glass::default(), hover: None },
             menu: None,
             tooltip: None,
+            pinned: AppKind::PINNED.to_vec(),
             hover_item: None,
+            tip: None,
             hover_since: 0,
             tooltip_suppressed: false,
-            hover_alpha: [0.0; ITEMS],
+            hover_alpha: [0.0; MAX_ITEMS],
+            tray_hover: None,
             topbar_hover: None,
+            icons: icons::load(),
+            icon_hover: None,
             damage: Vec::new(),
             mx,
             my,
             buttons: 0,
-            drag: None,
+            grab: Grab::None,
             last_click: (0, 0, 0),
+            cursor: Cursor::Arrow,
+            cursor_frame: 0,
+            launching_until: 0,
             sys_seq: u64::MAX,
             clock: String::new(),
             date: String::new(),
+            long_date: String::new(),
             cpu: String::new(),
             ram: String::new(),
+            ram_detail: String::new(),
             now: timer::ticks(),
-        }
+        };
+        let wa = d.work_area();
+        icons::arrange(&mut d.icons, wa);
+        d
     }
 
     // --- Geometry -------------------------------------------------------
@@ -294,20 +411,55 @@ impl Desktop {
         Rect::new(TASKBAR_MARGIN, TOPBAR_H + 4, s.w - 2 * TASKBAR_MARGIN, tb.y - 8 - (TOPBAR_H + 4))
     }
 
+    /// The apps on the taskbar after Start: the pinned ones, then any
+    /// others that are running.
+    fn task_apps(&self) -> Vec<AppKind> {
+        let mut apps = self.pinned.clone();
+        for w in &self.windows {
+            if !apps.contains(&w.kind) {
+                apps.push(w.kind);
+            }
+        }
+        apps
+    }
+
+    fn item_count(&self) -> usize {
+        (1 + self.task_apps().len()).min(MAX_ITEMS)
+    }
+
     fn item_rect(&self, i: usize) -> Rect {
         let tb = self.taskbar_rect();
-        let total = ITEMS as i32 * CELL + (ITEMS as i32 - 1) * CELL_GAP;
+        let n = self.item_count() as i32;
+        let total = n * CELL + (n - 1) * CELL_GAP;
         let x0 = self.screen().w / 2 - total / 2;
         Rect::new(x0 + i as i32 * (CELL + CELL_GAP), tb.y + (TASKBAR_H - CELL) / 2, CELL, CELL)
     }
 
     fn item_at(&self, x: i32, y: i32) -> Option<usize> {
-        (0..ITEMS).find(|&i| self.item_rect(i).contains(x, y))
+        (0..self.item_count()).find(|&i| self.item_rect(i).contains(x, y))
     }
 
     fn tray_rect(&self) -> Rect {
         let tb = self.taskbar_rect();
         Rect::new(tb.right() - 300, tb.y, 300, tb.h)
+    }
+
+    /// The tray's hover zones: memory, CPU, clock. Mirrors `paint_tray`.
+    fn tray_zones(&self) -> [Rect; 3] {
+        let tb = self.taskbar_rect();
+        let right = tb.right() - 20;
+        let cw = font::UI.width(&self.clock).max(font::SMALL.width(&self.date));
+        let clock = Rect::new(right - cw - 10, tb.y + 8, cw + 20, tb.h - 16);
+        let mut zones = [Rect::default(), Rect::default(), clock];
+        let mut x = right - cw - 26;
+        for (z, text) in [&self.ram, &self.cpu].into_iter().enumerate() {
+            let tw = font::UI.width(text);
+            let end = x;
+            x -= tw + 20 + 6;
+            zones[z] = Rect::new(x - 8, tb.y + 10, end - x + 16, tb.h - 20);
+            x -= 18;
+        }
+        zones
     }
 
     fn start_rect(&self) -> Rect {
@@ -327,21 +479,29 @@ impl Desktop {
     }
 
     fn tile_rect(i: usize) -> Rect {
-        let x0 = (START_W - 5 * TILE_W - 4 * 6) / 2;
-        Rect::new(x0 + i as i32 * (TILE_W + 6), 48, TILE_W, TILE_H)
+        let n = AppKind::ALL.len() as i32;
+        let x0 = (START_W - n * TILE_W - (n - 1) * TILE_GAP) / 2;
+        Rect::new(x0 + i as i32 * (TILE_W + TILE_GAP), 48, TILE_W, TILE_H)
     }
 
     fn power_rect() -> Rect {
         Rect::new(START_W - 58, START_H - 50, 42, 38)
     }
 
+    fn user_rect() -> Rect {
+        Rect::new(14, START_H - 52, 220, 42)
+    }
+
     fn start_hit(&self, x: i32, y: i32) -> Option<usize> {
         let r = self.start_rect();
         let (lx, ly) = (x - r.x, y - r.y);
         if Self::power_rect().contains(lx, ly) {
-            return Some(5);
+            return Some(START_POWER);
         }
-        (0..5).find(|&i| Self::tile_rect(i).contains(lx, ly))
+        if Self::user_rect().contains(lx, ly) {
+            return Some(START_USER);
+        }
+        (0..AppKind::ALL.len()).find(|&i| Self::tile_rect(i).contains(lx, ly))
     }
 
     fn active(&self) -> Option<usize> {
@@ -350,6 +510,10 @@ impl Desktop {
 
     fn active_kind(&self) -> Option<AppKind> {
         self.active().map(|i| self.windows[i].kind)
+    }
+
+    fn window_of(&self, kind: AppKind) -> Option<usize> {
+        self.windows.iter().position(|w| w.kind == kind)
     }
 
     fn topbar_items(&self) -> [(MenuId, Rect); 3] {
@@ -376,6 +540,76 @@ impl Desktop {
         })
     }
 
+    /// The resize grip under `(x, y)`: which window, and which of its
+    /// edges (`EDGE_*` bits; two for a corner). A window in front blocks
+    /// the grips of those behind it.
+    fn edge_at(&self, x: i32, y: i32) -> Option<(usize, u8)> {
+        for i in (0..self.windows.len()).rev() {
+            let w = &self.windows[i];
+            if w.minimized {
+                continue;
+            }
+            let d = w.drawn();
+            if w.resizable() && d.expand(GRIP_OUT).contains(x, y) {
+                let mut e = 0;
+                if x < d.x + GRIP_IN {
+                    e |= EDGE_L;
+                } else if x >= d.right() - GRIP_IN {
+                    e |= EDGE_R;
+                }
+                if y < d.y + GRIP_IN {
+                    e |= EDGE_T;
+                } else if y >= d.bottom() - GRIP_IN {
+                    e |= EDGE_B;
+                }
+                if e & (EDGE_L | EDGE_R) != 0 && e & (EDGE_T | EDGE_B) == 0 {
+                    if y < d.y + GRIP_CORNER {
+                        e |= EDGE_T;
+                    } else if y >= d.bottom() - GRIP_CORNER {
+                        e |= EDGE_B;
+                    }
+                } else if e & (EDGE_T | EDGE_B) != 0 && e & (EDGE_L | EDGE_R) == 0 {
+                    if x < d.x + GRIP_CORNER {
+                        e |= EDGE_L;
+                    } else if x >= d.right() - GRIP_CORNER {
+                        e |= EDGE_R;
+                    }
+                }
+                if e != 0 {
+                    return Some((i, e));
+                }
+            }
+            if d.contains(x, y) && w.glass.shape.hit(x - d.x, y - d.y) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn icon_area(&self) -> Rect {
+        self.work_area()
+    }
+
+    fn icon_cell(&self, i: usize) -> Rect {
+        let ic = &self.icons[i];
+        icons::cell_rect(self.icon_area(), ic.col, ic.row)
+    }
+
+    /// The icon under `(x, y)`, if the desktop itself is what's there.
+    fn icon_at(&self, x: i32, y: i32) -> Option<usize> {
+        (0..self.icons.len()).find(|&i| icons::hit_rect(self.icon_cell(i)).contains(x, y))
+    }
+
+    /// Whether `(x, y)` is bare desktop: no bar, window, menu or Start.
+    fn on_desktop(&self, x: i32, y: i32) -> bool {
+        y >= TOPBAR_H
+            && !self.taskbar_rect().contains(x, y)
+            && self.window_at(x, y).is_none()
+            && self.edge_at(x, y).is_none()
+            && !self.menu.as_ref().is_some_and(|m| m.rect.contains(x, y))
+            && !(self.start.open && self.start_rect().contains(x, y))
+    }
+
     // --- Damage -----------------------------------------------------------
 
     fn damage(&mut self, r: Rect, level: u16) {
@@ -395,8 +629,38 @@ impl Desktop {
     }
 
     fn damage_cursor(&mut self) {
-        let r = Rect::new(self.mx - cursor::HOTSPOT_X, self.my - cursor::HOTSPOT_Y, cursor::WIDTH as i32, cursor::HEIGHT as i32);
+        let img = cursor::image(self.cursor);
+        let r = Rect::new(self.mx - img.hot_x, self.my - img.hot_y, img.w, img.h);
         self.damage(r, L_CURSOR);
+    }
+
+    fn damage_taskbar(&mut self) {
+        let r = self.taskbar_rect();
+        self.damage(r, L_TASKBAR);
+    }
+
+    fn damage_icon(&mut self, i: usize) {
+        let r = self.icon_cell(i);
+        self.damage(r, L_DESK);
+    }
+
+    /// Where the dragged icons are drawn right now, all together.
+    fn drag_bounds(&self) -> Rect {
+        let Grab::IconDrag { x, y } = self.grab else { return Rect::default() };
+        let (dx, dy) = (self.mx - x, self.my - y);
+        let mut r = Rect::default();
+        for i in 0..self.icons.len() {
+            if self.icons[i].selected {
+                let c = self.icon_cell(i).offset(dx, dy);
+                r = if r.is_empty() { c } else { r.union(&c) };
+            }
+        }
+        r
+    }
+
+    fn band_rect(&self) -> Rect {
+        let Grab::Band { x, y } = self.grab else { return Rect::default() };
+        Rect::new(x.min(self.mx), y.min(self.my), (x - self.mx).abs() + 1, (y - self.my).abs() + 1)
     }
 
     fn glass_layers(&self) -> Vec<(Layer, u16, Rect, &'static GlassStyle)> {
@@ -481,14 +745,23 @@ impl Desktop {
         let topbar = self.topbar_items();
         let active_name = self.active_kind().map_or("KonjacOS", |k| k.name());
         let tb = self.taskbar_rect();
-        let items: Vec<Rect> = (0..ITEMS).map(|i| self.item_rect(i)).collect();
-        let running: Vec<bool> = AppKind::PINNED.iter().map(|k| self.windows.iter().any(|w| w.kind == *k)).collect();
+        let apps = self.task_apps();
+        let items: Vec<Rect> = (0..self.item_count()).map(|i| self.item_rect(i)).collect();
         let active_kind = self.active_kind();
         let start_drawn = self.start_drawn();
         let start_open = self.start_visible();
+        let icon_area = self.icon_area();
+        let drag = match self.grab {
+            Grab::IconDrag { x, y } => Some((self.mx - x, self.my - y)),
+            _ => None,
+        };
+        let band = self.band_rect();
+        let tray_hover = self.tray_hover.map(|z| self.tray_zones()[z]);
+        let cursor_img = cursor::image(self.cursor);
 
-        // Occlusion: if a window's opaque content (DOOM's frame) covers
-        // this whole region, nothing beneath it can show -- start there.
+        // Occlusion: if a window's opaque content (DOOM's frame, Sketch's
+        // paper) covers this whole region, nothing beneath it can show --
+        // start there.
         let first = self.windows.iter().enumerate().rev().find_map(|(i, w)| {
             if w.minimized || w.opacity() < 255 {
                 return None;
@@ -499,11 +772,19 @@ impl Desktop {
             (r.intersect(&clip) == clip).then_some(i)
         });
 
-        let Desktop { bb, wall, scratch, windows, taskbar, start, menu, tooltip, hover_alpha, topbar_hover, mx, my, clock, date, cpu, ram, .. } = self;
+        let Desktop { bb, wall, scratch, windows, taskbar, start, menu, tooltip, hover_alpha, topbar_hover, icons: desk_icons, icon_hover, mx, my, clock, date, cpu, ram, cursor_frame, .. } = self;
         let (sw, sh) = (bb.w, bb.h);
 
         if first.is_none() {
             bb.painter(clip).blit(0, 0, sw, sh, wall, sw);
+            let mut p = bb.painter(clip);
+            for (i, ic) in desk_icons.iter().enumerate() {
+                let cell = icons::cell_rect(icon_area, ic.col, ic.row);
+                if cell.intersects(&clip) {
+                    let alpha = if drag.is_some() && ic.selected { 90 } else { 255 };
+                    icons::paint(&mut p, cell, ic, *icon_hover == Some(i), alpha);
+                }
+            }
         }
 
         for (i, w) in windows.iter_mut().enumerate() {
@@ -534,7 +815,7 @@ impl Desktop {
             w.app.paint(&mut cp, cw, ch);
         }
 
-        paint_topbar(&mut bb.painter(clip), &topbar, active_name, *topbar_hover, menu.as_ref().map(|m| m.id));
+        paint_topbar(&mut bb.painter(clip), &topbar, active_name, *topbar_hover, menu.as_ref().filter(|m| m.id != MenuId::Context).map(|m| m.id));
 
         taskbar.render(bb, tb, &glass::TASKBAR, clip, 255, scratch);
         {
@@ -549,16 +830,19 @@ impl Desktop {
                     p.draw_mask(r.x + (r.w - lw) / 2, r.y + (r.h - lh) / 2, lw, lh, m, TEXT, 255);
                     continue;
                 }
-                let kind = AppKind::PINNED[i - 1];
+                let kind = apps[i - 1];
                 let is_active = active_kind == Some(kind);
                 let (regular, filled) = kind.taskbar_icons();
                 let id = if is_active || h > 0.5 { filled } else { regular };
                 let (iw, ih, m) = assets::icon(id);
                 p.draw_mask(r.x + (r.w - iw) / 2, r.y + (r.h - ih) / 2 - 2, iw, ih, m, TEXT, 255);
-                if running[i - 1] {
+                if windows.iter().any(|w| w.kind == kind) {
                     let pw = if is_active { 18 } else { 6 };
                     p.fill_squircle(Rect::new(r.x + (r.w - pw) / 2, r.bottom() - 5, pw, 3), 1.5, TEXT, if is_active { 235 } else { 150 });
                 }
+            }
+            if let Some(z) = tray_hover {
+                p.fill_squircle(z, 10.0, TEXT, 26);
             }
             paint_tray(&mut p, tb, clock, date, cpu, ram);
         }
@@ -590,17 +874,39 @@ impl Desktop {
             t.glass.render(bb, t.rect, &glass::TOOLTIP, clip, op, scratch);
             let mut p = bb.painter(clip);
             p.alpha = op;
-            let tx = t.rect.x + (t.rect.w - font::UI.width(t.text)) / 2;
-            p.text_shadowed(&font::UI, tx, t.rect.y + 7, t.text, TEXT, 255);
+            let tx = t.rect.x + (t.rect.w - font::UI.width(&t.text)) / 2;
+            p.text_shadowed(&font::UI, tx, t.rect.y + 7, &t.text, TEXT, 255);
         }
 
-        paint_cursor(bb, clip, *mx, *my);
+        if let Some((dx, dy)) = drag {
+            let mut p = bb.painter(clip);
+            for ic in desk_icons.iter().filter(|ic| ic.selected) {
+                let cell = icons::cell_rect(icon_area, ic.col, ic.row).offset(dx, dy);
+                if cell.intersects(&clip) {
+                    icons::paint(&mut p, cell, ic, false, 210);
+                }
+            }
+        }
+        if !band.is_empty() {
+            let mut p = bb.painter(clip);
+            p.fill_rect(band, ACCENT, 40);
+            for edge in [
+                Rect::new(band.x, band.y, band.w, 1),
+                Rect::new(band.x, band.bottom() - 1, band.w, 1),
+                Rect::new(band.x, band.y, 1, band.h),
+                Rect::new(band.right() - 1, band.y, 1, band.h),
+            ] {
+                p.fill_rect(edge, ACCENT, 200);
+            }
+        }
+
+        paint_cursor(bb, clip, *mx, *my, &cursor_img, *cursor_frame);
     }
 
     // --- Windows ----------------------------------------------------------
 
     fn open_app(&mut self, kind: AppKind) {
-        if let Some(i) = self.windows.iter().position(|w| w.kind == kind) {
+        if let Some(i) = self.window_of(kind) {
             if self.windows[i].minimized {
                 self.windows[i].minimized = false;
             }
@@ -619,6 +925,7 @@ impl Desktop {
         open.target = 1.0;
         self.windows.push(Window { kind, app, rect: Rect::new(x, y, w, h), restore: None, minimized: false, glass: Glass::default(), open, btn_hover: None });
         let i = self.windows.len() - 1;
+        self.launching_until = self.now + LAUNCH_TICKS;
         self.damage_window(i);
         self.focus_changed();
     }
@@ -644,20 +951,26 @@ impl Desktop {
         keyboard::set_doom_focus(self.active_kind() == Some(AppKind::Doom));
         let s = self.screen();
         self.damage(Rect::new(0, 0, s.w, TOPBAR_H), L_TOPBAR);
-        for i in 0..ITEMS {
-            let r = self.item_rect(i);
-            self.damage(r, L_TASKBAR);
+        // The set of taskbar items may have changed, shifting them all.
+        self.damage_taskbar();
+    }
+
+    /// Bookkeeping after window `i` left `windows`: a grab on it ends, a
+    /// grab on a window above it follows the index shift.
+    fn window_removed(&mut self, i: usize) {
+        match &mut self.grab {
+            Grab::Move { win, .. } | Grab::Resize { win, .. } if *win == i => self.grab = Grab::None,
+            Grab::Move { win, .. } | Grab::Resize { win, .. } if *win > i => *win -= 1,
+            _ => {}
         }
+        self.focus_changed();
     }
 
     fn close_window(&mut self, i: usize) {
         self.damage_window(i);
         let mut w = self.windows.remove(i);
         w.app.closed();
-        if self.drag.is_some_and(|(d, ..)| d == i) {
-            self.drag = None;
-        }
-        self.focus_changed();
+        self.window_removed(i);
     }
 
     fn minimize(&mut self, i: usize) {
@@ -696,9 +1009,45 @@ impl Desktop {
         self.windows[i].rect.y = y;
     }
 
+    /// Resizes window `i` from `start` by dragging `edges` by `(dx, dy)`,
+    /// keeping it at least the app's minimum size and inside the screen
+    /// (and below the top bar, above the taskbar).
+    fn resize_window(&mut self, i: usize, edges: u8, start: Rect, dx: i32, dy: i32) {
+        let wa = self.work_area();
+        let s = self.screen();
+        let (mw, mh) = self.windows[i].app.min_size();
+        let (min_w, min_h) = (mw.max(300), mh + TITLE_H);
+        let mut r = start;
+        if edges & EDGE_L != 0 {
+            let x = (start.x + dx).min(start.right() - min_w).max(0);
+            r.x = x;
+            r.w = start.right() - x;
+        }
+        if edges & EDGE_R != 0 {
+            r.w = (start.w + dx).max(min_w).min(s.w - r.x);
+        }
+        if edges & EDGE_T != 0 {
+            let y = (start.y + dy).min(start.bottom() - min_h).max(wa.y);
+            r.y = y;
+            r.h = start.bottom() - y;
+        }
+        if edges & EDGE_B != 0 {
+            r.h = (start.h + dy).max(min_h).min(wa.bottom() - r.y);
+        }
+        if r == self.windows[i].rect {
+            return;
+        }
+        self.damage_window(i);
+        let w = &mut self.windows[i];
+        w.rect = r;
+        let (cw, ch) = w.client_size();
+        w.app.resized(cw, ch);
+        self.damage_window(i);
+    }
+
     /// Taskbar click: launch, restore, focus or minimize.
     fn taskbar_click(&mut self, kind: AppKind) {
-        if kind == AppKind::Doom && !self.windows.iter().any(|w| w.kind == kind) {
+        if kind == AppKind::Doom && self.window_of(kind).is_none() {
             match crate::commands::launch_doom() {
                 Ok(_) => self.open_app(kind),
                 Err(e) => {
@@ -708,7 +1057,7 @@ impl Desktop {
             }
             return;
         }
-        match self.windows.iter().position(|w| w.kind == kind) {
+        match self.window_of(kind) {
             Some(i) if self.windows[i].minimized => {
                 self.windows[i].minimized = false;
                 self.focus(i);
@@ -721,37 +1070,215 @@ impl Desktop {
         }
     }
 
+    /// Start menu tiles, desktop icons and menus launch (or bring
+    /// forward) an app, never minimize it.
+    fn launch(&mut self, kind: AppKind) {
+        if kind == AppKind::Doom {
+            match self.window_of(kind) {
+                Some(i) => {
+                    self.windows[i].minimized = false;
+                    self.focus(i);
+                }
+                None => self.taskbar_click(kind),
+            }
+        } else {
+            self.open_app(kind);
+        }
+    }
+
     fn shell_command(&mut self, cmd: &str) {
         keyboard::inject(cmd);
         self.open_app(AppKind::Terminal);
     }
 
+    /// Brings Files forward showing folder `dir`, with `select` picked.
+    fn open_files_at(&mut self, dir: &str, select: Option<&str>) {
+        self.open_app(AppKind::Files);
+        if let Some(i) = self.window_of(AppKind::Files) {
+            self.windows[i].app.navigate(dir, select);
+            self.damage_client(i);
+        }
+    }
+
     fn apply_reply(&mut self, i: usize, reply: Reply) {
         if reply.repaint {
             self.damage_client(i);
+        } else if let Some(r) = reply.damage {
+            let d = self.windows[i].drawn();
+            let client = Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H);
+            self.damage(r.offset(client.x, client.y).intersect(&client), L_WIN + i as u16);
         }
         if let Some(Action::Shell(cmd)) = reply.action {
             self.shell_command(&cmd);
         }
     }
 
-    fn run_cmd(&mut self, cmd: Cmd) {
+    fn set_pinned(&mut self, kind: AppKind, pinned: bool) {
+        if pinned && !self.pinned.contains(&kind) {
+            self.pinned.push(kind);
+        } else if !pinned {
+            self.pinned.retain(|&k| k != kind);
+        }
+        self.hide_tooltip();
+        self.damage_taskbar();
+    }
+
+    // --- Desktop icons ------------------------------------------------------
+
+    fn open_icon(&mut self, i: usize) {
+        match self.icons[i].target.clone() {
+            Target::App(kind) => self.launch(kind),
+            Target::Dir(path) => self.open_files_at(&path, None),
+            Target::File(path) => {
+                if path.to_ascii_lowercase().ends_with(".wad") {
+                    self.launch(AppKind::Doom);
+                } else if let Some(cmd) = open_command(&path) {
+                    self.shell_command(&cmd);
+                }
+            }
+        }
+    }
+
+    fn show_icon_in_files(&mut self, i: usize) {
+        if let Target::File(path) | Target::Dir(path) = self.icons[i].target.clone() {
+            let cut = path.rfind('/').unwrap_or(0);
+            let dir = if cut == 0 { "/" } else { &path[..cut] };
+            self.open_files_at(dir, Some(&path[cut + 1..]));
+        }
+    }
+
+    fn select_icons(&mut self, pick: impl Fn(usize, &Icon) -> bool) {
+        for i in 0..self.icons.len() {
+            let sel = pick(i, &self.icons[i]);
+            if sel != self.icons[i].selected {
+                self.icons[i].selected = sel;
+                self.damage_icon(i);
+            }
+        }
+    }
+
+    /// Lays the icons out from scratch, in order.
+    fn arrange_icons(&mut self) {
+        for i in 0..self.icons.len() {
+            self.damage_icon(i);
+        }
+        let area = self.icon_area();
+        icons::arrange(&mut self.icons, area);
+        for i in 0..self.icons.len() {
+            self.damage_icon(i);
+        }
+    }
+
+    /// Re-reads the disk's root folder; icons that are still there keep
+    /// their place, new ones go in the first free cells.
+    fn refresh_icons(&mut self) {
+        for i in 0..self.icons.len() {
+            self.damage_icon(i);
+        }
+        let area = self.icon_area();
+        let mut fresh = icons::load();
+        let mut taken = Vec::new();
+        let mut placed = alloc::vec![false; fresh.len()];
+        for (n, ic) in fresh.iter_mut().enumerate() {
+            if let Some(old) = self.icons.iter().find(|o| o.target == ic.target) {
+                ic.col = old.col;
+                ic.row = old.row;
+                taken.push((ic.col, ic.row));
+                placed[n] = true;
+            }
+        }
+        for (n, ic) in fresh.iter_mut().enumerate() {
+            if !placed[n] {
+                let (c, r) = icons::nearest_free(area, 0, 0, &taken);
+                ic.col = c;
+                ic.row = r;
+                taken.push((c, r));
+            }
+        }
+        self.icons = fresh;
+        self.icon_hover = None;
+        for i in 0..self.icons.len() {
+            self.damage_icon(i);
+        }
+    }
+
+    /// Where a drop of the selected icons, dragged by `(dx, dy)`, would
+    /// pin something: any selected app that isn't on the taskbar yet.
+    fn droppable_apps(&self) -> Vec<AppKind> {
+        self.icons.iter().filter(|ic| ic.selected).filter_map(|ic| ic.app()).filter(|k| !self.pinned.contains(k)).collect()
+    }
+
+    fn drop_icons(&mut self, dx: i32, dy: i32) {
+        let (x, y) = (self.mx, self.my);
+        if self.taskbar_rect().contains(x, y) {
+            for kind in self.droppable_apps() {
+                self.set_pinned(kind, true);
+            }
+            return;
+        }
+        if !self.on_desktop(x, y) {
+            return;
+        }
+        let area = self.icon_area();
+        let mut taken: Vec<(i32, i32)> = self.icons.iter().filter(|ic| !ic.selected).map(|ic| (ic.col, ic.row)).collect();
+        for i in 0..self.icons.len() {
+            if !self.icons[i].selected {
+                continue;
+            }
+            self.damage_icon(i);
+            let c = self.icon_cell(i).offset(dx, dy);
+            let (col, row) = icons::cell_at(area, c.x + c.w / 2, c.y + c.h / 2);
+            let (col, row) = if taken.contains(&(col, row)) { icons::nearest_free(area, col, row, &taken) } else { (col, row) };
+            self.icons[i].col = col;
+            self.icons[i].row = row;
+            taken.push((col, row));
+            self.damage_icon(i);
+        }
+    }
+
+    // --- Commands -----------------------------------------------------------
+
+    fn run_cmd(&mut self, cmd: Cmd, target: Option<AppKind>) {
+        // A menu about a particular app acts on that app's window only.
+        let win = match target {
+            Some(k) => self.window_of(k),
+            None => self.active(),
+        };
         match cmd {
-            Cmd::Open(kind) => self.open_app(kind),
+            Cmd::Open(kind) => self.launch(kind),
             Cmd::Shell(s) => self.shell_command(s),
             Cmd::Minimize => {
-                if let Some(i) = self.active() {
+                if let Some(i) = win {
                     self.minimize(i);
                 }
             }
-            Cmd::Maximize => {
-                if let Some(i) = self.active() {
+            Cmd::ToggleMaximize => {
+                if let Some(i) = win {
                     self.toggle_maximize(i);
                 }
             }
             Cmd::Close => {
-                if let Some(i) = self.active() {
+                if let Some(i) = win {
                     self.close_window(i);
+                }
+            }
+            Cmd::Pin(kind) => self.set_pinned(kind, true),
+            Cmd::Unpin(kind) => self.set_pinned(kind, false),
+            Cmd::App(id) => {
+                if let Some(i) = target.and_then(|k| self.window_of(k)) {
+                    let reply = self.windows[i].app.context_cmd(id);
+                    self.apply_reply(i, reply);
+                }
+            }
+            Cmd::OpenIcon(i) => self.open_icon(i),
+            Cmd::ShowInFiles(i) => self.show_icon_in_files(i),
+            Cmd::ArrangeIcons => self.arrange_icons(),
+            Cmd::RefreshIcons => self.refresh_icons(),
+            Cmd::ShowDesktop => {
+                for i in 0..self.windows.len() {
+                    if !self.windows[i].minimized {
+                        self.minimize(i);
+                    }
                 }
             }
         }
@@ -760,33 +1287,32 @@ impl Desktop {
     // --- Menus ------------------------------------------------------------
 
     fn open_menu(&mut self, id: MenuId) {
-        self.close_menu();
         let maximized = self.active().is_some_and(|i| self.windows[i].restore.is_some());
         let items = match id {
             MenuId::System => alloc::vec![
-                MenuItem { label: "About KonjacOS", cmd: Some(Cmd::Open(AppKind::About)) },
-                MenuItem { label: "System Monitor", cmd: Some(Cmd::Open(AppKind::Monitor)) },
+                item("About KonjacOS", Cmd::Open(AppKind::About)),
+                item("System Monitor", Cmd::Open(AppKind::Monitor)),
                 SEPARATOR,
-                MenuItem { label: "Restart...", cmd: Some(Cmd::Shell("reboot\n")) },
-                MenuItem { label: "Shut Down...", cmd: Some(Cmd::Shell("halt\n")) },
+                item("Restart...", Cmd::Shell("reboot\n")),
+                item("Shut Down...", Cmd::Shell("halt\n")),
             ],
-            MenuId::Window => alloc::vec![
-                MenuItem { label: "Minimize", cmd: Some(Cmd::Minimize) },
-                MenuItem { label: if maximized { "Restore" } else { "Maximize" }, cmd: Some(Cmd::Maximize) },
-                SEPARATOR,
-                MenuItem { label: "Close", cmd: Some(Cmd::Close) },
-            ],
+            MenuId::Window => {
+                let any = self.active().is_some();
+                alloc::vec![
+                    item_if("Minimize", Cmd::Minimize, any),
+                    item_if(if maximized { "Restore" } else { "Maximize" }, Cmd::ToggleMaximize, any),
+                    SEPARATOR,
+                    item_if("Close", Cmd::Close, any),
+                ]
+            }
             MenuId::Help => alloc::vec![
-                MenuItem { label: "Shell Commands", cmd: Some(Cmd::Shell("help\n")) },
-                MenuItem { label: "About KonjacOS", cmd: Some(Cmd::Open(AppKind::About)) },
+                item("Shell Commands", Cmd::Shell("help\n")),
+                item("About KonjacOS", Cmd::Open(AppKind::About)),
             ],
-            MenuId::Power => alloc::vec![
-                MenuItem { label: "Restart", cmd: Some(Cmd::Shell("reboot\n")) },
-                MenuItem { label: "Shut Down", cmd: Some(Cmd::Shell("halt\n")) },
-            ],
+            MenuId::Power => alloc::vec![item("Restart", Cmd::Shell("reboot\n")), item("Shut Down", Cmd::Shell("halt\n"))],
+            MenuId::Context => return,
         };
-        let width = items.iter().map(|it| font::UI.width(it.label)).max().unwrap_or(0) + 56;
-        let height = 2 * MENU_PAD + items.iter().map(|it| if it.label.is_empty() { MENU_SEP_H } else { MENU_ITEM_H }).sum::<i32>();
+        let (width, height) = menu_size(&items);
         let (rect, upward) = match id {
             MenuId::Power => {
                 let s = self.start_rect();
@@ -798,11 +1324,51 @@ impl Desktop {
                 (Rect::new(anchor.x, TOPBAR_H + 4, width, height), false)
             }
         };
+        self.show_menu(id, items, rect, upward, None);
+    }
+
+    fn show_menu(&mut self, id: MenuId, items: Vec<MenuItem>, rect: Rect, upward: bool, target: Option<AppKind>) {
+        self.close_menu();
+        self.hide_tooltip();
         let mut spring = Spring::new(0.0);
         spring.target = 1.0;
-        self.menu = Some(Menu { id, rect, upward, items, hover: None, spring, glass: Glass::default() });
+        self.menu = Some(Menu { id, rect, upward, items, hover: None, spring, glass: Glass::default(), target });
         self.damage(rect.expand(glass::MENU.reach()), L_MENU);
         self.damage(Rect::new(0, 0, self.screen().w, TOPBAR_H), L_TOPBAR);
+    }
+
+    /// Opens a right-click menu at the pointer, flipped to stay on screen.
+    fn context_menu(&mut self, items: Vec<MenuItem>, target: Option<AppKind>) {
+        if items.is_empty() {
+            return;
+        }
+        let (w, h) = menu_size(&items);
+        let s = self.screen();
+        let x = self.mx.min(s.w - w - 6).max(6);
+        let (y, upward) = if self.my + h > s.h - 6 { ((self.my - h).max(6), true) } else { (self.my, false) };
+        self.show_menu(MenuId::Context, items, Rect::new(x, y, w, h), upward, target);
+    }
+
+    /// Opens a right-click menu just above taskbar item `i`.
+    fn taskbar_menu(&mut self, i: usize, items: Vec<MenuItem>, target: Option<AppKind>) {
+        let (w, h) = menu_size(&items);
+        let r = self.item_rect(i);
+        let s = self.screen();
+        let x = (r.x + r.w / 2 - w / 2).clamp(6, s.w - w - 6);
+        let y = self.taskbar_rect().y - 10 - h;
+        self.show_menu(MenuId::Context, items, Rect::new(x, y, w, h), true, target);
+    }
+
+    /// The right-click menu for app `kind` on the taskbar, Start or the
+    /// desktop: open it, pin or unpin it, close its window.
+    fn app_menu(&self, kind: AppKind, open: Cmd, open_label: &'static str) -> Vec<MenuItem> {
+        let running = self.window_of(kind).is_some();
+        let mut items = alloc::vec![item(open_label, open), SEPARATOR];
+        items.push(if self.pinned.contains(&kind) { item("Unpin from Taskbar", Cmd::Unpin(kind)) } else { item("Pin to Taskbar", Cmd::Pin(kind)) });
+        if running {
+            items.push(item("Close Window", Cmd::Close));
+        }
+        items
     }
 
     fn close_menu(&mut self) {
@@ -836,6 +1402,29 @@ impl Desktop {
         }
     }
 
+    /// What a tooltip at `(x, y)` would say, and about which rectangle.
+    fn tip_at(&self, x: i32, y: i32) -> Option<(Rect, String)> {
+        if !self.taskbar_rect().contains(x, y) {
+            return None;
+        }
+        if let Some(i) = self.item_at(x, y) {
+            let name = if i == 0 { "Start" } else { self.task_apps()[i - 1].name() };
+            return Some((self.item_rect(i), String::from(name)));
+        }
+        let zones = self.tray_zones();
+        let z = zones.iter().position(|r| r.contains(x, y))?;
+        let text = match z {
+            0 => self.ram_detail.clone(),
+            1 => {
+                let mut s = String::from("CPU usage ");
+                s.push_str(&self.cpu);
+                s
+            }
+            _ => self.long_date.clone(),
+        };
+        Some((zones[z], text))
+    }
+
     // --- Input ------------------------------------------------------------
 
     fn poll_input(&mut self) {
@@ -843,51 +1432,110 @@ impl Desktop {
         let b = mouse::buttons();
         if (x, y) != (self.mx, self.my) {
             self.damage_cursor();
+            // Dragged icons and the rubber band follow the pointer: clear
+            // where they were.
+            let (drag, band) = (self.drag_bounds(), self.band_rect());
+            self.damage(drag, L_DRAG);
+            self.damage(band.expand(1), L_DRAG);
             self.mx = x;
             self.my = y;
             self.damage_cursor();
             self.on_move();
         }
-        let left = b & mouse::LEFT_BUTTON != 0;
-        let was = self.buttons & mouse::LEFT_BUTTON != 0;
+        let pressed = b & !self.buttons;
+        let released = self.buttons & !b;
         self.buttons = b;
-        if left && !was {
+        if pressed & mouse::LEFT_BUTTON != 0 {
             self.on_press();
-        } else if !left && was {
-            self.drag = None;
+        } else if released & mouse::LEFT_BUTTON != 0 {
+            self.on_release();
+        }
+        if pressed & mouse::RIGHT_BUTTON != 0 && self.grab == Grab::None {
+            self.on_right_press();
         }
     }
 
     fn on_move(&mut self) {
         let (x, y) = (self.mx, self.my);
-        if let Some((i, ox, oy)) = self.drag {
-            if let Some(w) = self.windows.get(i) {
-                if w.restore.is_some() {
-                    // Dragging a maximized window restores it under the
-                    // cursor, like other desktops do.
-                    let r = w.restore.unwrap();
-                    let ratio = ox as f32 / w.rect.w as f32;
-                    self.damage_window(i);
-                    let w = &mut self.windows[i];
-                    w.restore = None;
-                    let nox = (r.w as f32 * ratio) as i32;
-                    w.rect = Rect::new(x - nox, y - oy, r.w, r.h);
-                    let (cw, ch) = w.client_size();
-                    w.app.resized(cw, ch);
-                    self.drag = Some((i, nox, oy));
-                } else {
-                    self.move_window(i, x - ox, y - oy);
+        match self.grab {
+            Grab::Move { win, ox, oy } => {
+                if let Some(w) = self.windows.get(win) {
+                    if let Some(r) = w.restore {
+                        // Dragging a maximized window restores it under the
+                        // cursor, like other desktops do.
+                        let ratio = ox as f32 / w.rect.w as f32;
+                        self.damage_window(win);
+                        let w = &mut self.windows[win];
+                        w.restore = None;
+                        let nox = (r.w as f32 * ratio) as i32;
+                        w.rect = Rect::new(x - nox, y - oy, r.w, r.h);
+                        let (cw, ch) = w.client_size();
+                        w.app.resized(cw, ch);
+                        self.grab = Grab::Move { win, ox: nox, oy };
+                    } else {
+                        self.move_window(win, x - ox, y - oy);
+                    }
                 }
+                return;
             }
-            return;
+            Grab::Resize { win, edges, start, mx, my } => {
+                if win < self.windows.len() {
+                    self.resize_window(win, edges, start, x - mx, y - my);
+                }
+                return;
+            }
+            Grab::Client { kind } => {
+                if let Some(i) = self.window_of(kind) {
+                    let d = self.windows[i].drawn();
+                    let (cw, ch) = self.windows[i].client_size();
+                    let reply = self.windows[i].app.mouse(MouseEvent::Drag, x - d.x, y - d.y - TITLE_H, cw, ch);
+                    self.apply_reply(i, reply);
+                }
+                return;
+            }
+            Grab::IconPress { x: px, y: py } => {
+                if (x - px).abs() > DRAG_THRESHOLD || (y - py).abs() > DRAG_THRESHOLD {
+                    self.grab = Grab::IconDrag { x: px, y: py };
+                    self.icon_hover = None;
+                    for i in 0..self.icons.len() {
+                        if self.icons[i].selected {
+                            self.damage_icon(i);
+                        }
+                    }
+                    let r = self.drag_bounds();
+                    self.damage(r, L_DRAG);
+                }
+                return;
+            }
+            Grab::IconDrag { .. } => {
+                let r = self.drag_bounds();
+                self.damage(r, L_DRAG);
+                return;
+            }
+            Grab::Band { .. } => {
+                let r = self.band_rect();
+                self.damage(r.expand(1), L_DRAG);
+                let area = self.icon_area();
+                self.select_icons(|_, ic| icons::hit_rect(icons::cell_rect(area, ic.col, ic.row)).intersects(&r));
+                return;
+            }
+            Grab::None => {}
         }
 
         let item = if self.taskbar_rect().contains(x, y) { self.item_at(x, y) } else { None };
-        if item != self.hover_item {
-            self.hover_item = item;
+        self.hover_item = item;
+        let tip = self.tip_at(x, y);
+        if tip.as_ref().map(|t| t.0) != self.tip.as_ref().map(|t| t.0) {
+            self.tip = tip;
             self.hover_since = self.now;
             self.tooltip_suppressed = false;
             self.hide_tooltip();
+        }
+        let tray = if self.taskbar_rect().contains(x, y) { self.tray_zones().iter().position(|r| r.contains(x, y)) } else { None };
+        if tray != self.tray_hover {
+            self.tray_hover = tray;
+            let r = self.tray_rect();
+            self.damage(r, L_TASKBAR);
         }
 
         let top = if y < TOPBAR_H { self.topbar_item_at(x, y) } else { None };
@@ -915,7 +1563,19 @@ impl Desktop {
             }
         }
 
-        let over = if self.menu.is_none() && !self.start.open && y >= TOPBAR_H { self.window_at(x, y) } else { None };
+        let free = self.menu.is_none() && !self.start.open;
+        let icon = if free && self.on_desktop(x, y) { self.icon_at(x, y) } else { None };
+        if icon != self.icon_hover {
+            if let Some(i) = self.icon_hover {
+                self.damage_icon(i);
+            }
+            self.icon_hover = icon;
+            if let Some(i) = icon {
+                self.damage_icon(i);
+            }
+        }
+
+        let over = if free && y >= TOPBAR_H && self.edge_at(x, y).is_none() { self.window_at(x, y) } else { None };
         for i in 0..self.windows.len() {
             let w = &self.windows[i];
             let d = w.drawn();
@@ -935,6 +1595,41 @@ impl Desktop {
         }
     }
 
+    fn on_release(&mut self) {
+        let grab = core::mem::replace(&mut self.grab, Grab::None);
+        match grab {
+            Grab::Client { kind } => {
+                if let Some(i) = self.window_of(kind) {
+                    let d = self.windows[i].drawn();
+                    let (cw, ch) = self.windows[i].client_size();
+                    let reply = self.windows[i].app.mouse(MouseEvent::Up, self.mx - d.x, self.my - d.y - TITLE_H, cw, ch);
+                    self.apply_reply(i, reply);
+                }
+            }
+            Grab::IconDrag { x, y } => {
+                self.grab = grab;
+                let r = self.drag_bounds();
+                self.grab = Grab::None;
+                self.damage(r, L_DRAG);
+                self.drop_icons(self.mx - x, self.my - y);
+                for i in 0..self.icons.len() {
+                    if self.icons[i].selected {
+                        self.damage_icon(i);
+                    }
+                }
+            }
+            Grab::Band { .. } => {
+                self.grab = grab;
+                let r = self.band_rect();
+                self.grab = Grab::None;
+                self.damage(r.expand(1), L_DRAG);
+            }
+            _ => {}
+        }
+        // Whatever is under the pointer now gets its hover state back.
+        self.on_move();
+    }
+
     fn on_press(&mut self) {
         let (x, y) = (self.mx, self.my);
         let (lt, lx, ly) = self.last_click;
@@ -942,20 +1637,22 @@ impl Desktop {
         self.last_click = if double { (0, x, y) } else { (self.now, x, y) };
 
         if let Some(m) = &self.menu {
-            let (id, rect, hit) = (m.id, m.rect, m.item_at(x, y));
+            let (id, rect, target, hit) = (m.id, m.rect, m.target, m.item_at(x, y));
             if rect.contains(x, y) {
                 if let Some(cmd) = hit.and_then(|i| self.menu.as_ref().unwrap().items[i].cmd) {
                     self.close_menu();
                     if id == MenuId::Power {
                         self.close_start();
                     }
-                    self.run_cmd(cmd);
+                    self.run_cmd(cmd, target);
                 }
                 return;
             }
             self.close_menu();
-            if let Some(other) = self.topbar_item_at(x, y).filter(|&o| o != id) {
-                self.open_menu(other);
+            if id != MenuId::Context {
+                if let Some(other) = self.topbar_item_at(x, y).filter(|&o| o != id) {
+                    self.open_menu(other);
+                }
             }
             if !(self.start.open && self.start_rect().contains(x, y)) {
                 return;
@@ -965,10 +1662,14 @@ impl Desktop {
         if self.start.open {
             if self.start_rect().contains(x, y) {
                 match self.start_hit(x, y) {
-                    Some(5) => self.open_menu(MenuId::Power),
+                    Some(START_POWER) => self.open_menu(MenuId::Power),
+                    Some(START_USER) => {
+                        self.close_start();
+                        self.launch(AppKind::About);
+                    }
                     Some(i) => {
                         self.close_start();
-                        self.taskbar_click_or_open(AppKind::PINNED[i]);
+                        self.launch(AppKind::ALL[i]);
                     }
                     None => {}
                 }
@@ -983,7 +1684,7 @@ impl Desktop {
             self.tooltip_suppressed = true;
             match self.item_at(x, y) {
                 Some(0) => self.open_start(),
-                Some(i) => self.taskbar_click(AppKind::PINNED[i - 1]),
+                Some(i) => self.taskbar_click(self.task_apps()[i - 1]),
                 None => {}
             }
             return;
@@ -993,6 +1694,12 @@ impl Desktop {
             if let Some(id) = self.topbar_item_at(x, y) {
                 self.open_menu(id);
             }
+            return;
+        }
+
+        if let Some((i, edges)) = self.edge_at(x, y) {
+            let i = self.focus(i);
+            self.grab = Grab::Resize { win: i, edges, start: self.windows[i].rect, mx: x, my: y };
             return;
         }
 
@@ -1006,23 +1713,254 @@ impl Desktop {
                     Some(Btn::Max) => self.toggle_maximize(i),
                     Some(Btn::Min) => self.minimize(i),
                     None if double => self.toggle_maximize(i),
-                    None => self.drag = Some((i, lx, ly)),
+                    None => self.grab = Grab::Move { win: i, ox: lx, oy: ly },
                 }
             } else {
                 let (cw, ch) = self.windows[i].client_size();
                 let ev = if double { MouseEvent::DoubleClick } else { MouseEvent::Down };
+                self.grab = Grab::Client { kind: self.windows[i].kind };
                 let reply = self.windows[i].app.mouse(ev, lx, ly - TITLE_H, cw, ch);
                 self.apply_reply(i, reply);
+            }
+            return;
+        }
+
+        // The desktop itself.
+        match self.icon_at(x, y) {
+            Some(i) if double => {
+                self.select_icons(|j, _| j == i);
+                self.open_icon(i);
+            }
+            Some(i) => {
+                if !self.icons[i].selected {
+                    self.select_icons(|j, _| j == i);
+                }
+                self.grab = Grab::IconPress { x, y };
+            }
+            None => {
+                self.select_icons(|_, _| false);
+                self.grab = Grab::Band { x, y };
             }
         }
     }
 
-    /// Start menu tiles launch (or bring forward) an app, never minimize.
-    fn taskbar_click_or_open(&mut self, kind: AppKind) {
-        if kind == AppKind::Doom {
-            self.taskbar_click(kind);
+    fn on_right_press(&mut self) {
+        let (x, y) = (self.mx, self.my);
+        if let Some(m) = &self.menu {
+            let inside = m.rect.contains(x, y);
+            self.close_menu();
+            if inside {
+                return;
+            }
+        }
+
+        if self.start.open {
+            if self.start_rect().contains(x, y) {
+                if let Some(i) = self.start_hit(x, y).filter(|&i| i < AppKind::ALL.len()) {
+                    let kind = AppKind::ALL[i];
+                    let items = self.app_menu(kind, Cmd::Open(kind), "Open");
+                    self.context_menu(items, Some(kind));
+                }
+                return;
+            }
+            self.close_start();
+            return;
+        }
+
+        if self.taskbar_rect().contains(x, y) {
+            self.hide_tooltip();
+            self.tooltip_suppressed = true;
+            match self.item_at(x, y) {
+                Some(0) => {
+                    let items = alloc::vec![
+                        item("Terminal", Cmd::Open(AppKind::Terminal)),
+                        item("Files", Cmd::Open(AppKind::Files)),
+                        item("System Monitor", Cmd::Open(AppKind::Monitor)),
+                        SEPARATOR,
+                        item("Show Desktop", Cmd::ShowDesktop),
+                        SEPARATOR,
+                        item("Restart", Cmd::Shell("reboot\n")),
+                        item("Shut Down", Cmd::Shell("halt\n")),
+                    ];
+                    self.taskbar_menu(0, items, None);
+                }
+                Some(i) => {
+                    let kind = self.task_apps()[i - 1];
+                    let items = self.app_menu(kind, Cmd::Open(kind), kind.name());
+                    self.taskbar_menu(i, items, Some(kind));
+                }
+                None => {
+                    let items = alloc::vec![item("System Monitor", Cmd::Open(AppKind::Monitor)), item("Show Desktop", Cmd::ShowDesktop)];
+                    self.context_menu(items, None);
+                }
+            }
+            return;
+        }
+
+        if y < TOPBAR_H {
+            return;
+        }
+
+        if self.edge_at(x, y).is_some() {
+            return;
+        }
+
+        if let Some(i) = self.window_at(x, y) {
+            let i = self.focus(i);
+            let w = &self.windows[i];
+            let kind = w.kind;
+            let d = w.drawn();
+            let (lx, ly) = (x - d.x, y - d.y);
+            if ly < TITLE_H {
+                let maximized = w.restore.is_some();
+                let items = alloc::vec![
+                    item_if("Restore", Cmd::ToggleMaximize, maximized),
+                    item("Minimize", Cmd::Minimize),
+                    item_if("Maximize", Cmd::ToggleMaximize, !maximized),
+                    SEPARATOR,
+                    item("Close", Cmd::Close),
+                ];
+                self.context_menu(items, Some(kind));
+            } else {
+                let (cw, ch) = w.client_size();
+                let offered: Vec<ContextItem> = self.windows[i].app.context_menu(lx, ly - TITLE_H, cw, ch);
+                self.damage_client(i);
+                let items = offered.into_iter().map(|(label, id)| MenuItem { label, cmd: id.map(Cmd::App) }).collect();
+                self.context_menu(items, Some(kind));
+            }
+            return;
+        }
+
+        // The desktop itself.
+        match self.icon_at(x, y) {
+            Some(i) => {
+                if !self.icons[i].selected {
+                    self.select_icons(|j, _| j == i);
+                }
+                let items = match &self.icons[i].target {
+                    Target::App(kind) => {
+                        let kind = *kind;
+                        let items = self.app_menu(kind, Cmd::OpenIcon(i), "Open");
+                        self.context_menu(items, Some(kind));
+                        return;
+                    }
+                    Target::Dir(_) => alloc::vec![item("Open", Cmd::OpenIcon(i))],
+                    Target::File(path) => {
+                        let can_open = open_command(path).is_some();
+                        alloc::vec![item_if("Open", Cmd::OpenIcon(i), can_open), item("Show in Files", Cmd::ShowInFiles(i))]
+                    }
+                };
+                self.context_menu(items, None);
+            }
+            None => {
+                self.select_icons(|_, _| false);
+                let items = alloc::vec![
+                    item("Open Terminal", Cmd::Open(AppKind::Terminal)),
+                    item("Open Files", Cmd::Open(AppKind::Files)),
+                    SEPARATOR,
+                    item("Arrange Icons", Cmd::ArrangeIcons),
+                    item("Refresh", Cmd::RefreshIcons),
+                    item("Show Desktop", Cmd::ShowDesktop),
+                    SEPARATOR,
+                    item("About KonjacOS", Cmd::Open(AppKind::About)),
+                ];
+                self.context_menu(items, None);
+            }
+        }
+    }
+
+    // --- Pointer ------------------------------------------------------------
+
+    /// The pointer for what's under it right now, or for what the held
+    /// button is doing.
+    fn pick_cursor(&self) -> Cursor {
+        let (x, y) = (self.mx, self.my);
+        match self.grab {
+            Grab::Move { .. } => return Cursor::Move,
+            Grab::Resize { edges, .. } => return edge_cursor(edges),
+            Grab::IconDrag { .. } => {
+                return if self.taskbar_rect().contains(x, y) {
+                    if self.droppable_apps().is_empty() {
+                        Cursor::No
+                    } else {
+                        Cursor::Pin
+                    }
+                } else if self.on_desktop(x, y) {
+                    Cursor::Move
+                } else {
+                    Cursor::No
+                };
+            }
+            Grab::Band { .. } => return Cursor::Cross,
+            Grab::Client { kind } => {
+                if let Some(i) = self.window_of(kind) {
+                    let w = &self.windows[i];
+                    let d = w.drawn();
+                    let (cw, ch) = w.client_size();
+                    return w.app.cursor(x - d.x, y - d.y - TITLE_H, cw, ch);
+                }
+            }
+            Grab::IconPress { .. } | Grab::None => {}
+        }
+
+        let hover = self.hover_cursor(x, y);
+        let launching = self.now < self.launching_until || self.windows.iter().any(|w| w.app.loading());
+        if hover == Cursor::Arrow && launching {
+            Cursor::Working
         } else {
-            self.open_app(kind);
+            hover
+        }
+    }
+
+    fn hover_cursor(&self, x: i32, y: i32) -> Cursor {
+        if let Some(m) = &self.menu {
+            if m.rect.contains(x, y) {
+                return match m.row_at(x, y) {
+                    Some(i) if m.items[i].cmd.is_none() => Cursor::No,
+                    Some(_) if m.id == MenuId::Help => Cursor::Help,
+                    _ => Cursor::Arrow,
+                };
+            }
+        }
+        if self.start.open && self.start_rect().contains(x, y) {
+            return match self.start_hit(x, y) {
+                Some(START_USER) => Cursor::Person,
+                Some(_) => Cursor::Hand,
+                None => Cursor::Arrow,
+            };
+        }
+        if self.taskbar_rect().contains(x, y) {
+            return if self.tray_zones().iter().any(|r| r.contains(x, y)) { Cursor::Help } else { Cursor::Arrow };
+        }
+        if y < TOPBAR_H {
+            return if self.topbar_item_at(x, y) == Some(MenuId::Help) { Cursor::Help } else { Cursor::Arrow };
+        }
+        if self.menu.is_some() || self.start.open {
+            return Cursor::Arrow;
+        }
+        if let Some((_, edges)) = self.edge_at(x, y) {
+            return edge_cursor(edges);
+        }
+        if let Some(i) = self.window_at(x, y) {
+            let w = &self.windows[i];
+            let d = w.drawn();
+            let (cw, ch) = w.client_size();
+            if y - d.y >= TITLE_H {
+                return w.app.cursor(x - d.x, y - d.y - TITLE_H, cw, ch);
+            }
+        }
+        Cursor::Arrow
+    }
+
+    /// Switches the pointer's shape (or animation frame) when it changes.
+    fn update_cursor(&mut self) {
+        let shape = self.pick_cursor();
+        let frame = cursor::image(shape).frame_at(self.now);
+        if (shape, frame) != (self.cursor, self.cursor_frame) {
+            self.damage_cursor();
+            self.cursor = shape;
+            self.cursor_frame = frame;
+            self.damage_cursor();
         }
     }
 
@@ -1051,6 +1989,10 @@ impl Desktop {
             let _ = write!(cpu, "{}%", s.cpu);
             let pct = if s.mem_total > 0 { s.mem_used * 100 / s.mem_total } else { 0 };
             let _ = write!(ram, "{pct}%");
+            self.long_date.clear();
+            let _ = write!(self.long_date, "{}, {} {}, {}", weekday(t.year, t.month, t.day), month_name(t.month), t.day, t.year);
+            self.ram_detail.clear();
+            let _ = write!(self.ram_detail, "Memory: {} of {} MiB", s.mem_used / (1024 * 1024), s.mem_total / (1024 * 1024));
             if (&clock, &date, &cpu, &ram) != (&self.clock, &self.date, &self.cpu, &self.ram) {
                 self.clock = clock;
                 self.date = date;
@@ -1065,13 +2007,13 @@ impl Desktop {
         // taskbar or the `doom` shell command), closed when it ends.
         if self.now % 20 == 0 {
             let running = doom_driver::running_task().is_some();
-            let window = self.windows.iter().position(|w| w.kind == AppKind::Doom);
+            let window = self.window_of(AppKind::Doom);
             match (running, window) {
                 (true, None) => self.open_app(AppKind::Doom),
                 (false, Some(i)) => {
                     self.damage_window(i);
                     self.windows.remove(i);
-                    self.focus_changed();
+                    self.window_removed(i);
                 }
                 _ => {}
             }
@@ -1091,7 +2033,7 @@ impl Desktop {
         }
 
         // Hover boxes fade in/out linearly over 80ms (8 ticks).
-        for i in 0..ITEMS {
+        for i in 0..self.item_count() {
             let target = if self.hover_item == Some(i) { 1.0 } else { 0.0 };
             let cur = self.hover_alpha[i];
             if cur != target {
@@ -1101,16 +2043,15 @@ impl Desktop {
             }
         }
 
-        match self.hover_item {
-            Some(i) if self.tooltip.is_none() && !self.tooltip_suppressed && !self.start.open && self.menu.is_none() && self.now - self.hover_since > TOOLTIP_DELAY && self.buttons == 0 => {
-                let text = if i == 0 { "Start" } else { AppKind::PINNED[i - 1].name() };
-                let r = self.item_rect(i);
-                let w = font::UI.width(text) + 28;
-                let rect = Rect::new(r.x + (r.w - w) / 2, self.taskbar_rect().y - 42, w, 32);
+        if self.tooltip.is_none() && !self.tooltip_suppressed && !self.start.open && self.menu.is_none() && self.now - self.hover_since > TOOLTIP_DELAY && self.buttons == 0 {
+            if let Some((r, text)) = self.tip.clone() {
+                let w = font::UI.width(&text) + 28;
+                let s = self.screen();
+                let x = (r.x + (r.w - w) / 2).clamp(8, s.w - w - 8);
+                let rect = Rect::new(x, self.taskbar_rect().y - 42, w, 32);
                 self.tooltip = Some(Tooltip { text, rect, alpha: 0.0, glass: Glass::default() });
                 self.damage(rect.expand(glass::TOOLTIP.reach()), L_TOOLTIP);
             }
-            _ => {}
         }
         if let Some(t) = &mut self.tooltip {
             if t.alpha < 1.0 {
@@ -1180,6 +2121,7 @@ impl Desktop {
         for w in &mut self.windows {
             w.open.snap(1.0);
         }
+        self.launching_until = 0;
         self.damage.clear();
         self.render(s);
         let desk: Vec<u32> = self.bb.px.clone();
@@ -1200,6 +2142,32 @@ impl Desktop {
         self.bb.px.copy_from_slice(&desk);
         self.canvas.present(&self.bb.px, s.w as usize, 0, 0, s.w as usize, s.h as usize);
     }
+}
+
+fn edge_cursor(edges: u8) -> Cursor {
+    let h = edges & (EDGE_L | EDGE_R);
+    let v = edges & (EDGE_T | EDGE_B);
+    match (h, v) {
+        (0, _) => Cursor::SizeNS,
+        (_, 0) => Cursor::SizeWE,
+        (EDGE_L, EDGE_T) | (EDGE_R, EDGE_B) => Cursor::SizeNWSE,
+        _ => Cursor::SizeNESW,
+    }
+}
+
+fn month_name(m: u8) -> &'static str {
+    const NAMES: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    NAMES[(m.clamp(1, 12) - 1) as usize]
+}
+
+/// Day of the week for a Gregorian date (Sakamoto's method).
+fn weekday(y: u16, m: u8, d: u8) -> &'static str {
+    const NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let m = m.clamp(1, 12) as i32;
+    let y = y as i32 - (m < 3) as i32;
+    let dow = (y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d as i32).rem_euclid(7);
+    NAMES[dow as usize]
 }
 
 // --- Painting helpers -----------------------------------------------------
@@ -1264,27 +2232,34 @@ fn paint_tray(p: &mut Painter, tb: Rect, clock: &str, date: &str, cpu: &str, ram
 }
 
 fn paint_start(p: &mut Painter, hover: Option<usize>) {
-    p.text_shadowed(&font::UI_BOLD, 24, 18, "Pinned", TEXT, 255);
-    for (i, kind) in AppKind::PINNED.iter().enumerate() {
+    p.text_shadowed(&font::UI_BOLD, 24, 18, "Apps", TEXT, 255);
+    for (i, kind) in AppKind::ALL.iter().enumerate() {
         let r = Desktop::tile_rect(i);
         if hover == Some(i) {
             p.fill_squircle(r, 12.0, TEXT, 34);
         }
         let (iw, ih, m) = assets::icon(kind.taskbar_icons().1);
         p.draw_mask(r.x + (r.w - iw) / 2, r.y + 12, iw, ih, m, ACCENT, 255);
-        let label = match kind {
-            AppKind::About => "About",
-            k => k.name(),
-        };
+        let label = kind.short_name();
         p.text(&font::SMALL, r.x + (r.w - font::SMALL.width(label)) / 2, r.y + 54, label, TEXT, 255);
     }
     p.fill_rect(Rect::new(20, START_H - 62, START_W - 40, 1), TEXT, 36);
-    let (lw, lh, m) = assets::logo_small();
-    p.draw_mask(26, START_H - 42, lw, lh, m, TEXT, 255);
-    p.text_shadowed(&font::UI_BOLD, 50, START_H - 41, "KonjacOS", TEXT, 255);
-    p.text(&font::SMALL, 50 + font::UI_BOLD.width("KonjacOS") + 8, START_H - 39, "0.1.0", TEXT_DIM, 255);
+
+    // The user: there's only the one, but it's where a real desktop puts
+    // the account.
+    let ur = Desktop::user_rect();
+    if hover == Some(START_USER) {
+        p.fill_squircle(ur, 12.0, TEXT, 34);
+    }
+    let avatar = Rect::new(ur.x + 8, ur.y + 6, 30, 30);
+    p.fill_squircle(avatar, 15.0, ACCENT, 230);
+    let (iw, ih, m) = assets::icon(icon::PERSON_20_FILLED);
+    p.draw_mask(avatar.x + (avatar.w - iw) / 2, avatar.y + (avatar.h - ih) / 2, iw, ih, m, rgb(18, 40, 38), 255);
+    p.text_shadowed(&font::UI_BOLD, avatar.right() + 10, ur.y + 4, "konjac", TEXT, 255);
+    p.text(&font::SMALL, avatar.right() + 10, ur.y + 22, "KonjacOS 0.1.0", TEXT_DIM, 255);
+
     let pr = Desktop::power_rect();
-    if hover == Some(5) {
+    if hover == Some(START_POWER) {
         p.fill_squircle(pr, 10.0, TEXT, 34);
     }
     let (iw, ih, m) = assets::icon(icon::POWER_20);
@@ -1303,22 +2278,25 @@ fn paint_menu(p: &mut Painter, m: &Menu) {
         if m.hover == Some(i) {
             p.fill_squircle(Rect::new(MENU_PAD, y, w - 2 * MENU_PAD, MENU_ITEM_H), 8.0, TEXT, 36);
         }
-        p.text_shadowed(&font::UI, 20, y + (MENU_ITEM_H - font::UI.line_height()) / 2, item.label, TEXT, 255);
+        let (color, alpha) = if item.cmd.is_some() { (TEXT, 255) } else { (TEXT_DIM, 120) };
+        p.text_shadowed(&font::UI, 20, y + (MENU_ITEM_H - font::UI.line_height()) / 2, item.label, color, alpha);
         y += MENU_ITEM_H;
     }
 }
 
-fn paint_cursor(bb: &mut Surface, clip: Rect, mx: i32, my: i32) {
-    let x0 = mx - cursor::HOTSPOT_X;
-    let y0 = my - cursor::HOTSPOT_Y;
-    let r = Rect::new(x0, y0, cursor::WIDTH as i32, cursor::HEIGHT as i32).intersect(&clip);
+fn paint_cursor(bb: &mut Surface, clip: Rect, mx: i32, my: i32, img: &cursor::Image, frame: u16) {
+    let x0 = mx - img.hot_x;
+    let y0 = my - img.hot_y;
+    let px = img.pixels(frame);
+    let r = Rect::new(x0, y0, img.w, img.h).intersect(&clip);
     for y in r.y..r.bottom() {
+        let row = ((y - y0) * img.w) as usize;
         for x in r.x..r.right() {
-            if let Some((cr, cg, cb, a)) = cursor::pixel((x - x0) as u32, (y - y0) as u32) {
-                if a != 0 {
-                    let i = (y * bb.w + x) as usize;
-                    bb.px[i] = blend(bb.px[i], rgb(cr, cg, cb), a as u32);
-                }
+            let s = (row + (x - x0) as usize) * 4;
+            let a = px[s + 3] as u32;
+            if a != 0 {
+                let i = (y * bb.w + x) as usize;
+                bb.px[i] = blend(bb.px[i], rgb(px[s], px[s + 1], px[s + 2]), a);
             }
         }
     }
@@ -1342,6 +2320,7 @@ pub fn run() {
         for _ in 0..steps {
             d.animate();
         }
+        d.update_cursor();
         d.flush();
         task::sleep_ticks(1);
     }

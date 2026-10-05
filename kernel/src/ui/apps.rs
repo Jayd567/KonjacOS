@@ -17,6 +17,7 @@ use super::icon_ids as icon;
 use super::surface::{rgb, Painter, Rect};
 use super::sysmon::{self, Snapshot};
 use crate::console;
+use crate::cursor::Shape as Cursor;
 use crate::doom_driver;
 
 pub const TEXT: u32 = rgb(240, 243, 246);
@@ -29,10 +30,15 @@ pub enum AppKind {
     Files,
     Monitor,
     Doom,
+    Sketch,
     About,
 }
 
 impl AppKind {
+    /// Every app, in Start menu order.
+    pub const ALL: [AppKind; 6] = [AppKind::Terminal, AppKind::Files, AppKind::Monitor, AppKind::Doom, AppKind::Sketch, AppKind::About];
+    /// What the taskbar starts out with; the rest can be pinned by dragging
+    /// their desktop icon onto it, or from their right-click menu.
     pub const PINNED: [AppKind; 5] = [AppKind::Terminal, AppKind::Files, AppKind::Monitor, AppKind::Doom, AppKind::About];
 
     pub fn name(self) -> &'static str {
@@ -41,7 +47,28 @@ impl AppKind {
             AppKind::Files => "Files",
             AppKind::Monitor => "Monitor",
             AppKind::Doom => "DOOM",
+            AppKind::Sketch => "Sketch",
             AppKind::About => "About KonjacOS",
+        }
+    }
+
+    /// The name under its desktop icon and Start menu tile.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            AppKind::About => "About",
+            k => k.name(),
+        }
+    }
+
+    /// The colour of its desktop icon's tile.
+    pub fn tint(self) -> u32 {
+        match self {
+            AppKind::Terminal => rgb(46, 54, 70),
+            AppKind::Files => rgb(232, 164, 52),
+            AppKind::Monitor => rgb(34, 160, 140),
+            AppKind::Doom => rgb(196, 48, 40),
+            AppKind::Sketch => rgb(214, 84, 150),
+            AppKind::About => rgb(64, 116, 214),
         }
     }
 
@@ -52,6 +79,7 @@ impl AppKind {
             AppKind::Files => (icon::FILES_32, icon::FILES_32_FILLED),
             AppKind::Monitor => (icon::MONITOR_32, icon::MONITOR_32_FILLED),
             AppKind::Doom => (icon::DOOM_32, icon::DOOM_32_FILLED),
+            AppKind::Sketch => (icon::SKETCH_32, icon::SKETCH_32_FILLED),
             AppKind::About => (icon::ABOUT_32, icon::ABOUT_32_FILLED),
         }
     }
@@ -62,6 +90,7 @@ impl AppKind {
             AppKind::Files => icon::FILES_20,
             AppKind::Monitor => icon::MONITOR_20,
             AppKind::Doom => icon::DOOM_20,
+            AppKind::Sketch => icon::SKETCH_20,
             AppKind::About => icon::ABOUT_20,
         }
     }
@@ -72,7 +101,8 @@ impl AppKind {
             AppKind::Files => Box::new(Files::new()),
             AppKind::Monitor => Box::new(Monitor::new()),
             AppKind::Doom => Box::new(Doom::new()),
-            AppKind::About => Box::new(About),
+            AppKind::Sketch => Box::new(super::sketch::Sketch::new()),
+            AppKind::About => Box::new(About { link_hover: false }),
         }
     }
 }
@@ -82,6 +112,11 @@ pub enum MouseEvent {
     Move,
     Down,
     DoubleClick,
+    /// The pointer moved with the button held, after a `Down` in this
+    /// app -- delivered even once it leaves the client area.
+    Drag,
+    /// The button was released, after a `Down` in this app.
+    Up,
 }
 
 /// Something an app asks the desktop to do on its behalf.
@@ -92,9 +127,23 @@ pub enum Action {
 
 #[derive(Default)]
 pub struct Reply {
+    /// Repaint the whole client area...
     pub repaint: bool,
+    /// ...or just this part of it (client coordinates).
+    pub damage: Option<Rect>,
     pub action: Option<Action>,
 }
+
+impl Reply {
+    pub fn repaint(repaint: bool) -> Self {
+        Reply { repaint, ..Reply::default() }
+    }
+}
+
+/// A right-click menu entry an app offers: its label and the id passed
+/// back to [`App::context_cmd`] (`None` = shown greyed out). An empty
+/// label is a separator.
+pub type ContextItem = (&'static str, Option<u32>);
 
 pub trait App {
     /// Initial client-area size.
@@ -114,6 +163,33 @@ pub trait App {
     /// the desktop can skip compositing anything underneath it.
     fn opaque_rect(&self, _w: i32, _h: i32) -> Option<Rect> {
         None
+    }
+    /// Whether dragging the window's edges resizes it.
+    fn resizable(&self) -> bool {
+        true
+    }
+    /// The smallest client area resizing may shrink it to.
+    fn min_size(&self) -> (i32, i32) {
+        (320, 200)
+    }
+    /// The pointer to show over client point `(x, y)`.
+    fn cursor(&self, _x: i32, _y: i32, _w: i32, _h: i32) -> Cursor {
+        Cursor::Arrow
+    }
+    /// The right-click menu for client point `(x, y)`; empty for none.
+    /// Apps may update their selection to what was right-clicked first.
+    fn context_menu(&mut self, _x: i32, _y: i32, _w: i32, _h: i32) -> Vec<ContextItem> {
+        Vec::new()
+    }
+    /// One of this app's own menu entries was chosen.
+    fn context_cmd(&mut self, _id: u32) -> Reply {
+        Reply::default()
+    }
+    /// Show folder `dir` (Files only), with entry `select` highlighted.
+    fn navigate(&mut self, _dir: &str, _select: Option<&str>) {}
+    /// Still starting up: the pointer shows the "working" spinner.
+    fn loading(&self) -> bool {
+        false
     }
 }
 
@@ -230,6 +306,28 @@ impl App for Terminal {
             p.fill_rect(Rect::new(TERM_PAD + cc as i32 * cw, TERM_PAD - 6 + cr as i32 * ch + 1, 2, ch - 3), ACCENT, 255);
         }
     }
+
+    fn min_size(&self) -> (i32, i32) {
+        let (cw, ch) = Self::cell();
+        (20 * cw + 2 * TERM_PAD, 5 * ch + 2 * TERM_PAD)
+    }
+
+    fn cursor(&self, x: i32, y: i32, w: i32, h: i32) -> Cursor {
+        if Rect::new(12, 0, w - 24, h - 12).contains(x, y) {
+            Cursor::Text
+        } else {
+            Cursor::Arrow
+        }
+    }
+
+    fn context_menu(&mut self, _x: i32, _y: i32, _w: i32, _h: i32) -> Vec<ContextItem> {
+        alloc::vec![("Clear", Some(0)), ("Shell Commands", Some(1))]
+    }
+
+    fn context_cmd(&mut self, id: u32) -> Reply {
+        let cmd = if id == 0 { "clear\n" } else { "help\n" };
+        Reply { action: Some(Action::Shell(String::from(cmd))), ..Reply::default() }
+    }
 }
 
 // --- Files --------------------------------------------------------------
@@ -310,9 +408,41 @@ impl Files {
     fn up_rect() -> Rect {
         Rect::new(12, 6, 36, 32)
     }
+
+    /// Double-click / "Open": into a folder, or hand a file to the shell.
+    fn open(&mut self, i: usize) -> Reply {
+        let mut reply = Reply::repaint(true);
+        let path = self.child(&self.entries[i].name);
+        if self.entries[i].is_dir {
+            self.path = path;
+            self.load();
+        } else if let Some(cmd) = open_command(&path) {
+            reply.action = Some(Action::Shell(cmd));
+        }
+        reply
+    }
 }
 
-fn file_icon(name: &str) -> usize {
+/// The shell command that opens file `path`, if KonjacOS knows how:
+/// text is `cat`ed, programs are `run`, a WAD starts DOOM.
+pub fn open_command(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    let verb = if lower.ends_with(".txt") || lower.ends_with(".md") || lower.ends_with(".cfg") {
+        "cat "
+    } else if lower.ends_with(".exe") || lower.ends_with(".elf") || lower.ends_with(".bin") {
+        "run "
+    } else if lower.ends_with(".wad") {
+        return Some(String::from("doom\n"));
+    } else {
+        return None;
+    };
+    let mut cmd = String::from(verb);
+    cmd.push_str(path);
+    cmd.push('\n');
+    Some(cmd)
+}
+
+pub fn file_icon(name: &str) -> usize {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".exe") || lower.ends_with(".elf") || lower.ends_with(".bin") {
         icon::APP_20
@@ -387,14 +517,14 @@ impl App for Files {
     }
 
     fn mouse(&mut self, ev: MouseEvent, x: i32, y: i32, _w: i32, _h: i32) -> Reply {
-        let mut reply = Reply::default();
         match ev {
             MouseEvent::Move => {
                 let hover = self.row_at(y);
                 let up_hover = Self::up_rect().contains(x, y);
-                reply.repaint = hover != self.hover || up_hover != self.up_hover;
+                let changed = hover != self.hover || up_hover != self.up_hover;
                 self.hover = hover;
                 self.up_hover = up_hover;
+                Reply::repaint(changed)
             }
             MouseEvent::Down => {
                 if Self::up_rect().contains(x, y) {
@@ -402,37 +532,51 @@ impl App for Files {
                 } else {
                     self.selected = self.row_at(y);
                 }
-                reply.repaint = true;
+                Reply::repaint(true)
             }
-            MouseEvent::DoubleClick => {
-                if let Some(i) = self.row_at(y) {
-                    let (name, is_dir) = (self.entries[i].name.clone(), self.entries[i].is_dir);
-                    if is_dir {
-                        self.path = self.child(&name);
-                        self.load();
-                    } else {
-                        let lower = name.to_ascii_lowercase();
-                        let path = self.child(&name);
-                        let verb = if lower.ends_with(".txt") || lower.ends_with(".md") || lower.ends_with(".cfg") {
-                            Some("cat")
-                        } else if lower.ends_with(".exe") || lower.ends_with(".elf") || lower.ends_with(".bin") {
-                            Some("run")
-                        } else {
-                            None
-                        };
-                        if let Some(verb) = verb {
-                            let mut cmd = String::from(verb);
-                            cmd.push(' ');
-                            cmd.push_str(&path);
-                            cmd.push('\n');
-                            reply.action = Some(Action::Shell(cmd));
-                        }
-                    }
-                    reply.repaint = true;
-                }
+            MouseEvent::DoubleClick => match self.row_at(y) {
+                Some(i) => self.open(i),
+                None => Reply::default(),
+            },
+            MouseEvent::Drag | MouseEvent::Up => Reply::default(),
+        }
+    }
+
+    fn cursor(&self, x: i32, y: i32, _w: i32, _h: i32) -> Cursor {
+        if Self::up_rect().contains(x, y) && self.path != "/" {
+            Cursor::Up
+        } else {
+            Cursor::Arrow
+        }
+    }
+
+    fn context_menu(&mut self, _x: i32, y: i32, _w: i32, _h: i32) -> Vec<ContextItem> {
+        self.selected = self.row_at(y);
+        match self.selected {
+            Some(i) if self.entries[i].is_dir => alloc::vec![("Open", Some(0))],
+            Some(i) => alloc::vec![("Open", open_command(&self.entries[i].name).map(|_| 0))],
+            None => alloc::vec![("Up One Level", (self.path != "/").then_some(1)), ("Refresh", Some(2))],
+        }
+    }
+
+    fn context_cmd(&mut self, id: u32) -> Reply {
+        match (id, self.selected) {
+            (0, Some(i)) => self.open(i),
+            (1, _) => {
+                self.up();
+                Reply::repaint(true)
+            }
+            _ => {
+                self.load();
+                Reply::repaint(true)
             }
         }
-        reply
+    }
+
+    fn navigate(&mut self, dir: &str, select: Option<&str>) {
+        self.path = String::from(dir);
+        self.load();
+        self.selected = select.and_then(|name| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(name)));
     }
 }
 
@@ -453,6 +597,10 @@ impl Monitor {
 impl App for Monitor {
     fn client_size(&self) -> (i32, i32) {
         (520, 470)
+    }
+
+    fn min_size(&self) -> (i32, i32) {
+        (420, 300)
     }
 
     fn tick(&mut self) -> Option<Rect> {
@@ -583,15 +731,69 @@ impl App for Doom {
             crate::task::kill(id);
         }
     }
+
+    // DOOM renders at a fixed 640x400; a bigger window would only add
+    // empty glass round it.
+    fn resizable(&self) -> bool {
+        false
+    }
+
+    fn loading(&self) -> bool {
+        self.seq == 0 || self.seq == u64::MAX
+    }
+
+    fn cursor(&self, _x: i32, _y: i32, _w: i32, _h: i32) -> Cursor {
+        if self.loading() {
+            Cursor::Busy
+        } else {
+            Cursor::Arrow
+        }
+    }
 }
 
 // --- About --------------------------------------------------------------
 
-pub struct About;
+pub struct About {
+    link_hover: bool,
+}
+
+const ABOUT_LINK: &str = "Show shell commands";
+
+impl About {
+    fn link_rect(w: i32) -> Rect {
+        let lw = font::UI.width(ABOUT_LINK);
+        Rect::new((w - lw) / 2 - 4, 340, lw + 8, 24)
+    }
+}
 
 impl App for About {
     fn client_size(&self) -> (i32, i32) {
-        (400, 380)
+        (400, 384)
+    }
+
+    fn resizable(&self) -> bool {
+        false
+    }
+
+    fn cursor(&self, x: i32, y: i32, w: i32, _h: i32) -> Cursor {
+        if Self::link_rect(w).contains(x, y) {
+            Cursor::Hand
+        } else {
+            Cursor::Arrow
+        }
+    }
+
+    fn mouse(&mut self, ev: MouseEvent, x: i32, y: i32, w: i32, _h: i32) -> Reply {
+        let over = Self::link_rect(w).contains(x, y);
+        match ev {
+            MouseEvent::Move => {
+                let changed = over != self.link_hover;
+                self.link_hover = over;
+                Reply::repaint(changed)
+            }
+            MouseEvent::Down if over => Reply { action: Some(Action::Shell(String::from("help\n"))), ..Reply::default() },
+            _ => Reply::default(),
+        }
     }
 
     fn paint(&mut self, p: &mut Painter, w: i32, _h: i32) {
@@ -620,6 +822,12 @@ impl App for About {
             if i + 1 < rows.len() {
                 p.fill_rect(Rect::new(card.x + 18, y + 27, card.w - 36, 1), TEXT, 24);
             }
+        }
+
+        let link = Self::link_rect(w);
+        p.text(&font::UI, link.x + 4, link.y + 3, ABOUT_LINK, ACCENT, 255);
+        if self.link_hover {
+            p.fill_rect(Rect::new(link.x + 4, link.y + 20, link.w - 8, 1), ACCENT, 255);
         }
     }
 }

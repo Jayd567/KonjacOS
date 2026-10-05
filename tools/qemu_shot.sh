@@ -9,7 +9,9 @@
 #   shot NAME       screenshot to OUT_PREFIX-NAME.ppm
 #   regs NAME       CPU registers to OUT_PREFIX-NAME.txt (for hangs)
 #   moveto X Y      put the mouse at screen pixel (X, Y)
-#   click X Y       move there and left-click (dclick: double-click)
+#   click X Y       move there and left-click (dclick: double-click,
+#                   rclick: right-click)
+#   drag X1 Y1 X2 Y2  press at (X1, Y1), move to (X2, Y2), release
 #   type TEXT       type lowercase TEXT (spaces, / . - _ allowed)
 #   anything else   a raw QEMU monitor command (`sendkey ret`, ...)
 # Serial output goes to OUT_PREFIX-serial.log. Needs image.iso + disk.img.
@@ -63,7 +65,7 @@ step_move() {
     done
 }
 moveto() {
-    step_move -1000 -1000
+    step_move -2000 -2000
     step_move "$1" "$2"
 }
 
@@ -77,6 +79,8 @@ for c in "${cmds[@]}"; do
         regs\ *) mon "info registers" "$out-${c#regs }.txt" ;;
         moveto\ *) read -r _ x y <<< "$c"; moveto "$x" "$y" ;;
         click\ *) read -r _ x y <<< "$c"; moveto "$x" "$y"; sleep 0.2; mon "mouse_button 1"; sleep 0.15; mon "mouse_button 0" ;;
+        rclick\ *) read -r _ x y <<< "$c"; moveto "$x" "$y"; sleep 0.2; mon "mouse_button 2"; sleep 0.15; mon "mouse_button 0" ;;
+        drag\ *) read -r _ x1 y1 x2 y2 <<< "$c"; moveto "$x1" "$y1"; sleep 0.2; mon "mouse_button 1"; sleep 0.2; step_move $((x2 - x1)) $((y2 - y1)); sleep 0.3; mon "mouse_button 0" ;;
         dclick\ *) read -r _ x y <<< "$c"; moveto "$x" "$y"; sleep 0.2; mon "mouse_button 1"; mon "mouse_button 0"; sleep 0.05; mon "mouse_button 1"; mon "mouse_button 0" ;;
         type\ *) t="${c#type }"; for ((k=0; k<${#t}; k++)); do ch="${t:k:1}"; case "$ch" in " ") ch=spc;; "/") ch=slash;; ".") ch=dot;; "-") ch=minus;; "_") ch=shift-minus;; esac; mon "sendkey $ch"; done ;;
         *) mon "$c" ;;
