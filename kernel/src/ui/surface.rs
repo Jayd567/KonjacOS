@@ -137,6 +137,12 @@ impl<'a> Painter<'a> {
         Painter { clip: self.clip.intersect(&abs), ox: abs.x, oy: abs.y, alpha: self.alpha, s: self.s }
     }
 
+    /// A sub-painter with the same origin, clipped to `r` as well.
+    pub fn clipped(&mut self, r: Rect) -> Painter<'_> {
+        let abs = r.offset(self.ox, self.oy);
+        Painter { clip: self.clip.intersect(&abs), ox: self.ox, oy: self.oy, alpha: self.alpha, s: self.s }
+    }
+
     #[inline]
     fn scale(&self, a: u32) -> u32 {
         (a * self.alpha as u32 * 257 + 0x8000) >> 16

@@ -223,9 +223,19 @@ const INDEX: [(&str, &str, Section); 10] = [
     ("About this computer", "version kernel system uptime info", Section::System),
 ];
 
-fn contains_ignore_case(hay: &str, needle: &str) -> bool {
+pub fn contains_ignore_case(hay: &str, needle: &str) -> bool {
     let (h, n) = (hay.as_bytes(), needle.as_bytes());
     n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Settings matching `query`, for the Start menu's search: the setting's
+/// name, its section's name (what [`App::navigate`] takes) and icon.
+pub fn search(query: &str) -> Vec<(&'static str, &'static str, usize)> {
+    INDEX
+        .iter()
+        .filter(|(name, words, sec)| contains_ignore_case(name, query) || contains_ignore_case(words, query) || contains_ignore_case(sec.name(), query))
+        .map(|&(name, _, sec)| (name, sec.name(), sec.icon()))
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -631,7 +641,7 @@ impl App for SettingsApp {
         self.typing
     }
 
-    fn key(&mut self, code: u8) -> Reply {
+    fn key(&mut self, code: u8, _mods: u8) -> Reply {
         match code {
             crate::keyboard::KEY_ESC => {
                 if self.query.is_empty() {
@@ -652,6 +662,12 @@ impl App for SettingsApp {
         }
         self.hover = None;
         Reply::repaint(true)
+    }
+
+    fn navigate(&mut self, section: &str, _select: Option<&str>) {
+        if let Some(&s) = SECTIONS.iter().find(|s| s.name() == section) {
+            self.open(s);
+        }
     }
 
     fn cursor(&self, x: i32, y: i32, _w: i32, _h: i32) -> Cursor {

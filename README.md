@@ -43,10 +43,16 @@ to browse and no DOOM. For a smoother desktop, add `-accel whpx` on
 Windows, `-accel kvm` on Linux or `-accel hvf` on macOS.
 
 KonjacOS boots to the desktop with the Terminal open. Start lists every
-app; the taskbar shows the ones that are running plus any you pin
+app, and typing in it searches apps, settings and the files on the disk;
+the taskbar shows the apps that are running plus any you pin
 (right-click an app, then "Pin to Taskbar"). The "K" in the top-left
 corner has About, the system monitor, Restart and Shut Down. Typing goes
-to the shell (or to DOOM, while its window is in front).
+to whichever window is in front: the shell in the Terminal, Notepad,
+Files, or DOOM.
+
+Files opens, creates, renames, copies, moves and deletes files and
+folders, and Notepad edits text files; double-clicking a `.txt` file
+opens it there.
 
 The desktop starts empty: right-click an app, or a file or folder in
 Files, and choose "Create Shortcut" to put it there. Pins, shortcuts

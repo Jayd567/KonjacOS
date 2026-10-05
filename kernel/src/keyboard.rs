@@ -214,6 +214,7 @@ const RIGHT_SHIFT_BREAK: u8 = 0xB6;
 const EXTENDED_PREFIX: u8 = 0xE0;
 const CTRL_CODE: u8 = 0x1D;
 const ALT_CODE: u8 = 0x38;
+const CAPS_CODE: u8 = 0x3A;
 /// Left and right Super ("Windows") keys, both E0-prefixed.
 const SUPER_L_CODE: u8 = 0x5B;
 const SUPER_R_CODE: u8 = 0x5C;
@@ -232,6 +233,7 @@ static SUPER_ALONE: AtomicBool = AtomicBool::new(false);
 static ALT_TABBING: AtomicBool = AtomicBool::new(false);
 /// The desktop wants every key (a menu or the switcher is open).
 static CAPTURE: AtomicBool = AtomicBool::new(false);
+static CAPS_ON: AtomicBool = AtomicBool::new(false);
 
 // --- Keys for the desktop -----------------------------------------------------
 
@@ -250,11 +252,38 @@ pub const KEY_SUPER: u8 = 9;
 /// Alt released after an Alt+Tab.
 pub const KEY_ALT_UP: u8 = 10;
 pub const KEY_BACKSPACE: u8 = 11;
+pub const KEY_DELETE: u8 = 12;
+pub const KEY_HOME: u8 = 13;
+pub const KEY_END: u8 = 14;
+pub const KEY_PAGE_UP: u8 = 15;
+pub const KEY_PAGE_DOWN: u8 = 16;
+pub const KEY_F2: u8 = 17;
+pub const KEY_F5: u8 = 18;
 
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
 pub const MOD_SUPER: u8 = 8;
+/// Caps Lock is on.
+pub const MOD_CAPS: u8 = 16;
+
+/// The character a printable desktop key `code` (its unshifted ASCII)
+/// types with `mods` held: Shift (or Caps Lock, for letters) gives the
+/// upper row.
+pub fn typed_char(code: u8, mods: u8) -> u8 {
+    let shift = mods & MOD_SHIFT != 0;
+    if code.is_ascii_lowercase() {
+        return if shift != (mods & MOD_CAPS != 0) { code.to_ascii_uppercase() } else { code };
+    }
+    if shift {
+        if let Some(i) = SCANCODE_ASCII.iter().position(|&c| c == code) {
+            if SCANCODE_ASCII_SHIFT[i] != 0 {
+                return SCANCODE_ASCII_SHIFT[i];
+            }
+        }
+    }
+    code
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DesktopKey {
@@ -310,6 +339,9 @@ fn mods_now() -> u8 {
     if SUPER_HELD.load(Ordering::Relaxed) {
         m |= MOD_SUPER;
     }
+    if CAPS_ON.load(Ordering::Relaxed) {
+        m |= MOD_CAPS;
+    }
     m
 }
 
@@ -326,8 +358,14 @@ fn desktop_code(code: u8) -> u8 {
         0x4D => KEY_RIGHT,
         0x3E => KEY_F4,
         0x0E => KEY_BACKSPACE,
-        0x39 => b' ',
-        c if c < 0x80 && SCANCODE_ASCII[c as usize].is_ascii_alphanumeric() => SCANCODE_ASCII[c as usize],
+        0x53 => KEY_DELETE,
+        0x47 => KEY_HOME,
+        0x4F => KEY_END,
+        0x49 => KEY_PAGE_UP,
+        0x51 => KEY_PAGE_DOWN,
+        0x3C => KEY_F2,
+        0x3F => KEY_F5,
+        c if c < 0x80 && (0x20..0x7f).contains(&SCANCODE_ASCII[c as usize]) => SCANCODE_ASCII[c as usize],
         _ => 0,
     }
 }
@@ -365,6 +403,9 @@ fn desktop_filter(scancode: u8, extended: bool) -> bool {
         // The fake shifts some keyboards wrap extended keys in.
         0x2A | 0x36 if extended => return true,
         CTRL_CODE => CTRL_HELD.store(pressed, Ordering::Relaxed),
+        CAPS_CODE if pressed => {
+            CAPS_ON.fetch_xor(true, Ordering::Relaxed);
+        }
         ALT_CODE => {
             ALT_HELD.store(pressed, Ordering::Relaxed);
             if !pressed && ALT_TABBING.swap(false, Ordering::Relaxed) {

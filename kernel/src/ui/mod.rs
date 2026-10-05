@@ -10,6 +10,7 @@ mod glass;
 mod icon_ids;
 mod icons;
 mod math;
+mod notepad;
 mod settings;
 mod sketch;
 mod surface;

@@ -36,6 +36,11 @@ Added since the brief:
 | Keyboard shortcuts | `keyboard.rs` `desktop_filter` keeps shortcuts (and everything while a menu is open, via `set_capture`) away from the shell and DOOM; `Desktop::on_key` acts on them, including the Alt+Tab `Switcher` |
 | Settings | `settings.rs`: one global `Settings` with a revision counter the desktop watches (`apply_settings`); drawn gradient wallpapers; saved as `set` lines in `/DESKTOP.CFG`. The app has a sidebar of sections and a search box over an `INDEX` of settings and related words; typing reaches it through `App::wants_keys` / `App::key` |
 | Pointer shapes | `cursor.rs` (all 17 cursors from the pack, two of them animated); `Desktop::pick_cursor` picks one from the current drag or what's under the pointer, apps answer for their client area through `App::cursor` |
+| Start search | `Desktop::update_search`: apps, then `settings::search`, then files from `disk_index` (a walk of the disk taken when a search starts, capped at 3000 entries); `start_key` sends typing there, since Start captures the keyboard |
+| Window animations | `Ghost` in `desktop.rs`: minimize, restore and close take a snapshot of the window (`Desktop::snapshot` composes it alone over its backdrop, with its glass coverage as alpha) and scale/fade that between two rectangles, so the app is never resized mid-animation. A restoring window stays `hidden` until its ghost lands. Snapshot buffers are pooled at screen size so the non-coalescing heap sees one allocation size |
+| Notepad | `notepad.rs`: lines of ASCII, caret and selection anchor, undo snapshots per word; `App::request_close` lets it ask about unsaved changes before the desktop closes it, and `App::title` puts the file name in the title bar |
+| File management | `apps.rs` `Files` on `fat16.rs` `rename` / `remove` / `copy` / `create_dir`; `Action::PathChanged` tells the desktop so shortcuts follow; `FS_REVISION` makes an open Files window re-read the folder when something else changes the disk |
+| Scroll wheel | `mouse.rs` turns on IntelliMouse 4-byte packets; the desktop sends notches to the window under the pointer (`App::wheel`) |
 
 Differences from the brief:
 

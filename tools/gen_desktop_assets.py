@@ -88,6 +88,17 @@ ICONS = [
     ("STORAGE_20", "storage", 20, "regular"),
     ("LAPTOP_20", "laptop", 20, "regular"),
     ("SEARCH_20", "search", 20, "regular"),
+    ("NOTEPAD_32", "notepad", 32, "regular"),
+    ("NOTEPAD_32_FILLED", "notepad", 32, "filled"),
+    ("NOTEPAD_20", "notepad", 20, "regular"),
+    ("FOLDER_ADD_20", "folder_add", 20, "regular"),
+    ("DOCUMENT_ADD_20", "document_add", 20, "regular"),
+    ("RENAME_20", "rename", 20, "regular"),
+    ("COPY_20", "copy", 20, "regular"),
+    ("CUT_20", "cut", 20, "regular"),
+    ("PASTE_20", "clipboard_paste", 20, "regular"),
+    ("SAVE_20", "save", 20, "regular"),
+    ("WARNING_20", "warning", 20, "regular"),
 ]
 
 # Cursor pack files in `cursor::Shape` order (kernel/src/cursor.rs).

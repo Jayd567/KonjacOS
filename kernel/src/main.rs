@@ -151,7 +151,7 @@ pub extern "C" fn kstart() -> ! {
         unsafe {
             mouse::init(w, h);
         }
-        sprintln!("PS/2 mouse driver installed.");
+        sprintln!("PS/2 mouse driver installed (scroll wheel: {}).", if mouse::has_wheel() { "yes" } else { "no" });
     }
 
     unsafe {

@@ -1,18 +1,18 @@
-//! A read-only FAT16 driver, layered on `ata.rs`'s raw sector reads.
+//! A FAT16 driver, layered on `ata.rs`'s raw sector reads and writes.
 //!
 //! FAT16 was picked over a custom filesystem specifically so the disk
 //! image stays a completely ordinary FAT16 volume: it's built with real
 //! host tools (`mkfs.vfat`/`mtools`), and any FAT-aware tool -- including
 //! just mounting it on the host -- can add or inspect files on it. The
-//! driver supports 8.3 short filenames, reading (not yet writing) real
-//! VFAT long filenames, reading and writing whole files, and walking
-//! subdirectories (including a `cd`-style current-directory tracked here
-//! rather than in the shell, so any future caller besides the shell gets
-//! the same notion of "where we are"). Creating/removing directories and
-//! timestamps are still unsupported -- writes always store a zeroed
-//! date/time, which real FAT tools treat as "unknown," not an error, and
-//! every write always targets an already-existing short-name entry, never
-//! allocating new LFN entries of its own.
+//! driver supports 8.3 short filenames and real VFAT long filenames
+//! (reading them, and writing them with proper `~N` short aliases),
+//! reading and writing whole files, creating, renaming, moving, copying
+//! and deleting files and folders, and walking subdirectories (including
+//! a `cd`-style current-directory tracked here rather than in the shell,
+//! so any future caller besides the shell gets the same notion of "where
+//! we are"). Timestamps are still unsupported -- writes always store a
+//! zeroed date/time, which real FAT tools treat as "unknown," not an
+//! error.
 //!
 //! Subdirectory traversal deliberately does *not* rely on the on-disk "."
 //! and ".." entries every FAT directory has -- [`Cwd`] keeps its own
@@ -841,7 +841,9 @@ fn needs_lfn(display: &str, short: &[u8; 11]) -> bool {
         rebuilt.push('.');
         rebuilt.push_str(ext);
     }
-    !rebuilt.eq_ignore_ascii_case(display)
+    // Exact, case included: the short entry alone would show "notes.txt"
+    // as "NOTES.TXT", so a lowercase name gets an LFN entry too.
+    rebuilt != display
 }
 
 /// Builds the real, on-disk-ordered sequence of VFAT LFN entries for
@@ -975,79 +977,161 @@ fn write_named_entry(l: Layout, run: &[(u32, usize)], lfn_entries: &[[u8; 32]], 
     Ok(())
 }
 
-/// Finds where a directory entry named `target` (an already-8.3-formatted
-/// name) either already lives, or should be written: an exact name match
-/// (for overwriting), a deleted/free slot (for a new entry), or -- for a
-/// subdirectory that's completely full of live entries and has never hit
-/// its own free-slot marker -- a freshly allocated and linked cluster to
-/// extend it with. The root directory can't be extended this way (it's a
-/// fixed-size region, a FAT16 quirk), so a full root directory is an
-/// error instead.
-///
-/// Returns `(sector_lba, offset_within_sector, existing_entry)` --
-/// `existing_entry` is `Some` only for the exact-name-match case.
-fn locate_slot(l: Layout, location: DirLocation, target: &[u8; 11]) -> Result<(u32, usize, Option<DirEntry>), &'static str> {
-    let mut free_slot: Option<(u32, usize)> = None;
-    let mut cluster = match location {
-        DirLocation::Root => None,
-        DirLocation::Cluster(c) => Some(c),
-    };
+/// A live entry found by its display name, with where it sits on disk:
+/// the LFN entries naming it (if any, in disk order) and its 8.3 entry.
+/// What deleting, renaming and overwriting need -- all three have to
+/// touch every slot that belongs to the name, not just the short entry,
+/// or orphaned LFN entries would later attach themselves to whatever new
+/// short entry reuses the slot after them.
+struct Found {
+    entry: DirEntry,
+    /// The 8.3 entry's raw bytes.
+    raw: [u8; DIR_ENTRY_SIZE],
+    lfn_slots: Vec<(u32, usize)>,
+    slot: (u32, usize),
+}
 
-    loop {
-        let sector_range: Vec<u32> = match (location, cluster) {
-            (DirLocation::Root, _) => (0..l.root_dir_sectors).map(|i| l.root_dir_start_lba + i).collect(),
-            (DirLocation::Cluster(_), Some(c)) => (0..l.sectors_per_cluster).map(|s| cluster_to_lba(l, c) + s).collect(),
-            (DirLocation::Cluster(_), None) => Vec::new(),
-        };
+/// Every live entry in `location` with its slots -- [`list_dir_at`]'s
+/// walk, keeping track of where each entry came from.
+fn scan_dir(location: DirLocation) -> Result<Vec<Found>, &'static str> {
+    let l = layout()?;
+    let mut out = Vec::new();
+    let mut lfn_parts: Vec<(u8, [u16; 13])> = Vec::new();
+    let mut lfn_slots: Vec<(u32, usize)> = Vec::new();
 
-        for lba in sector_range {
-            let buf = read_sector(lba)?;
-            for (idx, chunk) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
-                let first = chunk[0];
-                let offset = idx * DIR_ENTRY_SIZE;
-                if first == ENTRY_FREE {
-                    return Ok((free_slot.map(|s| s.0).unwrap_or(lba), free_slot.map(|s| s.1).unwrap_or(offset), None));
-                }
-                if first == ENTRY_DELETED {
-                    if free_slot.is_none() {
-                        free_slot = Some((lba, offset));
-                    }
-                    continue;
-                }
-                if first == ENTRY_DOT || is_skippable_attr(chunk[11]) {
-                    continue;
-                }
-                if chunk[0..11] == target[..] {
-                    return Ok((lba, offset, Some(decode_entry(chunk))));
-                }
+    'sectors: for lba in DirSectors::new(l, location) {
+        let buf = read_sector(lba)?;
+        for (idx, chunk) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
+            let first = chunk[0];
+            if first == ENTRY_FREE {
+                break 'sectors;
             }
-        }
-
-        // Ran off the end of this directory's allocated space without
-        // finding a free slot or the name. Root can't grow; a
-        // subdirectory can, by chaining on a fresh cluster.
-        match location {
-            DirLocation::Root => {
-                return match free_slot {
-                    Some((lba, off)) => Ok((lba, off, None)),
-                    None => Err("root directory is full"),
-                };
+            if chunk[11] == ATTR_LFN && first != ENTRY_DELETED {
+                lfn_parts.push((first & 0x1F, decode_lfn_chars(chunk)));
+                lfn_slots.push((lba, idx * DIR_ENTRY_SIZE));
+                continue;
             }
-            DirLocation::Cluster(_) => {
-                if let Some((lba, off)) = free_slot {
-                    return Ok((lba, off, None));
-                }
-                let last = cluster.expect("Cluster(_) location always has Some(cluster) here");
-                let new_cluster = allocate_cluster(l)?;
-                set_fat_entry(l, last, new_cluster as u16)?;
-                zero_cluster(l, new_cluster)?;
-                cluster = Some(new_cluster);
-                // Loop again: the freshly zeroed cluster's first entry
-                // (offset 0, first byte 0x00) will be picked up as the
-                // free slot on the next pass.
+            if first == ENTRY_DELETED || first == ENTRY_DOT || is_skippable_attr(chunk[11]) {
+                lfn_parts.clear();
+                lfn_slots.clear();
+                continue;
             }
+            let mut entry = decode_entry(chunk);
+            if !lfn_parts.is_empty() {
+                entry.name = reconstruct_long_name(&mut lfn_parts);
+            }
+            let mut raw = [0u8; DIR_ENTRY_SIZE];
+            raw.copy_from_slice(chunk);
+            out.push(Found { entry, raw, lfn_slots: core::mem::take(&mut lfn_slots), slot: (lba, idx * DIR_ENTRY_SIZE) });
+            lfn_parts.clear();
         }
     }
+    Ok(out)
+}
+
+/// The live entry called `name` (case-insensitively, by its long name if
+/// it has one) in `location`.
+fn find_slots(location: DirLocation, name: &str) -> Result<Option<Found>, &'static str> {
+    Ok(scan_dir(location)?.into_iter().find(|f| f.entry.name.eq_ignore_ascii_case(name)))
+}
+
+/// Marks every slot of `f` deleted.
+fn delete_slots(f: &Found) -> Result<(), &'static str> {
+    for &(lba, offset) in f.lfn_slots.iter().chain(core::iter::once(&f.slot)) {
+        let mut buf = read_sector(lba)?;
+        buf[offset] = ENTRY_DELETED;
+        write_sector(lba, &buf)?;
+    }
+    Ok(())
+}
+
+/// Characters FAT allows in an 8.3 name besides letters and digits.
+fn short_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'()-@^_`{}~".contains(&b)
+}
+
+/// Whether `name` can be a file name at all: not empty, not `.`/`..`,
+/// and none of the characters FAT (and Windows) forbid.
+fn valid_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed == name
+        && name != "."
+        && name != ".."
+        && name.len() <= 200
+        && name.bytes().all(|b| b >= 0x20 && b < 0x7f && !b"\\/:*?\"<>|".contains(&b))
+}
+
+/// Picks the 8.3 short name for a new entry `display` in `location`: the
+/// name itself, uppercased, if it fits 8.3 and isn't taken; otherwise a
+/// `BASIS~N.EXT` alias the way Windows makes them, with `N` the first
+/// number no other entry uses. (Before this, a long name's short entry
+/// was just its truncation, so "New Text Document.txt" and "New Text
+/// Document 2.txt" both became `NEW TEXT.TXT` -- and writing the second
+/// silently overwrote the first.) `except` is a slot whose own short
+/// name doesn't count as taken: the entry being renamed.
+fn make_short_name(location: DirLocation, display: &str, except: Option<(u32, usize)>) -> Result<[u8; 11], &'static str> {
+    let taken: Vec<[u8; 11]> = scan_dir(location)?
+        .into_iter()
+        .filter(|f| Some(f.slot) != except)
+        .map(|f| {
+            let mut s = [0u8; 11];
+            s.copy_from_slice(&f.raw[0..11]);
+            s
+        })
+        .collect();
+
+    let (base, ext) = match display.rsplit_once('.') {
+        Some((b, e)) if !b.is_empty() => (b, e),
+        _ => (display, ""),
+    };
+    let fits = base.len() <= 8 && ext.len() <= 3 && base.bytes().all(short_name_char) && ext.bytes().all(short_name_char);
+    let plain = to_short_name(display);
+    if fits && !taken.contains(&plain) {
+        return Ok(plain);
+    }
+
+    let clean = |s: &str, n: usize| -> Vec<u8> {
+        s.bytes()
+            .filter(|&b| b != b' ' && b != b'.')
+            .map(|b| if short_name_char(b) { b.to_ascii_uppercase() } else { b'_' })
+            .take(n)
+            .collect()
+    };
+    let basis = clean(base, 6);
+    let ext = clean(ext, 3);
+    for n in 1..1000u32 {
+        let mut tail = [0u8; 4];
+        let mut len = 0;
+        let mut k = n;
+        while k > 0 {
+            tail[len] = b'0' + (k % 10) as u8;
+            k /= 10;
+            len += 1;
+        }
+        let keep = basis.len().min(7 - len);
+        let mut short = [b' '; 11];
+        short[..keep].copy_from_slice(&basis[..keep]);
+        short[keep] = b'~';
+        for i in 0..len {
+            short[keep + 1 + i] = tail[len - 1 - i];
+        }
+        short[8..8 + ext.len()].copy_from_slice(&ext);
+        if !taken.contains(&short) {
+            return Ok(short);
+        }
+    }
+    Err("too many similar names in this folder")
+}
+
+/// Writes a new directory entry for `display` into `location`: the 8.3
+/// entry `entry` (whose name bytes become `short`), preceded by real LFN
+/// entries whenever the short name alone wouldn't give `display` back.
+fn place_entry(l: Layout, location: DirLocation, display: &str, short: [u8; 11], mut entry: [u8; DIR_ENTRY_SIZE]) -> Result<(), &'static str> {
+    entry[0..11].copy_from_slice(&short);
+    let lfn_entries = if needs_lfn(display, &short) { build_lfn_entries(display, &short) } else { Vec::new() };
+    let run = locate_slot_run(l, location, lfn_entries.len() + 1)?;
+    write_named_entry(l, &run, &lfn_entries, &entry)
 }
 
 /// Creates a file at `path` with contents `data`, overwriting it (and
@@ -1060,28 +1144,33 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
         return Err("not a file");
     }
     let dir_location = resolve_dir(dir_part)?;
-    let target = to_short_name(filename);
-
-    let (lba, offset, existing) = locate_slot(l, dir_location, &target)?;
-
+    let existing = find_slots(dir_location, filename)?;
     if let Some(existing) = &existing {
-        if existing.is_dir {
+        if existing.entry.is_dir {
             return Err("is a directory");
         }
-        if existing.cluster >= 2 {
-            free_chain(l, existing.cluster)?;
-        }
+    } else if !valid_name(filename) {
+        return Err("invalid file name");
     }
 
-    // Allocate and write the new cluster chain, linking each cluster to
-    // the next as we go.
+    // Allocate and write the new cluster chain first, linking each cluster
+    // to the next as we go -- the old contents are only freed once the
+    // new ones are safely on disk.
     let mut first_cluster: u32 = 0;
     let mut prev_cluster: Option<u32> = None;
     let cluster_bytes = (l.sectors_per_cluster * l.bytes_per_sector) as usize;
     let mut offset_in_data = 0usize;
 
     while offset_in_data < data.len() {
-        let cluster = allocate_cluster(l)?;
+        let cluster = match allocate_cluster(l) {
+            Ok(c) => c,
+            Err(e) => {
+                if first_cluster >= 2 {
+                    free_chain(l, first_cluster)?;
+                }
+                return Err(e);
+            }
+        };
         if first_cluster == 0 {
             first_cluster = cluster;
         }
@@ -1106,29 +1195,29 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
     // either, since first_cluster just stays 0 (FAT's own "no data" case).
 
     let mut entry = [0u8; DIR_ENTRY_SIZE];
-    entry[0..11].copy_from_slice(&target);
     entry[11] = 0; // Attributes: a plain file.
     entry[26] = (first_cluster & 0xFF) as u8;
     entry[27] = ((first_cluster >> 8) & 0xFF) as u8;
     entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
 
-    // Overwriting an existing entry reuses its exact slot (and whatever
-    // LFN entries -- correct or not, see needs_lfn's own doc comment for
-    // this narrow scope's one known gap -- already precede it) unchanged.
-    // A genuinely new entry gets real LFN entries first when its name
-    // doesn't fit 8.3 -- seebuild_lfn_entries'/needs_lfn's own doc
-    // comments for why this matters: without them, a real caller that
-    // wrote a long name here could never find it again by that name.
-    if existing.is_some() || !needs_lfn(filename, &target) {
-        let mut sector_buf = read_sector(lba)?;
-        sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
-        write_sector(lba, &sector_buf)?;
-    } else {
-        let lfn_entries = build_lfn_entries(filename, &target);
-        let run = locate_slot_run(l, dir_location, lfn_entries.len() + 1)?;
-        write_named_entry(l, &run, &lfn_entries, &entry)?;
+    match existing {
+        // Overwriting reuses the entry's own slot, name and LFN entries.
+        Some(existing) => {
+            entry[0..11].copy_from_slice(&existing.raw[0..11]);
+            entry[11] = existing.raw[11];
+            let (lba, offset) = existing.slot;
+            let mut sector_buf = read_sector(lba)?;
+            sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
+            write_sector(lba, &sector_buf)?;
+            if existing.entry.cluster >= 2 {
+                free_chain(l, existing.entry.cluster)?;
+            }
+        }
+        None => {
+            let short = make_short_name(dir_location, filename, None)?;
+            place_entry(l, dir_location, filename, short, entry)?;
+        }
     }
-
     Ok(())
 }
 
@@ -1152,13 +1241,14 @@ pub fn create_dir(path: &str) -> Result<(), &'static str> {
     if dirname.is_empty() {
         return Err("not a directory name");
     }
+    if !valid_name(dirname) {
+        return Err("invalid folder name");
+    }
     let dir_location = resolve_dir(dir_part)?;
-    let target = to_short_name(dirname);
-
-    let (lba, offset, existing) = locate_slot(l, dir_location, &target)?;
-    if existing.is_some() {
+    if find_slots(dir_location, dirname)?.is_some() {
         return Err("already exists");
     }
+    let short = make_short_name(dir_location, dirname, None)?;
 
     let new_cluster = allocate_cluster(l)?;
     zero_cluster(l, new_cluster)?;
@@ -1192,7 +1282,6 @@ pub fn create_dir(path: &str) -> Result<(), &'static str> {
     write_sector(cluster_to_lba(l, new_cluster), &dot_sector)?;
 
     let mut entry = [0u8; DIR_ENTRY_SIZE];
-    entry[0..11].copy_from_slice(&target);
     entry[11] = ATTR_DIRECTORY;
     entry[26] = (new_cluster & 0xFF) as u8;
     entry[27] = ((new_cluster >> 8) & 0xFF) as u8;
@@ -1200,51 +1289,204 @@ pub fn create_dir(path: &str) -> Result<(), &'static str> {
     // report a directory's own size as 0, same as this driver's readers
     // (decode_entry) already assume.
 
-    // Real LFN entries first when `dirname` doesn't fit 8.3 -- see
-    // `needs_lfn`/`build_lfn_entries`'s own doc comments for why this
-    // matters: real `java -version`'s own `mkdir("/tmp/hsperfdata_root")`
-    // is exactly the real case that exposed this (see
-    // docs/java-version.md) -- without this, the directory this call
-    // just created could never be found again by its own real name.
-    if !needs_lfn(dirname, &target) {
-        let mut sector_buf = read_sector(lba)?;
-        sector_buf[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
-        write_sector(lba, &sector_buf)?;
-    } else {
-        let lfn_entries = build_lfn_entries(dirname, &target);
-        let run = locate_slot_run(l, dir_location, lfn_entries.len() + 1)?;
-        write_named_entry(l, &run, &lfn_entries, &entry)?;
-    }
-
-    Ok(())
+    // Real LFN entries first when `dirname` doesn't fit 8.3 -- real `java
+    // -version`'s own `mkdir("/tmp/hsperfdata_root")` is exactly the real
+    // case that exposed the need (see docs/java-version.md): without them,
+    // the directory this call just created could never be found again by
+    // its own real name.
+    place_entry(l, dir_location, dirname, short, entry)
 }
 
 /// Deletes a file at `path`: frees its cluster chain and marks its
-/// directory entry deleted. Directories aren't supported (there's no
-/// `rmdir` here, deliberately -- removing a non-empty directory safely
-/// needs recursion this driver doesn't have yet).
+/// directory entries deleted. Refuses directories -- [`remove`] deletes
+/// those, contents and all.
 pub fn remove_file(path: &str) -> Result<(), &'static str> {
     let l = layout()?;
     let (dir_part, filename) = split_path(path);
     if filename.is_empty() {
         return Err("not a file");
     }
-    let dir_location = resolve_dir(dir_part)?;
-    let target = to_short_name(filename);
-
-    let (lba, offset, existing) = locate_slot(l, dir_location, &target)?;
-    let existing = existing.ok_or("no such file")?;
-    if existing.is_dir {
+    let found = find_slots(resolve_dir(dir_part)?, filename)?.ok_or("no such file")?;
+    if found.entry.is_dir {
         return Err("is a directory (rmdir not supported)");
     }
-    if existing.cluster >= 2 {
-        free_chain(l, existing.cluster)?;
+    if found.entry.cluster >= 2 {
+        free_chain(l, found.entry.cluster)?;
+    }
+    delete_slots(&found)
+}
+
+/// Frees directory `cluster` and everything in it, all the way down.
+/// There's no need to mark the entries inside deleted: the clusters that
+/// hold them are freed along with everything else.
+fn delete_tree(l: Layout, cluster: u32, depth: u32) -> Result<(), &'static str> {
+    if depth > 32 {
+        return Err("folders nested too deeply");
+    }
+    for f in scan_dir(DirLocation::Cluster(cluster))? {
+        let child = f.entry.cluster;
+        if child < 2 || child == cluster {
+            continue;
+        }
+        if f.entry.is_dir {
+            delete_tree(l, child, depth + 1)?;
+        } else {
+            free_chain(l, child)?;
+        }
+    }
+    free_chain(l, cluster)
+}
+
+/// Deletes the file or folder at `path` (a folder with everything in it).
+pub fn remove(path: &str) -> Result<(), &'static str> {
+    let l = layout()?;
+    let (dir_part, name) = split_path(path);
+    if name.is_empty() {
+        return Err("can't delete the root folder");
+    }
+    let found = find_slots(resolve_dir(dir_part)?, name)?.ok_or("no such file or directory")?;
+    delete_slots(&found)?;
+    let cluster = found.entry.cluster;
+    if found.entry.is_dir && cluster >= 2 {
+        delete_tree(l, cluster, 0)?;
+        // The shell can't stay inside a folder that no longer exists.
+        let mut cwd = CWD.lock();
+        if cwd.stack.iter().any(|&(_, c)| c == cluster) {
+            cwd.stack.clear();
+            cwd.location = DirLocation::Root;
+        }
+    } else if cluster >= 2 {
+        free_chain(l, cluster)?;
+    }
+    Ok(())
+}
+
+/// The parent of directory `cluster`, from its `..` entry.
+fn parent_of(l: Layout, cluster: u32) -> Result<DirLocation, &'static str> {
+    let buf = read_sector(cluster_to_lba(l, cluster))?;
+    let dotdot = &buf[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE];
+    if dotdot[0] != b'.' || dotdot[1] != b'.' {
+        return Err("damaged folder");
+    }
+    let parent = u16::from_le_bytes([dotdot[26], dotdot[27]]) as u32;
+    Ok(if parent < 2 { DirLocation::Root } else { DirLocation::Cluster(parent) })
+}
+
+/// Renames and/or moves the file or folder at `from` to `to` (a full
+/// path; its folder must exist). The data stays where it is -- only the
+/// directory entry moves, plus a moved folder's `..` entry.
+pub fn rename(from: &str, to: &str) -> Result<(), &'static str> {
+    let l = layout()?;
+    let (src_dir, src_name) = split_path(from);
+    let (dst_dir, dst_name) = split_path(to);
+    if src_name.is_empty() || dst_name.is_empty() {
+        return Err("not a file or folder name");
+    }
+    if !valid_name(dst_name) {
+        return Err("invalid name");
+    }
+    let src_loc = resolve_dir(src_dir)?;
+    let dst_loc = resolve_dir(dst_dir)?;
+    let found = find_slots(src_loc, src_name)?.ok_or("no such file or directory")?;
+    if let Some(other) = find_slots(dst_loc, dst_name)? {
+        if other.slot != found.slot {
+            return Err("something with that name is already there");
+        }
+        if other.entry.name == dst_name {
+            return Ok(()); // Nothing to do.
+        }
+    }
+    let moving_dir = found.entry.is_dir && found.entry.cluster >= 2;
+    if moving_dir && dst_loc != src_loc {
+        // Walk up from the destination: reaching the folder being moved
+        // means it would end up inside itself.
+        let mut at = dst_loc;
+        let mut steps = 0;
+        while let DirLocation::Cluster(c) = at {
+            if c == found.entry.cluster {
+                return Err("can't move a folder into itself");
+            }
+            at = parent_of(l, c)?;
+            steps += 1;
+            if steps > 64 {
+                return Err("folders nested too deeply");
+            }
+        }
     }
 
-    let mut buf = read_sector(lba)?;
-    buf[offset] = ENTRY_DELETED;
-    write_sector(lba, &buf)?;
+    let except = (dst_loc == src_loc).then_some(found.slot);
+    let short = make_short_name(dst_loc, dst_name, except)?;
+    place_entry(l, dst_loc, dst_name, short, found.raw)?;
+    delete_slots(&found)?;
 
+    if moving_dir {
+        if dst_loc != src_loc {
+            let lba = cluster_to_lba(l, found.entry.cluster);
+            let mut buf = read_sector(lba)?;
+            let parent = match dst_loc {
+                DirLocation::Root => 0,
+                DirLocation::Cluster(c) => c,
+            };
+            buf[DIR_ENTRY_SIZE + 26] = (parent & 0xFF) as u8;
+            buf[DIR_ENTRY_SIZE + 27] = ((parent >> 8) & 0xFF) as u8;
+            write_sector(lba, &buf)?;
+        }
+        // The shell's path names the folder by its old name; if it moved,
+        // the path is wrong altogether.
+        let mut cwd = CWD.lock();
+        if let Some(pos) = cwd.stack.iter().position(|&(_, c)| c == found.entry.cluster) {
+            if dst_loc == src_loc {
+                cwd.stack[pos].0 = String::from(dst_name);
+            } else {
+                cwd.stack.clear();
+                cwd.location = DirLocation::Root;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copies the file or folder at `from` (a folder with everything in it)
+/// to the new path `to`, which must not exist yet.
+pub fn copy(from: &str, to: &str) -> Result<(), &'static str> {
+    if stat_path(to).is_ok() {
+        return Err("something with that name is already there");
+    }
+    let (is_dir, _) = stat_path(from)?;
+    if !is_dir {
+        let data = read_file(from)?;
+        return write_file(to, &data);
+    }
+    let mut inside = String::from(from);
+    inside.push('/');
+    if to.len() > inside.len() && to[..inside.len()].eq_ignore_ascii_case(&inside) {
+        return Err("can't copy a folder into itself");
+    }
+    copy_dir(from, to, 0)
+}
+
+fn copy_dir(from: &str, to: &str, depth: u32) -> Result<(), &'static str> {
+    if depth > 32 {
+        return Err("folders nested too deeply");
+    }
+    create_dir(to)?;
+    for e in list_dir(from)? {
+        let join = |base: &str| {
+            let mut p = String::from(base);
+            if !p.ends_with('/') {
+                p.push('/');
+            }
+            p.push_str(&e.name);
+            p
+        };
+        let (src, dst) = (join(from), join(to));
+        if e.is_dir {
+            copy_dir(&src, &dst, depth + 1)?;
+        } else {
+            let data = read_file(&src)?;
+            write_file(&dst, &data)?;
+        }
+    }
     Ok(())
 }
 

@@ -23,6 +23,11 @@
 //!   in menus and Start.
 //! - **Right-click menus** almost everywhere: the desktop, icons, the
 //!   taskbar, title bars, and whatever apps offer for their own content.
+//! - **Start** has a search box: just start typing to find apps,
+//!   settings, and files and folders anywhere on the disk.
+//! - **Window animations**: windows slide up as they open, shrink into
+//!   their taskbar button when minimized and grow back out of it when
+//!   restored, and fade away when closed (see [`Ghost`]).
 //!
 //! ## Rendering
 //!
@@ -49,7 +54,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use super::apps::{open_command, Action, App, AppKind, ContextItem, MouseEvent, Reply, accent, TEXT, TEXT_DIM};
+use super::apps::{base_name, file_icon, join_path, opener, parent_path, Action, App, AppKind, ContextItem, MouseEvent, Opener, Reply, accent, TEXT, TEXT_DIM};
 use super::assets;
 use super::font;
 use super::glass::{self, Glass, GlassStyle, Scratch};
@@ -76,6 +81,8 @@ const MAX_ITEMS: usize = 1 + AppKind::ALL.len();
 /// so a snap preview fits just beneath the window being dragged).
 const L_DESK: u16 = 1;
 const L_WIN: u16 = 10;
+/// Window animations (see [`Ghost`]): above every window, below the bars.
+const L_GHOST: u16 = 140;
 const L_TOPBAR: u16 = 150;
 const L_TASKBAR: u16 = 200;
 const L_START: u16 = 300;
@@ -129,6 +136,8 @@ struct Window {
     glass: Glass,
     open: Spring,
     btn_hover: Option<Btn>,
+    /// Not drawn yet: it's still growing out of the taskbar (a [`Ghost`]).
+    hidden: bool,
 }
 
 impl Window {
@@ -186,6 +195,7 @@ enum Cmd {
     /// One of the target app's own context-menu entries.
     App(u32),
     OpenIcon(usize),
+    EditIcon(usize),
     ShowInFiles(usize),
     RemoveIcon(usize),
     ShortcutTo(AppKind),
@@ -269,16 +279,91 @@ struct StartMenu {
     glass: Glass,
     /// One of the `START_*` hit codes, or a tile index.
     hover: Option<usize>,
+    /// What's typed into the search box.
+    query: String,
+    results: Vec<Found>,
+    /// The highlighted result (Enter opens it).
+    sel: usize,
+    /// Every file and folder on the disk, gathered when a search starts.
+    index: Option<Vec<(String, bool)>>,
 }
 
-const START_W: i32 = 620;
-const START_H: i32 = 236;
+/// A Start menu search result.
+#[derive(Clone)]
+enum Found {
+    App(AppKind),
+    /// A setting: its name, its section, the section's icon.
+    Setting(&'static str, &'static str, usize),
+    /// A file or folder (`true`).
+    Path(String, bool),
+}
+
+const START_W: i32 = 680;
+const START_H: i32 = 300;
 const TILE_W: i32 = 76;
 const TILE_H: i32 = 80;
 const TILE_GAP: i32 = 6;
+const START_TILES_Y: i32 = 94;
+const START_RESULTS_Y: i32 = 66;
+const RESULT_H: i32 = 32;
+const MAX_RESULTS: usize = 5;
 /// Start menu hit codes after the app tiles (`0..AppKind::ALL.len()`).
 const START_POWER: usize = 100;
 const START_USER: usize = 101;
+const START_SEARCH: usize = 102;
+/// Search result `i` is `START_RESULT + i`.
+const START_RESULT: usize = 200;
+/// How much of the disk Start's search looks through.
+const INDEX_MAX: usize = 3000;
+const INDEX_DEPTH: usize = 8;
+
+/// Most window animations running at once (each holds a snapshot).
+const MAX_GHOSTS: usize = 4;
+
+/// A window animating on its own: closing or minimizing after the window
+/// itself has gone, or restoring before it reappears. It's a snapshot of
+/// the window as last drawn, scaled and faded between two rectangles --
+/// cheap to draw every frame, and the app never sees the in-between
+/// sizes (a Terminal shouldn't reflow itself 20 times on the way to the
+/// taskbar).
+struct Ghost {
+    /// The snapshot, `w x h`, with the window's coverage in the top byte.
+    px: Vec<u32>,
+    w: i32,
+    h: i32,
+    from: Rect,
+    to: Rect,
+    alpha: (f32, f32),
+    /// Progress, 0 to 1, and how much each tick adds.
+    t: f32,
+    speed: f32,
+    /// Accelerate away (minimize) rather than settle into place.
+    ease_in: bool,
+    /// The hidden window to show once this finishes.
+    reveal: Option<AppKind>,
+}
+
+impl Ghost {
+    fn eased(&self) -> f32 {
+        let t = self.t.clamp(0.0, 1.0);
+        if self.ease_in {
+            t * t * t
+        } else {
+            1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
+        }
+    }
+
+    fn rect(&self) -> Rect {
+        let e = self.eased();
+        let lerp = |a: i32, b: i32| a + ((b - a) as f32 * e) as i32;
+        Rect::new(lerp(self.from.x, self.to.x), lerp(self.from.y, self.to.y), lerp(self.from.w, self.to.w).max(1), lerp(self.from.h, self.to.h).max(1))
+    }
+
+    fn opacity(&self) -> u32 {
+        let (a, b) = self.alpha;
+        ((a + (b - a) * self.eased()).clamp(0.0, 1.0) * 255.0) as u32
+    }
+}
 
 struct Tooltip {
     text: String,
@@ -383,6 +468,16 @@ pub struct Desktop {
     capture: bool,
     settings_rev: u64,
     wallpaper: u8,
+    ghosts: Vec<Ghost>,
+    /// Snapshot buffers kept for the next animation (always screen-sized,
+    /// so the heap sees the same allocation every time).
+    ghost_pool: Vec<Vec<u32>>,
+    /// While taking a snapshot: compose only up to this window.
+    render_upto: Option<usize>,
+    /// Which half of its blink Start's search caret was last drawn in.
+    caret_phase: u64,
+    /// The apps with windows, in the order they were opened.
+    launched: Vec<AppKind>,
 }
 
 impl Desktop {
@@ -398,7 +493,7 @@ impl Desktop {
             scratch: Scratch::new(((w / 2 + 64) * (h / 2 + 64)) as usize),
             windows: Vec::new(),
             taskbar: Glass::default(),
-            start: StartMenu { open: false, spring: Spring::new(0.0), glass: Glass::default(), hover: None },
+            start: StartMenu { open: false, spring: Spring::new(0.0), glass: Glass::default(), hover: None, query: String::new(), results: Vec::new(), sel: 0, index: None },
             menu: None,
             tooltip: None,
             pinned,
@@ -433,6 +528,11 @@ impl Desktop {
             capture: false,
             settings_rev: settings::revision(),
             wallpaper: prefs.wallpaper,
+            ghosts: Vec::new(),
+            ghost_pool: Vec::new(),
+            render_upto: None,
+            caret_phase: 0,
+            launched: Vec::new(),
         };
         let wa = d.work_area();
         icons::tidy(&mut d.icons, wa);
@@ -458,12 +558,13 @@ impl Desktop {
     }
 
     /// The apps on the taskbar after Start: the pinned ones, then any
-    /// others that are running.
+    /// others that are running, in the order they were started (not the
+    /// windows' stacking order, so buttons don't shuffle as focus moves).
     fn task_apps(&self) -> Vec<AppKind> {
         let mut apps = self.pinned.clone();
-        for w in &self.windows {
-            if !apps.contains(&w.kind) {
-                apps.push(w.kind);
+        for &k in &self.launched {
+            if !apps.contains(&k) {
+                apps.push(k);
             }
         }
         apps
@@ -527,7 +628,15 @@ impl Desktop {
     fn tile_rect(i: usize) -> Rect {
         let n = AppKind::ALL.len() as i32;
         let x0 = (START_W - n * TILE_W - (n - 1) * TILE_GAP) / 2;
-        Rect::new(x0 + i as i32 * (TILE_W + TILE_GAP), 48, TILE_W, TILE_H)
+        Rect::new(x0 + i as i32 * (TILE_W + TILE_GAP), START_TILES_Y, TILE_W, TILE_H)
+    }
+
+    fn search_rect() -> Rect {
+        Rect::new(20, 16, START_W - 40, 38)
+    }
+
+    fn result_rect(i: usize) -> Rect {
+        Rect::new(14, START_RESULTS_Y + i as i32 * RESULT_H, START_W - 28, RESULT_H - 2)
     }
 
     fn power_rect() -> Rect {
@@ -546,6 +655,12 @@ impl Desktop {
         }
         if Self::user_rect().contains(lx, ly) {
             return Some(START_USER);
+        }
+        if Self::search_rect().contains(lx, ly) {
+            return Some(START_SEARCH);
+        }
+        if !self.start.query.is_empty() {
+            return (0..self.start.results.len()).find(|&i| Self::result_rect(i).contains(lx, ly)).map(|i| START_RESULT + i);
         }
         (0..AppKind::ALL.len()).find(|&i| Self::tile_rect(i).contains(lx, ly))
     }
@@ -582,7 +697,7 @@ impl Desktop {
         (0..self.windows.len()).rev().find(|&i| {
             let w = &self.windows[i];
             let d = w.drawn();
-            !w.minimized && d.contains(x, y) && w.glass.shape.hit(x - d.x, y - d.y)
+            !w.minimized && !w.hidden && d.contains(x, y) && w.glass.shape.hit(x - d.x, y - d.y)
         })
     }
 
@@ -592,7 +707,7 @@ impl Desktop {
     fn edge_at(&self, x: i32, y: i32) -> Option<(usize, u8)> {
         for i in (0..self.windows.len()).rev() {
             let w = &self.windows[i];
-            if w.minimized {
+            if w.minimized || w.hidden {
                 continue;
             }
             let d = w.drawn();
@@ -842,8 +957,9 @@ impl Desktop {
         // Occlusion: if a window's opaque content (DOOM's frame, Sketch's
         // paper) covers this whole region, nothing beneath it can show --
         // start there.
+        let upto = self.render_upto.unwrap_or(usize::MAX);
         let first = self.windows.iter().enumerate().rev().find_map(|(i, w)| {
-            if w.minimized || w.opacity() < 255 {
+            if i > upto || w.minimized || w.hidden || w.opacity() < 255 {
                 return None;
             }
             let d = w.drawn();
@@ -852,7 +968,7 @@ impl Desktop {
             (r.intersect(&clip) == clip).then_some(i)
         });
 
-        let Desktop { bb, wall, scratch, windows, taskbar, start, menu, tooltip, hover_alpha, topbar_hover, icons: desk_icons, icon_hover, mx, my, clock, date, cpu, ram, cursor_frame, snap, switcher, .. } = self;
+        let Desktop { bb, wall, scratch, windows, taskbar, start, menu, tooltip, hover_alpha, topbar_hover, icons: desk_icons, icon_hover, mx, my, clock, date, cpu, ram, cursor_frame, snap, switcher, ghosts, now, .. } = self;
         let (sw, sh) = (bb.w, bb.h);
 
         if first.is_none() {
@@ -868,6 +984,9 @@ impl Desktop {
         }
 
         for (i, w) in windows.iter_mut().enumerate() {
+            if i > upto {
+                break;
+            }
             if first.is_some_and(|f| i < f) {
                 continue;
             }
@@ -876,7 +995,7 @@ impl Desktop {
                 sp.glass.render(bb, sp.rect, &glass::MENU, clip, op, scratch);
                 bb.painter(clip).fill_squircle(sp.rect, 30.0, TEXT, (sp.alpha * 22.0) as u8);
             }
-            if w.minimized {
+            if w.minimized || w.hidden {
                 continue;
             }
             if first == Some(i) {
@@ -901,6 +1020,13 @@ impl Desktop {
             let (cw, ch) = (d.w, d.h - TITLE_H);
             let mut cp = wp.sub(Rect::new(0, TITLE_H, cw, ch));
             w.app.paint(&mut cp, cw, ch);
+        }
+        if upto != usize::MAX {
+            return; // A snapshot: just the window and what's under it.
+        }
+
+        for g in ghosts.iter() {
+            paint_ghost(bb, clip, g);
         }
 
         paint_topbar(&mut bb.painter(clip), &topbar, active_name, *topbar_hover, menu.as_ref().filter(|m| m.id != MenuId::Context).map(|m| m.id));
@@ -943,7 +1069,7 @@ impl Desktop {
                 let mut p = bb.painter(clip);
                 p.alpha = content;
                 let mut sp = p.sub(Rect::new(start_drawn.x, start_drawn.y, START_W, START_H));
-                paint_start(&mut sp, start.hover);
+                paint_start(&mut sp, start, *now);
             }
         }
 
@@ -1004,10 +1130,7 @@ impl Desktop {
 
     fn open_app(&mut self, kind: AppKind) {
         if let Some(i) = self.window_of(kind) {
-            if self.windows[i].minimized {
-                self.windows[i].minimized = false;
-            }
-            self.focus(i);
+            self.restore(i);
             return;
         }
         let mut app = kind.create();
@@ -1020,8 +1143,9 @@ impl Desktop {
         app.resized(w, h - TITLE_H);
         let mut open = Spring::new(0.0);
         open.target = 1.0;
-        self.windows.push(Window { kind, app, rect: Rect::new(x, y, w, h), restore: None, minimized: false, glass: Glass::default(), open, btn_hover: None });
+        self.windows.push(Window { kind, app, rect: Rect::new(x, y, w, h), restore: None, minimized: false, glass: Glass::default(), open, btn_hover: None, hidden: false });
         let i = self.windows.len() - 1;
+        self.launched.push(kind);
         self.launching_until = self.now + LAUNCH_TICKS;
         self.damage_window(i);
         self.focus_changed();
@@ -1055,6 +1179,8 @@ impl Desktop {
     /// Bookkeeping after window `i` left `windows`: a grab on it ends, a
     /// grab on a window above it follows the index shift.
     fn window_removed(&mut self, i: usize) {
+        let open: Vec<AppKind> = self.windows.iter().map(|w| w.kind).collect();
+        self.launched.retain(|k| open.contains(k));
         match &mut self.grab {
             Grab::Move { win, .. } | Grab::Resize { win, .. } if *win == i => self.grab = Grab::None,
             Grab::Move { win, .. } | Grab::Resize { win, .. } if *win > i => *win -= 1,
@@ -1063,17 +1189,141 @@ impl Desktop {
         self.focus_changed();
     }
 
+    /// Closes window `i` -- unless its app has unsaved work to ask about
+    /// first (it closes itself afterwards with [`Action::Close`]).
     fn close_window(&mut self, i: usize) {
+        if !self.windows[i].app.request_close() {
+            let i = self.restore(i);
+            self.damage_client(i);
+            return;
+        }
+        self.force_close(i);
+    }
+
+    fn force_close(&mut self, i: usize) {
+        if !self.windows[i].minimized && !self.windows[i].hidden {
+            // Fade out, shrinking a little towards the centre.
+            if let Some((px, r)) = self.snapshot(i) {
+                let to = Rect::new(r.x + r.w * 4 / 100, r.y + r.h * 4 / 100, r.w * 92 / 100, r.h * 92 / 100);
+                self.add_ghost(px, r, r, to, (1.0, 0.0), 14, false, None);
+            }
+        }
         self.damage_window(i);
         let mut w = self.windows.remove(i);
         w.app.closed();
         self.window_removed(i);
     }
 
+    /// Where app `kind`'s button is on the taskbar.
+    fn task_slot(&self, kind: AppKind) -> Option<Rect> {
+        self.task_apps().iter().position(|&k| k == kind).map(|p| self.item_rect(p + 1))
+    }
+
+    /// A small rectangle centred on taskbar button `slot`, shaped like `r`:
+    /// where a minimizing window ends up (and a restoring one starts).
+    fn slot_target(slot: Rect, r: Rect) -> Rect {
+        let w = 40;
+        let h = (w * r.h / r.w.max(1)).clamp(16, 48);
+        Rect::new(slot.x + (slot.w - w) / 2, slot.y + (slot.h - h) / 2, w, h)
+    }
+
     fn minimize(&mut self, i: usize) {
+        if !self.windows[i].hidden {
+            if let (Some(slot), Some((px, r))) = (self.task_slot(self.windows[i].kind), self.snapshot(i)) {
+                self.add_ghost(px, r, r, Self::slot_target(slot, r), (1.0, 0.15), 24, true, None);
+            }
+        }
         self.damage_window(i);
         self.windows[i].minimized = true;
+        self.windows[i].hidden = false;
         self.focus_changed();
+    }
+
+    /// Brings window `i` forward, growing it back out of its taskbar
+    /// button if it was minimized. Returns its new index.
+    fn restore(&mut self, i: usize) -> usize {
+        if !self.windows[i].minimized {
+            return self.focus(i);
+        }
+        self.windows[i].minimized = false;
+        let i = self.focus(i);
+        let kind = self.windows[i].kind;
+        // Its glass has been off screen: recompute it for the snapshot.
+        self.windows[i].glass.invalidate();
+        if let Some(slot) = self.task_slot(kind) {
+            if let Some((px, r)) = self.snapshot(i) {
+                self.add_ghost(px, r, Self::slot_target(slot, r), r, (0.15, 1.0), 20, false, Some(kind));
+                self.windows[i].hidden = true;
+            }
+        }
+        i
+    }
+
+    /// A snapshot of window `i` as it's drawn right now over whatever is
+    /// beneath it (nothing above it, not even the pointer): the pixels,
+    /// with its glass shape's coverage in the top byte, and where it is.
+    fn snapshot(&mut self, i: usize) -> Option<(Vec<u32>, Rect)> {
+        if self.ghosts.len() >= MAX_GHOSTS {
+            return None;
+        }
+        let s = self.screen();
+        let d = self.windows[i].drawn();
+        let r = d.intersect(&s);
+        if r.is_empty() {
+            return None;
+        }
+        // Compose everything the window's glass samples, then the window.
+        let region = d.expand(glass::WINDOW.pad()).intersect(&s);
+        self.render_upto = Some(i);
+        self.render(region);
+        self.render_upto = None;
+        // The back buffer there is now missing whatever is above the
+        // window: recompose it before it's shown.
+        self.damage(region, L_RENDER_ONLY);
+
+        let mut px = self.ghost_pool.pop().unwrap_or_default();
+        px.clear();
+        px.reserve_exact((s.w * s.h) as usize);
+        let cov = &self.windows[i].glass.shape.cov;
+        let full = cov.len() != (d.w * d.h) as usize;
+        for y in r.y..r.bottom() {
+            for x in r.x..r.right() {
+                let a = if full { 255 } else { cov[((y - d.y) * d.w + (x - d.x)) as usize] as u32 };
+                px.push((a << 24) | (self.bb.px[(y * s.w + x) as usize] & 0x00ff_ffff));
+            }
+        }
+        Some((px, r))
+    }
+
+    /// Starts a window animation of snapshot `px` (taken of screen area
+    /// `shot`) from `from` to `to` over `ticks` ticks.
+    #[allow(clippy::too_many_arguments)]
+    fn add_ghost(&mut self, px: Vec<u32>, shot: Rect, from: Rect, to: Rect, alpha: (f32, f32), ticks: u32, ease_in: bool, reveal: Option<AppKind>) {
+        let g = Ghost { px, w: shot.w, h: shot.h, from, to, alpha, t: 0.0, speed: 1.0 / ticks as f32, ease_in, reveal };
+        self.damage(from.union(&to), L_GHOST);
+        self.ghosts.push(g);
+    }
+
+    fn step_ghosts(&mut self) {
+        let mut i = 0;
+        while i < self.ghosts.len() {
+            let before = self.ghosts[i].rect();
+            self.ghosts[i].t += self.ghosts[i].speed;
+            let after = self.ghosts[i].rect();
+            self.damage(before.union(&after), L_GHOST);
+            if self.ghosts[i].t < 1.0 {
+                i += 1;
+                continue;
+            }
+            let g = self.ghosts.remove(i);
+            if let Some(w) = g.reveal.and_then(|k| self.window_of(k)) {
+                self.windows[w].hidden = false;
+                self.damage_window(w);
+            }
+            if self.ghost_pool.len() < MAX_GHOSTS {
+                self.ghost_pool.push(g.px);
+            }
+        }
     }
 
     fn toggle_maximize(&mut self, i: usize) {
@@ -1281,10 +1531,10 @@ impl Desktop {
             b'i' if sup => self.launch(AppKind::Settings),
             b't' if ctrl && alt => self.launch(AppKind::Terminal),
             _ if self.menu.is_some() => self.menu_key(k.code),
-            _ if self.start.open => self.start_key(k.code),
+            _ if self.start.open => self.start_key(k.code, k.mods),
             _ => {
                 if let Some(i) = self.active().filter(|&i| self.windows[i].app.wants_keys()) {
-                    let reply = self.windows[i].app.key(k.code);
+                    let reply = self.windows[i].app.key(k.code, k.mods);
                     self.apply_reply(i, reply);
                 }
             }
@@ -1321,36 +1571,105 @@ impl Desktop {
         }
     }
 
-    /// Arrows, Enter, Esc and type-to-find in the Start menu.
-    fn start_key(&mut self, code: u8) {
-        let n = AppKind::ALL.len();
-        let cur = self.start.hover.filter(|&h| h < n);
-        let hover = match code {
-            keyboard::KEY_ESC => {
+    /// The Start menu's keys: typing searches; arrows move through the
+    /// results (or the app tiles), Enter opens, Esc clears or closes.
+    fn start_key(&mut self, code: u8, mods: u8) {
+        use keyboard::*;
+        let r = self.start_rect();
+        let searching = !self.start.query.is_empty();
+        match code {
+            KEY_ESC if searching => {
+                self.start.query.clear();
+                self.update_search();
+            }
+            KEY_ESC => {
                 self.close_start();
                 return;
             }
-            keyboard::KEY_RIGHT | keyboard::KEY_DOWN => Some(cur.map_or(0, |c| (c + 1) % n)),
-            keyboard::KEY_LEFT | keyboard::KEY_UP => Some(cur.map_or(n - 1, |c| (c + n - 1) % n)),
-            keyboard::KEY_ENTER => {
-                if let Some(i) = cur {
+            KEY_BACKSPACE => {
+                self.start.query.pop();
+                self.update_search();
+            }
+            KEY_UP | KEY_DOWN if searching => {
+                let n = self.start.results.len();
+                if n > 0 {
+                    self.start.sel = if code == KEY_DOWN { (self.start.sel + 1) % n } else { (self.start.sel + n - 1) % n };
+                }
+            }
+            KEY_ENTER if searching => {
+                if let Some(f) = self.start.results.get(self.start.sel).cloned() {
                     self.close_start();
-                    self.launch(AppKind::ALL[i]);
+                    self.open_found(f);
                 }
                 return;
             }
-            c if c.is_ascii_alphanumeric() => {
-                // The next app (after the highlighted one) starting with
-                // that letter.
-                let from = cur.map_or(0, |c| c + 1);
-                (0..n).map(|k| (from + k) % n).find(|&i| AppKind::ALL[i].name().as_bytes()[0].to_ascii_lowercase() == c)
+            KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_ENTER => {
+                let n = AppKind::ALL.len();
+                let cur = self.start.hover.filter(|&h| h < n);
+                if code == KEY_ENTER {
+                    if let Some(i) = cur {
+                        self.close_start();
+                        self.launch(AppKind::ALL[i]);
+                    }
+                    return;
+                }
+                let next = if matches!(code, KEY_RIGHT | KEY_DOWN) { cur.map_or(0, |c| (c + 1) % n) } else { cur.map_or(n - 1, |c| (c + n - 1) % n) };
+                self.start.hover = Some(next);
+            }
+            c if (0x20..0x7f).contains(&c) && mods & (MOD_CTRL | MOD_ALT) == 0 => {
+                if self.start.query.len() < 40 && !(c == b' ' && self.start.query.is_empty()) {
+                    self.start.query.push(typed_char(c, mods) as char);
+                    self.update_search();
+                }
             }
             _ => return,
-        };
-        if hover.is_some() && hover != self.start.hover {
-            self.start.hover = hover;
-            let r = self.start_rect();
-            self.damage(r, L_START);
+        }
+        self.damage(r, L_START);
+    }
+
+    /// Re-runs Start's search for the current query: matching apps first,
+    /// then settings, then files and folders (names starting with the
+    /// query before names merely containing it).
+    fn update_search(&mut self) {
+        self.start.sel = 0;
+        self.start.hover = None;
+        self.start.results.clear();
+        let q = String::from(self.start.query.trim());
+        if q.is_empty() {
+            return;
+        }
+        let starts = |name: &str| name.len() >= q.len() && name[..q.len()].eq_ignore_ascii_case(&q);
+        let mut found: Vec<Found> = Vec::new();
+        let mut apps: Vec<AppKind> = AppKind::ALL.into_iter().filter(|k| settings::contains_ignore_case(k.name(), &q)).collect();
+        apps.sort_by_key(|k| !starts(k.name()));
+        found.extend(apps.into_iter().map(Found::App));
+        for (name, section, ic) in settings::search(&q).into_iter().take(2) {
+            found.push(Found::Setting(name, section, ic));
+        }
+        if self.start.index.is_none() {
+            self.start.index = Some(disk_index());
+        }
+        if let Some(index) = &self.start.index {
+            let mut files: Vec<&(String, bool)> = index.iter().filter(|(p, _)| settings::contains_ignore_case(base_name(p), &q)).collect();
+            files.sort_by_key(|(p, _)| !starts(base_name(p)));
+            found.extend(files.into_iter().take(MAX_RESULTS).map(|(p, d)| Found::Path(p.clone(), *d)));
+        }
+        found.truncate(MAX_RESULTS);
+        self.start.results = found;
+    }
+
+    fn open_found(&mut self, f: Found) {
+        match f {
+            Found::App(kind) => self.launch(kind),
+            Found::Setting(_, section, _) => {
+                self.launch(AppKind::Settings);
+                if let Some(i) = self.window_of(AppKind::Settings) {
+                    self.windows[i].app.navigate(section, None);
+                    self.damage_client(i);
+                }
+            }
+            Found::Path(path, true) => self.open_files_at(&path, None),
+            Found::Path(path, false) => self.open_file(&path),
         }
     }
 
@@ -1404,8 +1723,7 @@ impl Desktop {
         let kind = self.switcher.as_ref().map(|sw| sw.apps[sw.sel]);
         self.close_switcher();
         if let Some(i) = kind.and_then(|k| self.window_of(k)) {
-            self.windows[i].minimized = false;
-            self.focus(i);
+            self.restore(i);
         }
     }
 
@@ -1445,8 +1763,7 @@ impl Desktop {
         }
         match self.window_of(kind) {
             Some(i) if self.windows[i].minimized => {
-                self.windows[i].minimized = false;
-                self.focus(i);
+                self.restore(i);
             }
             Some(i) if Some(i) == self.active() => self.minimize(i),
             Some(i) => {
@@ -1462,8 +1779,7 @@ impl Desktop {
         if kind == AppKind::Doom {
             match self.window_of(kind) {
                 Some(i) => {
-                    self.windows[i].minimized = false;
-                    self.focus(i);
+                    self.restore(i);
                 }
                 None => self.taskbar_click(kind),
             }
@@ -1488,16 +1804,92 @@ impl Desktop {
 
     fn apply_reply(&mut self, i: usize, reply: Reply) {
         if reply.repaint {
-            self.damage_client(i);
+            // The whole window: the title can change too (Notepad's file
+            // name and unsaved-changes star).
+            let d = self.windows[i].drawn();
+            self.damage(d, win_level(i));
         } else if let Some(r) = reply.damage {
             let d = self.windows[i].drawn();
             let client = Rect::new(d.x, d.y + TITLE_H, d.w, d.h - TITLE_H);
             self.damage(r.offset(client.x, client.y).intersect(&client), win_level(i));
         }
+        let kind = self.windows[i].kind;
         match reply.action {
             Some(Action::Shell(cmd)) => self.shell_command(&cmd),
             Some(Action::Shortcut { path, is_dir }) => self.add_shortcut(if is_dir { Target::Dir(path) } else { Target::File(path) }),
+            Some(Action::Open(path)) => self.open_file(&path),
+            Some(Action::Edit(path)) => self.edit_file(&path),
+            Some(Action::PathChanged { from, to }) => self.path_changed(&from, to.as_deref()),
+            Some(Action::Close) => {
+                if let Some(i) = self.window_of(kind) {
+                    self.force_close(i);
+                }
+            }
             None => {}
+        }
+    }
+
+    /// Opens file `path` with whatever handles it: Notepad for text, the
+    /// Terminal for programs, DOOM for a WAD.
+    fn open_file(&mut self, path: &str) {
+        match opener(path) {
+            Some(Opener::Notepad) => self.edit_file(path),
+            Some(Opener::Shell(cmd)) => self.shell_command(&cmd),
+            Some(Opener::Doom) => self.launch(AppKind::Doom),
+            None => {}
+        }
+    }
+
+    fn edit_file(&mut self, path: &str) {
+        self.open_app(AppKind::Notepad);
+        if let Some(i) = self.window_of(AppKind::Notepad) {
+            self.windows[i].app.open_path(path);
+            self.damage_window(i);
+        }
+    }
+
+    /// Shortcuts follow a file or folder that moved (or vanish with one
+    /// that was deleted), including anything inside a moved folder.
+    fn path_changed(&mut self, from: &str, to: Option<&str>) {
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.icons.len() {
+            let (path, is_dir) = match &self.icons[i].target {
+                Target::File(p) => (p.clone(), false),
+                Target::Dir(p) => (p.clone(), true),
+                Target::App(_) => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let same = path.eq_ignore_ascii_case(from);
+            let inside = path.len() > from.len() && path[..from.len()].eq_ignore_ascii_case(from) && path.as_bytes()[from.len()] == b'/';
+            if !same && !inside {
+                i += 1;
+                continue;
+            }
+            self.damage_icon(i);
+            changed = true;
+            match to {
+                None => {
+                    self.icons.remove(i);
+                    continue;
+                }
+                Some(to) => {
+                    let mut moved = String::from(to);
+                    moved.push_str(&path[from.len()..]);
+                    let target = if is_dir { Target::Dir(moved) } else { Target::File(moved) };
+                    let (col, row, sel) = (self.icons[i].col, self.icons[i].row, self.icons[i].selected);
+                    self.icons[i] = Icon::new(target, col, row);
+                    self.icons[i].selected = sel;
+                    self.damage_icon(i);
+                }
+            }
+            i += 1;
+        }
+        if changed {
+            self.icon_hover = None;
+            self.save();
         }
     }
 
@@ -1522,13 +1914,7 @@ impl Desktop {
         match self.icons[i].target.clone() {
             Target::App(kind) => self.launch(kind),
             Target::Dir(path) => self.open_files_at(&path, None),
-            Target::File(path) => {
-                if path.to_ascii_lowercase().ends_with(".wad") {
-                    self.launch(AppKind::Doom);
-                } else if let Some(cmd) = open_command(&path) {
-                    self.shell_command(&cmd);
-                }
-            }
+            Target::File(path) => self.open_file(&path),
         }
     }
 
@@ -1648,6 +2034,11 @@ impl Desktop {
                 }
             }
             Cmd::OpenIcon(i) => self.open_icon(i),
+            Cmd::EditIcon(i) => {
+                if let Target::File(path) = self.icons[i].target.clone() {
+                    self.edit_file(&path);
+                }
+            }
             Cmd::ShowInFiles(i) => self.show_icon_in_files(i),
             Cmd::RemoveIcon(i) => self.remove_icon(i),
             Cmd::ShortcutTo(kind) => self.add_shortcut(Target::App(kind)),
@@ -1767,6 +2158,10 @@ impl Desktop {
         self.start.spring.snap(0.0);
         self.start.spring.target = 1.0;
         self.start.hover = None;
+        self.start.query.clear();
+        self.start.results.clear();
+        // Look at the disk afresh for this search.
+        self.start.index = None;
         self.damage(self.start_rect().expand(glass::MENU.reach()), L_START);
         self.damage(self.item_rect(0), L_TASKBAR);
     }
@@ -1835,6 +2230,19 @@ impl Desktop {
         }
         if pressed & mouse::RIGHT_BUTTON != 0 && self.grab == Grab::None {
             self.on_right_press();
+        }
+        let notches = mouse::take_wheel();
+        if notches != 0 && self.menu.is_none() && !self.start.open {
+            // The wheel scrolls whatever window is under the pointer,
+            // focused or not.
+            if let Some(i) = self.window_at(x, y) {
+                let d = self.windows[i].drawn();
+                let (cw, ch) = self.windows[i].client_size();
+                if y - d.y >= TITLE_H {
+                    let reply = self.windows[i].app.wheel(notches, x - d.x, y - d.y - TITLE_H, cw, ch);
+                    self.apply_reply(i, reply);
+                }
+            }
         }
     }
 
@@ -2057,6 +2465,13 @@ impl Desktop {
                         self.close_start();
                         self.launch(AppKind::About);
                     }
+                    Some(START_SEARCH) => {}
+                    Some(i) if i >= START_RESULT => {
+                        if let Some(f) = self.start.results.get(i - START_RESULT).cloned() {
+                            self.close_start();
+                            self.open_found(f);
+                        }
+                    }
                     Some(i) => {
                         self.close_start();
                         self.launch(AppKind::ALL[i]);
@@ -2241,8 +2656,8 @@ impl Desktop {
                     }
                     Target::Dir(_) => (alloc::vec![item("Open", Cmd::OpenIcon(i)), item("Show in Files", Cmd::ShowInFiles(i))], None),
                     Target::File(path) => {
-                        let can_open = open_command(path).is_some();
-                        (alloc::vec![item_if("Open", Cmd::OpenIcon(i), can_open), item("Show in Files", Cmd::ShowInFiles(i))], None)
+                        let can_open = opener(path).is_some();
+                        (alloc::vec![item_if("Open", Cmd::OpenIcon(i), can_open), item("Edit in Notepad", Cmd::EditIcon(i)), item("Show in Files", Cmd::ShowInFiles(i))], None)
                     }
                 };
                 items.push(SEPARATOR);
@@ -2311,6 +2726,7 @@ impl Desktop {
         if self.start.open && self.start_rect().contains(x, y) {
             return match self.start_hit(x, y) {
                 Some(START_USER) => Cursor::Person,
+                Some(START_SEARCH) => Cursor::Text,
                 Some(_) => Cursor::Hand,
                 None => Cursor::Arrow,
             };
@@ -2411,6 +2827,7 @@ impl Desktop {
     }
 
     fn animate(&mut self) {
+        self.step_ghosts();
         for i in 0..self.windows.len() {
             if !self.windows[i].open.settled() {
                 self.damage_window(i);
@@ -2449,6 +2866,13 @@ impl Desktop {
                 let r = t.rect;
                 self.damage(r, L_TOOLTIP);
             }
+        }
+
+        // The search box's caret blinks.
+        if self.start.open && self.now / 53 != self.caret_phase {
+            self.caret_phase = self.now / 53;
+            let r = Self::search_rect().offset(self.start_rect().x, self.start_rect().y);
+            self.damage(r, L_START);
         }
 
         if self.start.open && !self.start.spring.settled() {
@@ -2586,8 +3010,10 @@ fn paint_chrome(p: &mut Painter, w: &Window, active: bool) {
     let a = if active { 255 } else { 165 };
     let (iw, ih, m) = assets::icon(w.kind.small_icon());
     p.draw_mask(22, (TITLE_H - ih) / 2, iw, ih, m, TEXT, a);
-    let title = w.kind.name();
-    p.text_shadowed(&font::UI_BOLD, 52, (TITLE_H - font::UI_BOLD.line_height()) / 2, title, TEXT, a);
+    let title = w.app.title();
+    let title = title.as_deref().unwrap_or(w.kind.name());
+    let room = w.btn_rect(Btn::Min).x - 12;
+    p.clipped(Rect::new(0, 0, room, TITLE_H)).text_shadowed(&font::UI_BOLD, 52, (TITLE_H - font::UI_BOLD.line_height()) / 2, title, TEXT, a);
     for b in [Btn::Min, Btn::Max, Btn::Close] {
         let r = w.btn_rect(b);
         if w.btn_hover == Some(b) {
@@ -2641,17 +3067,65 @@ fn paint_tray(p: &mut Painter, tb: Rect, clock: &str, date: &str, cpu: &str, ram
     }
 }
 
-fn paint_start(p: &mut Painter, hover: Option<usize>) {
-    p.text_shadowed(&font::UI_BOLD, 24, 18, "Apps", TEXT, 255);
-    for (i, kind) in AppKind::ALL.iter().enumerate() {
-        let r = Desktop::tile_rect(i);
-        if hover == Some(i) {
-            p.fill_squircle(r, 12.0, TEXT, 34);
+fn paint_start(p: &mut Painter, start: &StartMenu, now: u64) {
+    let hover = start.hover;
+    let sr = Desktop::search_rect();
+    p.fill_squircle(sr, 13.0, rgb(0, 0, 0), 90);
+    p.fill_rect(Rect::new(sr.x + 14, sr.bottom() - 2, sr.w - 28, 2), accent(), 255);
+    let (iw, ih, m) = assets::icon(icon::SEARCH_20);
+    p.draw_mask(sr.x + 12, sr.y + (sr.h - ih) / 2, iw, ih, m, TEXT_DIM, 255);
+    let ty = sr.y + (sr.h - font::UI.line_height()) / 2;
+    let tx = sr.x + 42;
+    let end = if start.query.is_empty() {
+        p.text(&font::UI, tx, ty, "Type to search apps, settings and files", TEXT_DIM, 190);
+        tx
+    } else {
+        tx + p.text(&font::UI, tx, ty, &start.query, TEXT, 255)
+    };
+    // The search box always has the keyboard while Start is open.
+    if now / 53 % 2 == 0 {
+        p.fill_rect(Rect::new(end + 1, sr.y + 10, 2, sr.h - 20), accent(), 255);
+    }
+
+    if !start.query.is_empty() {
+        if start.results.is_empty() {
+            p.text(&font::UI, 30, START_RESULTS_Y + 10, "Nothing found. Try another name.", TEXT_DIM, 255);
         }
-        let (iw, ih, m) = assets::icon(kind.taskbar_icons().1);
-        p.draw_mask(r.x + (r.w - iw) / 2, r.y + 12, iw, ih, m, accent(), 255);
-        let label = kind.short_name();
-        p.text(&font::SMALL, r.x + (r.w - font::SMALL.width(label)) / 2, r.y + 54, label, TEXT, 255);
+        for (i, f) in start.results.iter().enumerate() {
+            let r = Desktop::result_rect(i);
+            if i == start.sel {
+                p.fill_squircle(r, 10.0, accent(), 70);
+            } else if hover == Some(START_RESULT + i) {
+                p.fill_squircle(r, 10.0, TEXT, 30);
+            }
+            let (ic, label, detail): (usize, &str, String) = match f {
+                Found::App(k) => (k.small_icon(), k.name(), String::from("App")),
+                Found::Setting(name, section, ic) => {
+                    let mut d = String::from("Settings > ");
+                    d.push_str(section);
+                    (*ic, name, d)
+                }
+                Found::Path(path, is_dir) => (if *is_dir { icon::FOLDER_20_FILLED } else { file_icon(path) }, base_name(path), String::from(parent_path(path))),
+            };
+            let (iw, ih, m) = assets::icon(ic);
+            p.draw_mask(r.x + 12, r.y + (r.h - ih) / 2, iw, ih, m, accent(), 255);
+            let ly = r.y + (r.h - font::UI.line_height()) / 2;
+            let dw = font::SMALL.width(&detail).min(260);
+            p.clipped(Rect::new(r.x, r.y, r.w - dw - 30, r.h)).text(&font::UI, r.x + 44, ly, label, TEXT, 255);
+            p.clipped(Rect::new(r.right() - dw - 16, r.y, dw + 4, r.h)).text(&font::SMALL, r.right() - 14 - dw, ly + 2, &detail, TEXT_DIM, 255);
+        }
+    } else {
+        p.text_shadowed(&font::UI_BOLD, 24, START_TILES_Y - 26, "Apps", TEXT, 255);
+        for (i, kind) in AppKind::ALL.iter().enumerate() {
+            let r = Desktop::tile_rect(i);
+            if hover == Some(i) {
+                p.fill_squircle(r, 12.0, TEXT, 34);
+            }
+            let (iw, ih, m) = assets::icon(kind.taskbar_icons().1);
+            p.draw_mask(r.x + (r.w - iw) / 2, r.y + 12, iw, ih, m, accent(), 255);
+            let label = kind.short_name();
+            p.text(&font::SMALL, r.x + (r.w - font::SMALL.width(label)) / 2, r.y + 54, label, TEXT, 255);
+        }
     }
     p.fill_rect(Rect::new(20, START_H - 62, START_W - 40, 1), TEXT, 36);
 
@@ -2707,6 +3181,56 @@ fn paint_menu(p: &mut Painter, m: &Menu) {
         p.text_shadowed(&font::UI, 20, y + (MENU_ITEM_H - font::UI.line_height()) / 2, item.label, color, alpha);
         y += MENU_ITEM_H;
     }
+}
+
+/// Draws a window animation: its snapshot scaled into its current
+/// rectangle (nearest pixel -- it's moving too fast for anything better
+/// to show), faded.
+fn paint_ghost(bb: &mut Surface, clip: Rect, g: &Ghost) {
+    let r = g.rect();
+    let op = g.opacity();
+    let c = r.intersect(&clip).intersect(&bb.bounds());
+    if c.is_empty() || op == 0 {
+        return;
+    }
+    let bw = bb.w;
+    for y in c.y..c.bottom() {
+        let sy = ((y - r.y) * g.h / r.h).min(g.h - 1);
+        let row = (sy * g.w) as usize;
+        for x in c.x..c.right() {
+            let sx = ((x - r.x) * g.w / r.w).min(g.w - 1);
+            let px = g.px[row + sx as usize];
+            let a = (px >> 24) * op / 255;
+            if a != 0 {
+                let i = (y * bw + x) as usize;
+                bb.px[i] = blend(bb.px[i], px & 0x00ff_ffff, a);
+            }
+        }
+    }
+}
+
+/// Every file and folder on the disk (up to [`INDEX_MAX`] of them, and
+/// [`INDEX_DEPTH`] folders deep), for Start's search.
+fn disk_index() -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut dirs = alloc::vec![String::from("/")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(list) = crate::fat16::list_dir(&dir) else { continue };
+        for e in list {
+            if e.name == "." || e.name == ".." {
+                continue;
+            }
+            let path = join_path(&dir, &e.name);
+            if e.is_dir && path.matches('/').count() < INDEX_DEPTH {
+                dirs.push(path.clone());
+            }
+            out.push((path, e.is_dir));
+            if out.len() >= INDEX_MAX {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 fn paint_cursor(bb: &mut Surface, clip: Rect, mx: i32, my: i32, img: &cursor::Image, frame: u16) {

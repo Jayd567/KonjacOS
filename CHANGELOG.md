@@ -38,11 +38,26 @@ ready-to-boot images.
     Super+E (Files), Super+I (Settings), Ctrl+Alt+T (Terminal), and
     arrows/Enter/Esc in menus and Start.
   - Tooltips on the tray's memory, CPU and clock.
-  - Apps: Terminal (the shell), Files, Monitor, DOOM, Sketch (a small
-    drawing app), Settings and About. Settings is split into sections
-    (Personalization, Mouse, Date & time, Storage, System) with a search
-    box: wallpaper, accent colour, glass strength, pointer and
+  - Search in Start: start typing to find apps, settings, and files and
+    folders anywhere on the disk; arrows and Enter open a result.
+  - Window animations: windows shrink into their taskbar button when
+    minimized, grow back out of it when restored, and fade away when
+    closed.
+  - Scroll-wheel support, for Files and Notepad.
+  - Apps: Terminal (the shell), Files, Notepad, Monitor, DOOM, Sketch (a
+    small drawing app), Settings and About. Settings is split into
+    sections (Personalization, Mouse, Date & time, Storage, System) with
+    a search box: wallpaper, accent colour, glass strength, pointer and
     double-click speed, 12/24-hour clock, disk space and system info.
+  - Notepad edits text files on the disk: selection with the mouse or
+    Shift, cut/copy/paste, undo/redo, Save and Save As, line numbers. It
+    asks before closing (or opening another file) with unsaved changes.
+    Opening a text file anywhere on the desktop opens it here.
+  - Files manages the disk: New Folder, New Text Document, Rename (in
+    place), Delete (after asking), Cut, Copy and Paste, from the toolbar,
+    the right-click menu or the keyboard (Delete, F2, Ctrl+C/X/V,
+    Ctrl+Shift+N, Enter, Backspace). Desktop shortcuts follow a file that
+    is renamed or moved, and disappear when it is deleted.
 - The `doom` command and the taskbar both open DOOM in a desktop window.
 
 ### Changed
@@ -52,6 +67,10 @@ ready-to-boot images.
 
 ### Fixed
 
+- Writing a new file whose long name shared its first eight letters with
+  another file's (`New Text Document.txt`, `New Text Document 2.txt`)
+  overwrote that file. New long names now get unique `~1`-style short
+  names, and deleting a file also removes its long-name entries.
 - A task that yielded could resume with interrupts disabled and never be
   preempted again, freezing the machine.
 - The kernel heap could deadlock when a task was preempted mid-allocation
