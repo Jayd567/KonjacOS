@@ -1,5 +1,5 @@
 //! The data disks, however they're attached: virtio-blk when QEMU
-//! provides them (DMA, up to 64 KiB per request -- see `virtio_blk.rs`),
+//! provides them (DMA, up to 1 MiB per request -- see `virtio_blk.rs`),
 //! otherwise the one ATA PIO disk (`ata.rs`, one sector per command).
 //! Disks are numbered from 0; each filesystem finds its own by what's on
 //! it (`fat16::init`, `kfs::mount`), and reads and writes runs of sectors
@@ -68,8 +68,8 @@ pub fn read(disk: usize, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
     debug_assert!(buf.len() % SECTOR_SIZE == 0);
     match BACKEND.load(Ordering::Relaxed) {
         VIRTIO => {
-            virtio_blk::read(disk, lba, buf)?;
-            count_io(buf.len().div_ceil(virtio_blk::MAX_BYTES) as u64, buf.len());
+            let requests = virtio_blk::read(disk, lba, buf)?;
+            count_io(requests, buf.len());
         }
         _ => {
             if disk != 0 {
@@ -79,6 +79,45 @@ pub fn read(disk: usize, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
                 let sector: &mut [u8; SECTOR_SIZE] = chunk.try_into().unwrap();
                 unsafe { ata::read_sector(lba as u32 + i as u32, sector) }?;
                 count_io(1, SECTOR_SIZE);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads each `(lba, buffer)` of `items` from disk `disk`, calling
+/// `done(i, &buffer)` as each arrives. With virtio several are in flight
+/// at once, and `done` runs while the rest are still on their way (KFS
+/// checks checksums there); with ATA they go one after another.
+pub fn read_many(disk: usize, items: &mut [(u64, &mut [u8])], done: &mut dyn FnMut(usize, &[u8])) -> Result<(), &'static str> {
+    match BACKEND.load(Ordering::Relaxed) {
+        VIRTIO => {
+            let bytes = items.iter().map(|(_, b)| b.len()).sum();
+            let requests = virtio_blk::read_many(disk, items, done)?;
+            count_io(requests, bytes);
+        }
+        _ => {
+            for (i, (lba, buf)) in items.iter_mut().enumerate() {
+                read(disk, *lba, buf)?;
+                done(i, buf);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes each `(lba, data)` of `items` to disk `disk`, several at once
+/// where the disk allows.
+pub fn write_many(disk: usize, items: &[(u64, &[u8])]) -> Result<(), &'static str> {
+    match BACKEND.load(Ordering::Relaxed) {
+        VIRTIO => {
+            let bytes = items.iter().map(|(_, b)| b.len()).sum();
+            let requests = virtio_blk::write_many(disk, items)?;
+            count_io(requests, bytes);
+        }
+        _ => {
+            for (lba, buf) in items {
+                write(disk, *lba, buf)?;
             }
         }
     }
@@ -100,8 +139,8 @@ pub fn write(disk: usize, lba: u64, buf: &[u8]) -> Result<(), &'static str> {
     debug_assert!(buf.len() % SECTOR_SIZE == 0);
     match BACKEND.load(Ordering::Relaxed) {
         VIRTIO => {
-            virtio_blk::write(disk, lba, buf)?;
-            count_io(buf.len().div_ceil(virtio_blk::MAX_BYTES) as u64, buf.len());
+            let requests = virtio_blk::write(disk, lba, buf)?;
+            count_io(requests, buf.len());
         }
         _ => {
             if disk != 0 {

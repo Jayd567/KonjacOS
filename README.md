@@ -96,7 +96,7 @@ ps                 list running tasks
 | `ps`, `kill <id>` | List or stop running tasks |
 | `doom` | Play DOOM |
 | `meminfo`, `uptime` | Show memory use and uptime |
-| `diskbench` | Time reads, writes and deletes on each disk |
+| `diskbench` | Time reads (whole, in 4 KiB pieces, random), writes and deletes on each disk |
 | `verify [folder]` | Read every file and report any that are damaged |
 | `kfstest [steps] [seed] [keep] [fill]` | Random writes, renames and deletes on KonjacFS, each checked; `fill` also fills the disk |
 | `reboot`, `halt` | Restart or stop the machine (needs the admin password) |

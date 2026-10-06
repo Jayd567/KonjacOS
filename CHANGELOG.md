@@ -4,6 +4,39 @@ Each version here is published on the
 [Releases](https://github.com/Jayd567/KonjacOS/releases) page with
 ready-to-boot images.
 
+## Unreleased
+
+### Changed
+
+- KonjacFS is now faster than FAT16 at nearly everything (`diskbench`,
+  median of 5 runs, first-time reads):
+
+  | | KonjacFS | FAT16 |
+  |---|---:|---:|
+  | Read DOOM1.WAD (4 MB) | 9.0 ms | 13.7 ms |
+  | Read it in 4 KiB pieces | 31.1 ms | 160.1 ms |
+  | 256 random 4 KiB reads | 21.0 ms | 137.1 ms |
+  | Write 1 MiB | 6.5 ms | 37.1 ms |
+  | List a folder x20 | 0.9 ms | 2.9 ms |
+
+  Reading DOOM1.WAD took 30.6 ms before. Deleting is the exception
+  (2.1 against 1.2 ms), because a KonjacFS delete is safely on the disk
+  when it returns and a FAT16 one isn't.
+- How:
+  - `memcpy` and `memset` were the real bottleneck: `rep movsb` runs
+    byte by byte under QEMU without acceleration, 36 MB/s. They now copy
+    64 bytes at a time through SSE2 (1.1 GB/s) and fill with `rep stosq`.
+    Every file read and every frame the desktop draws goes through them.
+  - virtio-blk hands the disk the caller's own memory instead of copying
+    through a 64 KiB buffer, moves up to 1 MiB per request, and keeps 4
+    requests in flight, which QEMU works on in parallel.
+  - KonjacFS reads neighbouring extents together and checks each one's
+    checksum while the rest are still arriving; small reads go through
+    an 8 MiB cache with 256 KiB of read-ahead; a file's extents and a
+    commit's blocks are written together.
+- `diskbench` times reading in 4 KiB pieces and random 4 KiB reads too,
+  and shows the median of 5 runs, timed to a tenth of a millisecond.
+
 ## v0.3.0
 
 ### New

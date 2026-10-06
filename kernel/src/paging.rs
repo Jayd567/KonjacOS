@@ -708,6 +708,42 @@ pub unsafe fn translate(pml4_phys: u64, virt: u64) -> Option<u64> {
     }
 }
 
+/// The physical address of byte `virt` in the current address space, or
+/// `None` if it isn't mapped. Unlike [`translate`], this follows 1 GiB and
+/// 2 MiB pages too (the kernel image and the HHDM use them), so it's safe
+/// for any kernel address -- what `virtio_blk.rs` uses to point the disk
+/// straight at a caller's buffer.
+pub fn virt_to_phys(virt: u64) -> Option<u64> {
+    const HUGE: u64 = 1 << 7;
+    let idx = indices(virt);
+    unsafe {
+        let pml4 = table_ptr(read_cr3() & ADDR_MASK);
+        let e0 = pml4.add(idx[0]).read_volatile();
+        if e0 & PAGE_PRESENT == 0 {
+            return None;
+        }
+        let e1 = table_ptr(e0 & ADDR_MASK).add(idx[1]).read_volatile();
+        if e1 & PAGE_PRESENT == 0 {
+            return None;
+        }
+        if e1 & HUGE != 0 {
+            return Some((e1 & ADDR_MASK & !((1 << 30) - 1)) | (virt & ((1 << 30) - 1)));
+        }
+        let e2 = table_ptr(e1 & ADDR_MASK).add(idx[2]).read_volatile();
+        if e2 & PAGE_PRESENT == 0 {
+            return None;
+        }
+        if e2 & HUGE != 0 {
+            return Some((e2 & ADDR_MASK & !((1 << 21) - 1)) | (virt & ((1 << 21) - 1)));
+        }
+        let e3 = table_ptr(e2 & ADDR_MASK).add(idx[3]).read_volatile();
+        if e3 & PAGE_PRESENT == 0 {
+            return None;
+        }
+        Some((e3 & ADDR_MASK) | (virt & 0xFFF))
+    }
+}
+
 /// Clears whatever mapping `virt` has in `pml4_phys`'s address space
 /// (same walk as [`translate`], but writes a zeroed entry back into the
 /// PT instead of just reading it) and flushes that one address out of the
