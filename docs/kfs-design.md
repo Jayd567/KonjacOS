@@ -2,8 +2,9 @@
 
 KFS is the filesystem that will replace FAT16 as KonjacOS's main disk
 format. This document fixes its on-disk layout and the rules for changing
-it. Status: **milestones 1 and 2 (reading and writing) implemented**;
-the details below match `tools/kfs.py` and `kernel/src/kfs.rs`.
+it. Status: **milestones 1-3 implemented**: KFS reads and writes, has
+passed the crash and bit-rot tests, and is KonjacOS's main disk (`/`).
+The details below match `tools/kfs.py` and `kernel/src/kfs.rs`.
 
 ## Goals
 
@@ -75,8 +76,18 @@ everything is.
 **Mounting:** read all eight slots and use the valid one (right magic,
 correct checksum) with the highest `txg`. A commit writes slot
 `txg % 8`, so a torn or failed superblock write only loses that one slot.
-The previous seven are still there, each pointing at an older but
-complete state.
+
+The older slots point at older states, but only the **previous one** is
+guaranteed complete. Blocks a commit frees are reusable as soon as it
+lands, so commit N+1 may overwrite what N-1 used; N-1 itself stays whole
+until a commit after the newest one happens. (An earlier draft said all
+seven older slots were complete; that would need frees held back for
+eight commits, and across reboots.) So mounting tries the newest
+superblock and, if its tree root or bitmap fails its checksum, the next
+newest, saying so at boot. Going further back is a last resort: anything
+reused since then fails its checksum rather than being read as data.
+`kfs.py mkfs` writes the first superblock to all eight slots, so even a
+fresh image survives one damaged slot.
 
 ### Block pointer (32 bytes)
 
@@ -322,18 +333,21 @@ if commits ever become the bottleneck.
 
 ## How it fits into the kernel
 
-Today every part of the kernel calls `fat16::` directly. KFS adds a small
-**VFS layer** (`vfs.rs`) with the operations already used (`read_file`,
-`open_file`/`read_at`, `write_file`, `list_dir`, `stat_path`,
-`create_dir`, `rename`, `remove`, `copy`), which dispatches by mount point:
+Every part of the kernel goes through a small **VFS layer** (`vfs.rs`)
+with the operations it uses (`read_file`, `open_file`/`read_at`,
+`write_file`, `list_dir`, `stat_path`, `create_dir`, `rename`, `remove`,
+`copy`), which dispatches by mount point:
 
-- `/` is KFS once a KFS disk is present.
+- `/` is KFS when a KFS disk is present.
 - The FAT16 disk stays available at `/fat` while KFS proves itself (see
   [Removing FAT16](#removing-fat16)). With no KFS disk, FAT16 is `/` as
-  it is today.
-
-The desktop, the shell, the Linux syscall layer, the loader and DOOM
-switch from `fat16::` to `vfs::`, which is a mechanical change.
+  before.
+- Moving between the two copies, then deletes the original. `/fat`
+  itself can't be renamed or deleted.
+- The first time KFS is `/`, `DESKTOP.CFG` (settings and pins) and
+  `APEX.PWD` (the admin password's hash) are copied from `/fat` if KFS
+  doesn't have them yet.
+- `statfs` and Settings report the disk at `/`.
 
 ## Tools
 
@@ -351,6 +365,14 @@ code: if the two disagree about the format, the tests catch it.
   its name's hash. It exits with an error if anything is
   wrong; the tests run it after every scenario.
 - **`kfs.py ls|cat|get`** reads files out of an image on the host.
+- **`kfs.py put|mkdir|rm`** changes an image the way the kernel does:
+  new data, a rebuilt tree and a rewritten bitmap go into blocks the
+  current state doesn't use, then the next superblock makes them live,
+  so an interrupted `put` leaves the image as it was. The Makefile's
+  test-program targets use `put` to add their programs to `kfs.img`, as
+  they use `mcopy` for the FAT16 disk.
+- **`tools/crash_test.py`** and **`tools/bitrot_test.py`**: see
+  [Testing](#testing).
 
 ## Testing
 
@@ -365,14 +387,26 @@ code: if the two disagree about the format, the tests catch it.
   for `kfs.py check`; `fill` then writes 1 MiB files until the disk is
   full, checks the failed write left nothing behind, deletes them and
   checks every block came back.
-- **Crash testing**, which is what backs the "never corrupts" goal: a
-  shell command writes, renames and deletes in a loop while the harness
-  kills QEMU at a random moment. The image must then pass `kfs.py check` and
-  mount, with every file either at its last committed contents or absent.
-  This runs hundreds of times with different timings.
-- **Bit rot:** flip a byte in an image; reading the affected file must
-  return an error, not wrong data, and everything else must stay
-  readable.
+- **Crash testing** (`tools/crash_test.py`), which is what backs the
+  "never corrupts" goal. It boots KonjacOS on a small KFS disk, starts
+  `kfstest`, and kills QEMU (SIGKILL) at a random moment 0.1-4 s in,
+  over and over on the same disk. After each crash the image must pass
+  `kfs.py check`, the next boot must mount it, and every file kfstest
+  wrote must be whole: each file of 16 bytes or more starts with
+  `KFST`, a tag and its size, and the rest follows from the tag, so a
+  mix of old and new contents is caught. QEMU writes go straight to the
+  host's file, so this tests crashes at every point in the sequence of
+  writes, but not a disk that loses or reorders writes it hadn't been
+  told to flush; the commit order (flush before and after the
+  superblock) is what covers that.
+- **Bit rot** (`tools/bitrot_test.py`): flip one random byte in a random
+  block of a fresh image (a superblock slot, the tree root, another tree
+  node, a file's data, or the bitmap), check `kfs.py check` notices,
+  then boot it and run `verify`, which reads every file. A file's data:
+  exactly that file fails. A tree node: some files fail, the rest read.
+  The root or the bitmap: the mount falls back to the previous commit or
+  refuses, saying the disk is damaged. A superblock slot: nothing is
+  lost. Never wrong data, never a crash.
 
 ## Milestones
 
@@ -383,9 +417,9 @@ Each one ends in something that boots and passes its tests.
    until 3.
 2. **Writing** (done). Commits, the allocator, deferred frees, inline
    data and extents. Files and Notepad work on KFS.
-3. **Crash-tested, then default.** Crash and bit-rot testing pass, `make`
-   builds a 512 MiB KFS disk, FAT16 moves to `/fat`. Released as a new
-   version.
+3. **Crash-tested, then default** (done). Crash and bit-rot testing pass,
+   `make` builds a 512 MiB KFS disk, FAT16 moves to `/fat`. Released as
+   a new version.
 4. **Remove FAT16**, once the checklist under
    [Removing FAT16](#removing-fat16) is met.
 5. **Snapshots** (format already ready: `snap_root`, `birth_txg`).

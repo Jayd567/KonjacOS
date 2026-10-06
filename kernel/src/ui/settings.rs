@@ -258,8 +258,9 @@ pub struct SettingsApp {
     query: alloc::string::String,
     /// The search box has keyboard focus.
     typing: bool,
-    /// `(used, total)` bytes on the disk, read when Storage opens.
-    disk: Option<(u64, u64)>,
+    /// `(used, total)` bytes on the `/` disk and its format, read when
+    /// Storage opens.
+    disk: Option<(u64, u64, &'static str)>,
     snap: sysmon::Snapshot,
     seq: u64,
 }
@@ -308,7 +309,7 @@ impl SettingsApp {
         if section == Section::Storage {
             self.disk = crate::vfs::volume_stats()
                 .ok()
-                .map(|v| ((v.total_clusters - v.free_clusters) * v.cluster_bytes, v.total_clusters * v.cluster_bytes));
+                .map(|v| ((v.total_blocks - v.free_blocks) * v.block_bytes, v.total_blocks * v.block_bytes, v.name));
         }
     }
 
@@ -534,9 +535,15 @@ impl SettingsApp {
                 p.fill_squircle(card, 16.0, rgb(0, 0, 0), 60);
                 let (iw, ih, m) = assets::icon(icon::HARD_DRIVE_20);
                 p.draw_mask(card.x + 18, card.y + 18, iw, ih, m, accent(), 255);
-                p.text(&font::UI_BOLD, card.x + 48, card.y + 18, "Data disk (FAT16)", TEXT, 255);
+                let mut title = alloc::string::String::from("Data disk");
+                if let Some((_, _, name)) = self.disk {
+                    title.push_str(" (");
+                    title.push_str(name);
+                    title.push(')');
+                }
+                p.text(&font::UI_BOLD, card.x + 48, card.y + 18, &title, TEXT, 255);
                 match self.disk {
-                    Some((used, total)) if total > 0 => {
+                    Some((used, total, _)) if total > 0 => {
                         let bar = Rect::new(card.x + 18, card.y + 54, card.w - 36, 10);
                         p.fill_squircle(bar, 5.0, TEXT, 40);
                         let fill = (bar.w as u64 * used / total) as i32;

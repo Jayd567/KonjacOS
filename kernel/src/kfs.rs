@@ -450,6 +450,8 @@ struct Fs {
     txg: u64,
     label: String,
     next_object: u64,
+    /// Set when the newest commit couldn't be read and an older one is in use.
+    fell_back_from: Option<u64>,
     cache: Cache,
 
     // Free space. The whole bitmap is in memory (32 KiB per GiB of disk).
@@ -495,10 +497,16 @@ fn change<T>(f: impl FnOnce(&mut Fs) -> Result<T, &'static str>) -> Result<T, &'
 }
 
 /// Looks for a KFS volume on every disk and mounts the first one found.
+///
+/// The newest valid superblock is used unless its state can't be read
+/// (its tree root or free-space bitmap fails its checksum); then the next
+/// newest. The previous commit's blocks are only reused by the commit
+/// after the newest one, so falling back one commit gives a complete
+/// state; further back, checksums still catch anything since reused.
 pub fn mount() -> Result<(), &'static str> {
     let mut buf: Box<[u8; BLOCK]> = Box::new([0u8; BLOCK]);
     for disk in 0..block::count() {
-        let mut best: Option<Box<[u8; BLOCK]>> = None;
+        let mut found: Vec<Box<[u8; BLOCK]>> = Vec::new();
         for slot in 0..SB_SLOTS {
             if read_blocks(disk, SB_FIRST + slot, &mut buf[..]).is_err() {
                 break;
@@ -509,40 +517,72 @@ pub fn mount() -> Result<(), &'static str> {
             if le32(&buf[..], 8) != VERSION || le32(&buf[..], 12) as usize != BLOCK {
                 continue;
             }
-            if best.as_ref().is_some_and(|b| le64(&b[..], 24) >= le64(&buf[..], 24)) {
-                continue;
+            if !found.iter().any(|b| le64(&b[..], 24) == le64(&buf[..], 24)) {
+                found.push(buf.clone());
             }
-            best = Some(buf.clone());
         }
-        let Some(sb) = best else { continue };
-        let total_blocks = le64(&sb[..], 16);
-        if block::capacity(disk).is_some_and(|sectors| total_blocks * SECTORS_PER_BLOCK > sectors) {
-            return Err("the KFS volume is larger than its disk (damaged, or the image was truncated)");
+        if found.is_empty() {
+            continue;
         }
-        let label_end = sb[168..200].iter().position(|&c| c == 0).unwrap_or(32);
-        let mut fs = Fs {
-            disk,
-            total_blocks,
-            txg: le64(&sb[..], 24),
-            label: String::from(core::str::from_utf8(&sb[168..168 + label_end]).unwrap_or("?")),
-            next_object: le64(&sb[..], 144),
-            cache: Cache { slots: Vec::with_capacity(CACHE_SLOTS), clock: 0 },
-            bits: Vec::new(),
-            held: Vec::new(),
-            bitmap: Vec::new(),
-            bitmap_dirty: Vec::new(),
-            index: Vec::new(),
-            cursor: DATA_START,
-            root: Child::Disk(Bp::parse(&sb[..], 40)),
-            nodes: Vec::new(),
-            dirty: false,
-            sb,
-        };
-        fs.load_bitmap()?;
-        *FS.lock() = Some(fs);
-        return Ok(());
+        // Newest first.
+        found.sort_by_key(|b| core::cmp::Reverse(le64(&b[..], 24)));
+        let newest = le64(&found[0][..], 24);
+        let mut first_error = None;
+        for sb in found {
+            match open(disk, sb) {
+                Ok(mut fs) => {
+                    if fs.txg != newest {
+                        fs.fell_back_from = Some(newest);
+                    }
+                    *FS.lock() = Some(fs);
+                    return Ok(());
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        return Err(first_error.unwrap_or("no usable KFS superblock"));
     }
     Err("no KFS volume on any disk")
+}
+
+/// The volume described by superblock `sb`, if its state reads back.
+fn open(disk: usize, sb: Box<[u8; BLOCK]>) -> Result<Fs, &'static str> {
+    let total_blocks = le64(&sb[..], 16);
+    if block::capacity(disk).is_some_and(|sectors| total_blocks * SECTORS_PER_BLOCK > sectors) {
+        return Err("the KFS volume is larger than its disk (damaged, or the image was truncated)");
+    }
+    let label_end = sb[168..200].iter().position(|&c| c == 0).unwrap_or(32);
+    let root = Bp::parse(&sb[..], 40);
+    let mut fs = Fs {
+        disk,
+        total_blocks,
+        txg: le64(&sb[..], 24),
+        label: String::from(core::str::from_utf8(&sb[168..168 + label_end]).unwrap_or("?")),
+        next_object: le64(&sb[..], 144),
+        fell_back_from: None,
+        cache: Cache { slots: Vec::with_capacity(CACHE_SLOTS), clock: 0 },
+        bits: Vec::new(),
+        held: Vec::new(),
+        bitmap: Vec::new(),
+        bitmap_dirty: Vec::new(),
+        index: Vec::new(),
+        cursor: DATA_START,
+        root: Child::Disk(root),
+        nodes: Vec::new(),
+        dirty: false,
+        sb,
+    };
+    fs.load_bitmap()?;
+    fs.node(root)?;
+    Ok(fs)
+}
+
+/// If the newest commit was damaged and mount used an older one: the
+/// newest commit's txg.
+pub fn fell_back_from() -> Option<u64> {
+    FS.lock().as_ref().and_then(|fs| fs.fell_back_from)
 }
 
 pub fn mounted() -> bool {

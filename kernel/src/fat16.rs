@@ -220,6 +220,10 @@ unsafe fn mount() -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn mounted() -> bool {
+    LAYOUT.lock().is_some()
+}
+
 fn layout() -> Result<Layout, &'static str> {
     LAYOUT.lock().ok_or("fat16: not initialized (init() failed or wasn't called)")
 }

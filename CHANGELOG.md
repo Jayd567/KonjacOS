@@ -4,33 +4,44 @@ Each version here is published on the
 [Releases](https://github.com/Jayd567/KonjacOS/releases) page with
 ready-to-boot images.
 
-## Unreleased
+## v0.3.0
 
 ### New
 
+- KonjacFS, KonjacOS's own copy-on-write filesystem
+  ([design](docs/kfs-design.md)), is now the main disk, `/`. `make`
+  builds it as `kfs.img` (512 MiB); the FAT16 disk, if attached too, is
+  at `/fat`, and settings, pins and the admin password are copied over
+  from it the first time.
+  - Every block is checksummed, so a damaged disk gives an error instead
+    of wrong data. If the newest commit itself is damaged, KonjacOS
+    mounts the one before it and says so.
+  - Writing is copy-on-write: each change (a save, a new folder, a
+    rename, a delete) is written to free space and then made live by a
+    single superblock write, so a crash can't leave the disk half
+    changed. Old blocks are reused only once the change has landed.
+  - Tested by killing QEMU mid-write 200 times and damaging random
+    blocks 100 times (`tools/crash_test.py`, `tools/bitrot_test.py`):
+    the disk always checked out, and damage was always reported, never
+    returned as data.
+  - Names are case-sensitive. Writing 1 MiB takes 10 ms, against 40 ms
+    on FAT16.
+  - `tools/kfs.py` builds, reads, checks and changes images on the host
+    (`put`, `mkdir`, `rm`, like `mtools` for FAT16).
+- `verify` in the Terminal reads every file and reports any that are
+  damaged.
 - A virtio-blk disk driver: the disk moves data into memory itself (DMA),
   64 KiB per request, instead of the CPU copying every sector through an
   I/O port. `make run` attaches the disk this way; the ATA driver is
   still used when the disk is attached as IDE.
 - `diskbench` in the Terminal times reading, writing and deleting files.
-- KonjacFS, KonjacOS's own copy-on-write filesystem
-  ([design](docs/kfs-design.md)), on a second disk, `kfs.img`, built by
-  `make kfs` and mounted at `/kfs`:
-  - Every block is checksummed, so a damaged disk gives an error instead
-    of wrong data.
-  - Writing is copy-on-write: each change (a save, a new folder, a
-    rename, a delete) is written to free space and then made live by a
-    single superblock write, so a crash can't leave the disk half
-    changed. Old blocks are reused only once the change has landed.
-  - Files, Notepad and the Terminal work on it like on the FAT16 disk.
-    Names are case-sensitive.
-  - Writing 1 MiB takes 10 ms, against 40 ms on FAT16.
-  - `tools/kfs.py` builds, reads and checks images on the host.
 - `kfstest` in the Terminal runs random writes, overwrites, renames and
   deletes on KonjacFS and checks every file as it goes; `kfstest fill`
   also fills the disk and checks the space all comes back.
 - Several disks at once; each filesystem finds its own.
 - Files copies and moves between the two disks; `ls` takes a folder.
+- The release has a `-kfs.zip` (the KonjacFS disk) alongside the
+  FAT16 `-disk.zip`.
 
 ### Changed
 
@@ -40,7 +51,11 @@ ready-to-boot images.
   of clusters per request, and writes changed FAT sectors once per
   operation instead of once per cluster. With virtio, writing 1 MiB went
   from 11.2 s to 40 ms and reading DOOM1.WAD from 1.3 s to about 10 ms.
-- `diskbench` times FAT16 and KonjacFS side by side.
+- `diskbench` times KonjacFS and FAT16 side by side.
+- `statfs` and Settings' Storage page report the disk at `/` and its
+  format.
+- DOOM is handed its WAD's exact path, since KonjacFS names are
+  case-sensitive and DOOM only looks for `doom1.wad` in lower case.
 
 ### Fixed
 
