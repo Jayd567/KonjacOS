@@ -16,6 +16,7 @@
 #   wheel N         turn the scroll wheel N notches down (negative: up)
 #   anything else   a raw QEMU monitor command (`sendkey ret`, ...)
 # Serial output goes to OUT_PREFIX-serial.log. Needs image.iso + disk.img.
+# DISK_IF=ide attaches the disk as ATA instead of virtio.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out="$1"
@@ -24,7 +25,7 @@ sock="$(mktemp -u /tmp/konjac-mon.XXXXXX)"
 
 qemu-system-x86_64 -m 256M -no-reboot -boot order=d -rtc base=localtime \
     -cdrom image.iso \
-    -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+    -drive file=disk.img,format=raw,if="${DISK_IF:-virtio}" \
     -display none -serial "file:$out-serial.log" \
     -monitor "unix:$sock,server,nowait" &
 qpid=$!

@@ -25,6 +25,46 @@ pub unsafe fn outb(port: u16, value: u8) {
     }
 }
 
+/// # Safety
+/// See [`inb`].
+#[inline]
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// # Safety
+/// See [`outb`].
+#[inline]
+pub unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// # Safety
+/// See [`inb`].
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// # Safety
+/// See [`outb`].
+#[inline]
+pub unsafe fn outl(port: u16, value: u32) {
+    unsafe {
+        asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Reads `buf.len() / 2` 16-bit words from `port` into `buf`, low byte
 /// first -- the shape the ATA PIO data port hands sectors back in.
 ///

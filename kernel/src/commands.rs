@@ -55,6 +55,7 @@ pub static COMMANDS: &[Command] = &[
     },
     Command { name: "write", summary: "<file> <text>  create/overwrite a file with <text>", requires_apex: false, handler: cmd_write },
     Command { name: "rm", summary: "<file>  delete a file", requires_apex: true, handler: cmd_rm },
+    Command { name: "diskbench", summary: "time disk reads and writes (needs DOOM1.WAD; writes and deletes /BENCH.TMP)", requires_apex: false, handler: cmd_diskbench },
     Command { name: "reboot", summary: "reset the machine", requires_apex: true, handler: cmd_reboot },
     Command { name: "halt", summary: "stop the CPU (interrupts off, spins on hlt)", requires_apex: true, handler: cmd_halt },
     Command { name: "apex", summary: "show whether an apex check is currently cached", requires_apex: false, handler: cmd_apex },
@@ -233,6 +234,61 @@ fn cmd_rm(rest: &str) {
     match crate::fat16::remove_file(rest) {
         Ok(()) => println!("removed {rest}"),
         Err(e) => println!("rm: {rest}: {e}"),
+    }
+}
+
+/// Times the disk: a big read, a 1 MiB write, reading that back, and
+/// listing the root folder -- the "before and after" numbers for disk
+/// driver and filesystem work.
+fn cmd_diskbench(_rest: &str) {
+    use crate::fat16;
+    // `ms` and KiB/s from a tick count and a byte count.
+    fn report(what: &str, ticks: u64, bytes: usize, sectors: u64) {
+        let ms = ticks * 1000 / timer::HZ as u64;
+        let kib_s = if ms == 0 { 0 } else { bytes as u64 * 1000 / 1024 / ms };
+        if bytes > 0 {
+            println!("  {what:<24} {ms:>6} ms  {kib_s:>7} KiB/s  ({sectors} disk requests)");
+        } else {
+            println!("  {what:<24} {ms:>6} ms  ({sectors} disk requests)");
+        }
+    }
+    let ops = || crate::block::stats().0;
+    println!("diskbench ({}):", crate::block::backend_name());
+
+    let (t, s) = (timer::ticks(), ops());
+    match fat16::read_file("/DOOM1.WAD") {
+        Ok(d) => report("read DOOM1.WAD", timer::ticks() - t, d.len(), ops() - s),
+        Err(e) => println!("  read DOOM1.WAD: {e}"),
+    }
+
+    let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i * 7 + i / 4096) as u8).collect();
+    let (t, s) = (timer::ticks(), ops());
+    match fat16::write_file("/BENCH.TMP", &data) {
+        Ok(()) => report("write 1 MiB", timer::ticks() - t, data.len(), ops() - s),
+        Err(e) => {
+            println!("  write 1 MiB: {e}");
+            return;
+        }
+    }
+    let (t, s) = (timer::ticks(), ops());
+    match fat16::read_file("/BENCH.TMP") {
+        Ok(d) => {
+            report("read it back", timer::ticks() - t, d.len(), ops() - s);
+            if d != data {
+                println!("  ** read-back mismatch: the disk returned different data **");
+            }
+        }
+        Err(e) => println!("  read it back: {e}"),
+    }
+    let (t, s) = (timer::ticks(), ops());
+    for _ in 0..20 {
+        let _ = fat16::list_dir("/");
+    }
+    report("list / x20", timer::ticks() - t, 0, ops() - s);
+    let (t, s) = (timer::ticks(), ops());
+    match fat16::remove_file("/BENCH.TMP") {
+        Ok(()) => report("delete it", timer::ticks() - t, 0, ops() - s),
+        Err(e) => println!("  delete: {e}"),
     }
 }
 

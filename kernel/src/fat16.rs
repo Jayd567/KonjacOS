@@ -1,4 +1,4 @@
-//! A FAT16 driver, layered on `ata.rs`'s raw sector reads and writes.
+//! A FAT16 driver, layered on `block.rs`'s sector reads and writes.
 //!
 //! FAT16 was picked over a custom filesystem specifically so the disk
 //! image stays a completely ordinary FAT16 volume: it's built with real
@@ -26,12 +26,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ata;
+use crate::block;
 use crate::sync::SpinLock;
 
-const SECTOR_SIZE: usize = ata::SECTOR_SIZE;
+const SECTOR_SIZE: usize = block::SECTOR_SIZE;
 const DIR_ENTRY_SIZE: usize = 32;
 
 const ATTR_VOLUME_ID: u8 = 0x08;
@@ -86,22 +85,62 @@ struct Cwd {
 // while holding this lock by another task that faults and needs the layout.
 static LAYOUT: crate::sync::IrqSpinLock<Option<Layout>> = crate::sync::IrqSpinLock::new(None);
 static CWD: SpinLock<Cwd> = SpinLock::new(Cwd { location: DirLocation::Root, stack: Vec::new() });
-/// Cheap instrumentation for `meminfo`/debugging: total sectors read since
-/// boot, so it's obvious whether `ls`/`cat` are actually hitting the disk.
-static SECTORS_READ: AtomicU64 = AtomicU64::new(0);
-static SECTORS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// FAT copy 0, kept in memory (at most 128 KiB on FAT16): following a
+/// cluster chain or finding a free cluster no longer reads the disk for
+/// every entry. Changes mark their sector dirty, and each public
+/// operation that changes the disk writes the dirty sectors to every FAT
+/// copy once when it finishes (see [`committed`]) -- writing a 1 MiB file
+/// used to rewrite the same FAT sectors hundreds of times. Same lock
+/// rules as [`LAYOUT`].
+static FAT: crate::sync::IrqSpinLock<FatCache> = crate::sync::IrqSpinLock::new(FatCache { table: Vec::new(), dirty: Vec::new() });
+
+struct FatCache {
+    table: Vec<u8>,
+    /// One flag per FAT sector: changed since it was last written.
+    dirty: Vec<bool>,
+}
+
+/// Writes the FAT sectors changed since the last flush to every FAT copy,
+/// in runs of consecutive sectors.
+fn flush_fat() -> Result<(), &'static str> {
+    let l = layout()?;
+    let mut fat = FAT.lock();
+    let n = fat.dirty.len();
+    let mut i = 0;
+    while i < n {
+        if !fat.dirty[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && fat.dirty[i] {
+            fat.dirty[i] = false;
+            i += 1;
+        }
+        let bytes = &fat.table[start * SECTOR_SIZE..i * SECTOR_SIZE];
+        for copy in 0..l.num_fats {
+            block::write((l.fat_start_lba + copy * l.fat_sectors + start as u32) as u64, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// `result`, after flushing the FAT -- the end of every public operation
+/// that may have changed it, successful or not.
+fn committed<T>(result: Result<T, &'static str>) -> Result<T, &'static str> {
+    let flushed = flush_fat();
+    let value = result?;
+    flushed.map(|_| value)
+}
 
 fn read_sector(lba: u32) -> Result<[u8; SECTOR_SIZE], &'static str> {
     let mut buf = [0u8; SECTOR_SIZE];
-    unsafe { ata::read_sector(lba, &mut buf) }?;
-    SECTORS_READ.fetch_add(1, Ordering::Relaxed);
+    block::read(lba as u64, &mut buf)?;
     Ok(buf)
 }
 
 fn write_sector(lba: u32, buf: &[u8; SECTOR_SIZE]) -> Result<(), &'static str> {
-    unsafe { ata::write_sector(lba, buf) }?;
-    SECTORS_WRITTEN.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    block::write(lba as u64, buf)
 }
 
 /// Parses the boot sector / BIOS Parameter Block and caches the derived
@@ -155,6 +194,10 @@ pub unsafe fn init() -> Result<(), &'static str> {
         total_sectors,
     };
 
+    let mut fat = alloc::vec![0u8; (fat_sectors_16 as usize) * SECTOR_SIZE];
+    block::read(fat_start_lba as u64, &mut fat)?;
+    let sectors = fat_sectors_16 as usize;
+    *FAT.lock() = FatCache { table: fat, dirty: alloc::vec![false; sectors] };
     *LAYOUT.lock() = Some(layout);
     *CWD.lock() = Cwd { location: DirLocation::Root, stack: Vec::new() };
     Ok(())
@@ -170,12 +213,13 @@ fn cluster_to_lba(l: Layout, cluster: u32) -> u32 {
 
 /// Looks up FAT entry `cluster`'s value (the next cluster in the chain, or
 /// an end-of-chain/free/bad marker).
-fn fat_entry(l: Layout, cluster: u32) -> Result<u16, &'static str> {
-    let byte_offset = cluster * 2;
-    let sector = l.fat_start_lba + byte_offset / l.bytes_per_sector;
-    let offset_in_sector = (byte_offset % l.bytes_per_sector) as usize;
-    let buf = read_sector(sector)?;
-    Ok(u16::from_le_bytes([buf[offset_in_sector], buf[offset_in_sector + 1]]))
+fn fat_entry(_l: Layout, cluster: u32) -> Result<u16, &'static str> {
+    let fat = FAT.lock();
+    let at = cluster as usize * 2;
+    if at + 1 >= fat.table.len() {
+        return Err("cluster number past the end of the FAT");
+    }
+    Ok(u16::from_le_bytes([fat.table[at], fat.table[at + 1]]))
 }
 
 /// Volume geometry and free space, for `statfs`.
@@ -187,26 +231,14 @@ pub struct VolumeStats {
 
 /// Reports the volume's cluster size, data-cluster count and free-cluster
 /// count. FAT16 keeps no free-space counter, so this counts free entries in
-/// FAT copy 0, reading it one sector at a time rather than once per cluster.
+/// the in-memory FAT.
 pub fn volume_stats() -> Result<VolumeStats, &'static str> {
     let l = layout()?;
     let total_clusters = (l.total_sectors - l.data_start_lba) / l.sectors_per_cluster;
-    let entries_per_sector = l.bytes_per_sector / 2;
-    let end = 2 + total_clusters;
-    let mut free = 0u64;
-    let mut cluster = 2u32;
-    while cluster < end {
-        let sector_in_fat = cluster / entries_per_sector;
-        let buf = read_sector(l.fat_start_lba + sector_in_fat)?;
-        let last = core::cmp::min(end, (sector_in_fat + 1) * entries_per_sector);
-        while cluster < last {
-            let off = ((cluster % entries_per_sector) * 2) as usize;
-            if u16::from_le_bytes([buf[off], buf[off + 1]]) == FAT_FREE {
-                free += 1;
-            }
-            cluster += 1;
-        }
-    }
+    let fat = FAT.lock();
+    let t = &fat.table;
+    let end = ((2 + total_clusters) as usize).min(t.len() / 2);
+    let free = (2..end).filter(|&c| u16::from_le_bytes([t[2 * c], t[2 * c + 1]]) == FAT_FREE).count() as u64;
     Ok(VolumeStats {
         cluster_bytes: (l.sectors_per_cluster * l.bytes_per_sector) as u64,
         total_clusters: total_clusters as u64,
@@ -630,24 +662,37 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, &'static str> {
         return Err("is a directory");
     }
 
-    let mut cluster = entry.cluster;
-    let size = entry.size;
-    let mut data = Vec::with_capacity(size as usize);
+    let size = entry.size as usize;
+    let cluster_bytes = (l.sectors_per_cluster * l.bytes_per_sector) as usize;
+    // Whole clusters are read, then the slack past the end is cut off.
+    let mut data = Vec::new();
+    data.try_reserve_exact(size.div_ceil(cluster_bytes) * cluster_bytes).map_err(|_| "file buffer allocation failed")?;
+    data.resize(size.div_ceil(cluster_bytes) * cluster_bytes, 0);
 
-    while cluster >= 2 && cluster < 0xFFF8 && (data.len() as u32) < size {
-        for s in 0..l.sectors_per_cluster {
-            let sector_lba = cluster_to_lba(l, cluster) + s;
-            let buf = read_sector(sector_lba)?;
-            let remaining = size - data.len() as u32;
-            let take = core::cmp::min(remaining, l.bytes_per_sector) as usize;
-            data.extend_from_slice(&buf[..take]);
-            if (data.len() as u32) >= size {
+    // Read each run of consecutive clusters in one disk request: files
+    // written in one go are usually laid out contiguously.
+    let mut cluster = entry.cluster;
+    let mut done = 0usize;
+    while cluster >= 2 && cluster < 0xFFF8 && done < size {
+        let start = cluster;
+        let mut run = 1u32;
+        loop {
+            let next = fat_entry(l, cluster)? as u32;
+            cluster = next;
+            if next == start + run && done + (run as usize + 1) * cluster_bytes <= data.len() {
+                run += 1;
+            } else {
                 break;
             }
         }
-        cluster = fat_entry(l, cluster)? as u32;
+        let bytes = run as usize * cluster_bytes;
+        block::read(cluster_to_lba(l, start) as u64, &mut data[done..done + bytes])?;
+        done += bytes;
     }
-
+    if done < size {
+        return Err("truncated cluster chain");
+    }
+    data.truncate(size);
     Ok(data)
 }
 
@@ -689,16 +734,10 @@ impl File {
         let (mut cluster, mut index) = if target >= self.cursor_index {
             (self.cursor_cluster, self.cursor_index)
         } else { (self.first, 0) };
-        // Cache one FAT sector per read: large random offsets must not issue
-        // one ATA command for every two-byte FAT entry they traverse.
-        let mut fat_sector = [0u8; SECTOR_SIZE];
-        let mut fat_lba = u32::MAX;
-        let mut next = |c: u32| -> Result<u32, &'static str> {
+        // The chain comes from the in-memory FAT.
+        let next = |c: u32| -> Result<u32, &'static str> {
             if !valid(c) { return Err("truncated or invalid file chain"); }
-            let sector = l.fat_start_lba + c * 2 / SECTOR_SIZE as u32;
-            if sector != fat_lba { fat_sector = read_sector(sector)?; fat_lba = sector; }
-            let at = (c * 2 % SECTOR_SIZE as u32) as usize;
-            Ok(u16::from_le_bytes([fat_sector[at], fat_sector[at+1]]) as u32)
+            Ok(fat_entry(l, c)? as u32)
         };
         while index < target { cluster = next(cluster)?; index += 1; }
         let want = out.len().min((self.size as u64 - offset) as usize);
@@ -708,10 +747,22 @@ impl File {
             if !valid(cluster) || index >= max_clusters { return Err("truncated or invalid file chain"); }
             self.cursor_cluster = cluster;
             self.cursor_index = index;
-            let sector = read_sector(cluster_to_lba(l, cluster) + (within / SECTOR_SIZE as u64) as u32)?;
+            let lba = cluster_to_lba(l, cluster) + (within / SECTOR_SIZE as u64) as u32;
             let lo = (within % SECTOR_SIZE as u64) as usize;
-            let take = (SECTOR_SIZE - lo).min(want - done);
-            out[done..done+take].copy_from_slice(&sector[lo..lo+take]);
+            // Whole sectors (as many as are left in this cluster) go
+            // straight into `out` in one request; a partial sector at
+            // either end goes through a buffer on the stack.
+            let whole = ((cluster_bytes - within) as usize / SECTOR_SIZE).min((want - done) / SECTOR_SIZE);
+            let take = if lo == 0 && whole > 0 {
+                let n = whole * SECTOR_SIZE;
+                block::read(lba as u64, &mut out[done..done + n])?;
+                n
+            } else {
+                let sector = read_sector(lba)?;
+                let take = (SECTOR_SIZE - lo).min(want - done);
+                out[done..done+take].copy_from_slice(&sector[lo..lo+take]);
+                take
+            };
             done += take;
             within += take as u64;
             if within == cluster_bytes && done < want {
@@ -746,20 +797,17 @@ pub fn read_file_range(path: &str, offset: u32, len: usize) -> Result<Vec<u8>, &
 const FAT_FREE: u16 = 0x0000;
 const FAT_EOC: u16 = 0xFFFF;
 
-/// Writes cluster `cluster`'s FAT entry to `value`, in every FAT copy the
-/// volume has.
-fn set_fat_entry(l: Layout, cluster: u32, value: u16) -> Result<(), &'static str> {
-    let byte_offset = cluster * 2;
-    let offset_in_sector = (byte_offset % l.bytes_per_sector) as usize;
-    let sector_in_fat = byte_offset / l.bytes_per_sector;
-
-    for fat_index in 0..l.num_fats {
-        let sector = l.fat_start_lba + fat_index * l.fat_sectors + sector_in_fat;
-        let mut buf = read_sector(sector)?;
-        buf[offset_in_sector] = (value & 0xFF) as u8;
-        buf[offset_in_sector + 1] = (value >> 8) as u8;
-        write_sector(sector, &buf)?;
+/// Sets cluster `cluster`'s FAT entry to `value` in memory; [`flush_fat`]
+/// writes it to every FAT copy on disk.
+fn set_fat_entry(_l: Layout, cluster: u32, value: u16) -> Result<(), &'static str> {
+    let mut fat = FAT.lock();
+    let at = cluster as usize * 2;
+    if at + 1 >= fat.table.len() {
+        return Err("cluster number past the end of the FAT");
     }
+    fat.table[at] = (value & 0xFF) as u8;
+    fat.table[at + 1] = (value >> 8) as u8;
+    fat.dirty[at / SECTOR_SIZE] = true;
     Ok(())
 }
 
@@ -769,13 +817,15 @@ fn set_fat_entry(l: Layout, cluster: u32, value: u16) -> Result<(), &'static str
 /// disk, not something you'd want on a real multi-gigabyte volume.
 fn allocate_cluster(l: Layout) -> Result<u32, &'static str> {
     let total_clusters = (l.total_sectors - l.data_start_lba) / l.sectors_per_cluster;
-    for cluster in 2..2 + total_clusters {
-        if fat_entry(l, cluster)? == FAT_FREE {
-            set_fat_entry(l, cluster, FAT_EOC)?;
-            return Ok(cluster);
-        }
-    }
-    Err("disk full (no free clusters)")
+    let free = {
+        let fat = FAT.lock();
+        let t = &fat.table;
+        let end = ((2 + total_clusters) as usize).min(t.len() / 2);
+        (2..end).find(|&c| u16::from_le_bytes([t[2 * c], t[2 * c + 1]]) == FAT_FREE)
+    };
+    let cluster = free.ok_or("disk full (no free clusters)")? as u32;
+    set_fat_entry(l, cluster, FAT_EOC)?;
+    Ok(cluster)
 }
 
 /// Frees every cluster in the chain starting at `cluster`.
@@ -792,11 +842,8 @@ fn free_chain(l: Layout, mut cluster: u32) -> Result<(), &'static str> {
 /// directory with a freshly allocated cluster, so it reads back as "all
 /// entries free" rather than whatever garbage was on disk before.
 fn zero_cluster(l: Layout, cluster: u32) -> Result<(), &'static str> {
-    let zero = [0u8; SECTOR_SIZE];
-    for s in 0..l.sectors_per_cluster {
-        write_sector(cluster_to_lba(l, cluster) + s, &zero)?;
-    }
-    Ok(())
+    let zero = alloc::vec![0u8; (l.sectors_per_cluster * l.bytes_per_sector) as usize];
+    block::write(cluster_to_lba(l, cluster) as u64, &zero)
 }
 
 /// The real VFAT checksum of an 8.3 short name -- stored in every LFN
@@ -1138,6 +1185,10 @@ fn place_entry(l: Layout, location: DirLocation, display: &str, short: [u8; 11],
 /// freeing its old cluster chain) if it already exists. Directories in
 /// `path` must already exist -- this doesn't create them.
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
+    committed(write_file_inner(path, data))
+}
+
+fn write_file_inner(path: &str, data: &[u8]) -> Result<(), &'static str> {
     let l = layout()?;
     let (dir_part, filename) = split_path(path);
     if filename.is_empty() {
@@ -1177,15 +1228,21 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
         if let Some(prev) = prev_cluster {
             set_fat_entry(l, prev, cluster as u16)?;
         }
-        for s in 0..l.sectors_per_cluster {
-            let mut sector_buf = [0u8; SECTOR_SIZE];
-            let start = offset_in_data + s as usize * l.bytes_per_sector as usize;
-            if start < data.len() {
-                let end = core::cmp::min(start + l.bytes_per_sector as usize, data.len());
-                sector_buf[..end - start].copy_from_slice(&data[start..end]);
-            }
-            write_sector(cluster_to_lba(l, cluster) + s, &sector_buf)?;
+        // The full sectors of this cluster in one request, then the
+        // last, partly filled one (zero-padded) on its own.
+        let lba = cluster_to_lba(l, cluster);
+        let here = (data.len() - offset_in_data).min(cluster_bytes);
+        let whole = here / SECTOR_SIZE * SECTOR_SIZE;
+        if whole > 0 {
+            block::write(lba as u64, &data[offset_in_data..offset_in_data + whole])?;
         }
+        if here > whole {
+            let mut buf = [0u8; SECTOR_SIZE];
+            buf[..here - whole].copy_from_slice(&data[offset_in_data + whole..offset_in_data + here]);
+            write_sector(lba + (whole / SECTOR_SIZE) as u32, &buf)?;
+        }
+        // Sectors past the end of the data stay unwritten: nothing reads
+        // beyond a file's size.
         offset_in_data += cluster_bytes;
         prev_cluster = Some(cluster);
     }
@@ -1236,6 +1293,10 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
 /// creation path whatsoever, file writing (item 5) having only ever
 /// needed to place new entries in a directory that already existed.
 pub fn create_dir(path: &str) -> Result<(), &'static str> {
+    committed(create_dir_inner(path))
+}
+
+fn create_dir_inner(path: &str) -> Result<(), &'static str> {
     let l = layout()?;
     let (dir_part, dirname) = split_path(path);
     if dirname.is_empty() {
@@ -1301,6 +1362,10 @@ pub fn create_dir(path: &str) -> Result<(), &'static str> {
 /// directory entries deleted. Refuses directories -- [`remove`] deletes
 /// those, contents and all.
 pub fn remove_file(path: &str) -> Result<(), &'static str> {
+    committed(remove_file_inner(path))
+}
+
+fn remove_file_inner(path: &str) -> Result<(), &'static str> {
     let l = layout()?;
     let (dir_part, filename) = split_path(path);
     if filename.is_empty() {
@@ -1339,6 +1404,10 @@ fn delete_tree(l: Layout, cluster: u32, depth: u32) -> Result<(), &'static str> 
 
 /// Deletes the file or folder at `path` (a folder with everything in it).
 pub fn remove(path: &str) -> Result<(), &'static str> {
+    committed(remove_inner(path))
+}
+
+fn remove_inner(path: &str) -> Result<(), &'static str> {
     let l = layout()?;
     let (dir_part, name) = split_path(path);
     if name.is_empty() {
@@ -1376,6 +1445,10 @@ fn parent_of(l: Layout, cluster: u32) -> Result<DirLocation, &'static str> {
 /// path; its folder must exist). The data stays where it is -- only the
 /// directory entry moves, plus a moved folder's `..` entry.
 pub fn rename(from: &str, to: &str) -> Result<(), &'static str> {
+    committed(rename_inner(from, to))
+}
+
+fn rename_inner(from: &str, to: &str) -> Result<(), &'static str> {
     let l = layout()?;
     let (src_dir, src_name) = split_path(from);
     let (dst_dir, dst_name) = split_path(to);
@@ -1488,14 +1561,4 @@ fn copy_dir(from: &str, to: &str, depth: u32) -> Result<(), &'static str> {
         }
     }
     Ok(())
-}
-
-#[allow(dead_code)] // Handy for future diagnostics; not wired to a command yet.
-pub fn sectors_read() -> u64 {
-    SECTORS_READ.load(Ordering::Relaxed)
-}
-
-#[allow(dead_code)] // Handy for future diagnostics; not wired to a command yet.
-pub fn sectors_written() -> u64 {
-    SECTORS_WRITTEN.load(Ordering::Relaxed)
 }
