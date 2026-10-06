@@ -71,7 +71,7 @@ Things to try in the Terminal:
 
 ```
 ls                 list files on the disk
-ls /kfs            list the KonjacFS disk (read-only for now)
+ls /kfs            list the KonjacFS disk
 cat README.TXT     print a file
 run hello.exe      run a Windows-format program
 doom               play DOOM (opens in its own window)
@@ -91,6 +91,8 @@ ps                 list running tasks
 | `ps`, `kill <id>` | List or stop running tasks |
 | `doom` | Play DOOM |
 | `meminfo`, `uptime` | Show memory use and uptime |
+| `diskbench` | Time reads, writes and deletes on each disk |
+| `kfstest [steps] [seed] [keep] [fill]` | Random writes, renames and deletes on KonjacFS, each checked; `fill` also fills the disk |
 | `reboot`, `halt` | Restart or stop the machine (needs the admin password) |
 
 The first time you run a command that needs the admin password, you

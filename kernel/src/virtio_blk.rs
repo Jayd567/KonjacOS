@@ -283,7 +283,6 @@ pub fn write(dev: usize, sector: u64, buf: &[u8]) -> Result<(), &'static str> {
 
 /// Makes everything written so far durable (a no-op if the device
 /// doesn't cache writes).
-#[allow(dead_code)] // For the copy-on-write filesystem's commit points.
 pub fn flush(dev: usize) -> Result<(), &'static str> {
     let mut guard = DISKS.lock();
     let d = guard.get_mut(dev).ok_or("virtio-blk: no such disk")?;

@@ -85,6 +85,16 @@ pub fn read(disk: usize, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Makes everything written to disk `disk` so far durable: the disk may
+/// cache writes, and KFS's commits depend on the order they land in.
+pub fn flush(disk: usize) -> Result<(), &'static str> {
+    match BACKEND.load(Ordering::Relaxed) {
+        VIRTIO => virtio_blk::flush(disk),
+        _ if disk != 0 => Err("no such disk"),
+        _ => unsafe { ata::flush() },
+    }
+}
+
 /// Writes `buf.len() / 512` sectors of disk `disk` starting at `lba`.
 pub fn write(disk: usize, lba: u64, buf: &[u8]) -> Result<(), &'static str> {
     debug_assert!(buf.len() % SECTOR_SIZE == 0);

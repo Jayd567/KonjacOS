@@ -2,8 +2,8 @@
 
 KFS is the filesystem that will replace FAT16 as KonjacOS's main disk
 format. This document fixes its on-disk layout and the rules for changing
-it. Status: **milestone 1 (read-only) implemented**; the details below
-match `tools/kfs.py` and `kernel/src/kfs.rs`.
+it. Status: **milestones 1 and 2 (reading and writing) implemented**;
+the details below match `tools/kfs.py` and `kernel/src/kfs.rs`.
 
 ## Goals
 
@@ -141,6 +141,13 @@ commit atomic, and it's also why changes are batched (see
 [Commits](#commits)): ten changes to one leaf in a commit write it once,
 not ten times.
 
+A node that overflows splits into as many nodes as its items need
+(usually two). After a removal, an empty node is dropped, and a node
+under a quarter full is merged into a neighbour if the two fit in one
+block; a root left with one child gives way to it. Interior keys are
+lower bounds: the key for a child is never more than the smallest key
+in it.
+
 ### Inode (128 bytes)
 
 | Field | Size | |
@@ -208,11 +215,18 @@ pointers each (almost 16 GiB of disk); level 1 points at bitmap blocks,
 and another level is added when the disk outgrows one node. Like
 everything else, it's copy-on-write.
 
-- At mount, the bitmap blocks are read as needed rather than all at once.
-  The allocator keeps a small in-memory summary (free blocks per 16 MiB
-  region) to find space without scanning everything.
-- **Allocating** looks for a free run big enough for the whole write,
-  close to the file's previous extent, so files stay contiguous.
+- v1 reads the **whole bitmap into memory** at mount (16 KiB for the
+  512 MiB volume), plus a second bitmap of blocks *held* for deferred
+  frees (below). If disks get large enough for that to matter, the
+  bitmap can be read as needed with a small summary (free blocks per
+  16 MiB region) kept in memory instead.
+- **Allocating** goes forward from a cursor (next-fit), looking for a
+  free run big enough for the whole write so the file is one run; if
+  there isn't one, the longest run there is, and so on.
+- **Reserve:** file data may not use the last 64 free blocks or 1/256 of
+  the volume, whichever is more. That space is left for the tree and
+  bitmap blocks commits write, so a full disk still has room for the
+  commit that deletes files to free space.
 - **Freeing is deferred:** a block freed in txg N is still part of the
   last committed state until txg N commits. It goes on a pending list and
   becomes allocatable only after the commit. Reusing it sooner would
@@ -273,6 +287,27 @@ replay and no `fsck` to run.
 previous commit, as on every modern filesystem. `fsync` (and Notepad's
 Save) forces a commit for the data that has to survive.
 
+**What v1 does:** a commit at the end of **every operation** (a file
+written, a folder made, a rename, a delete) rather than on a timer. That
+is simpler, needs no background thread, and makes every operation
+durable when it returns, at about 4 ms each under QEMU. Two other
+differences from the steps above:
+
+- File data is written to its new blocks when the file is written,
+  before the commit, so it doesn't wait in memory. It isn't reachable
+  until the commit lands, so a crash just leaves those blocks free.
+- If an operation fails part-way (the disk is full, a read error), its
+  changes are dropped and the in-memory state is reloaded from the last
+  commit. The operation either happened completely or not at all.
+
+A long operation, such as deleting a big folder, commits part of the way
+through once it has copied 128 tree nodes, after a step that leaves the
+tree consistent (one entry removed with everything under it). A crash
+then leaves some of the folder deleted, never a broken tree.
+
+Batching several operations into one commit on a timer is the upgrade
+if commits ever become the bottleneck.
+
 ## Memory
 
 - **Node cache:** a fixed-size LRU of tree nodes, 1 MiB by default. Nodes
@@ -310,8 +345,10 @@ code: if the two disagree about the format, the tests catch it.
   folder, the way `mtools` builds the FAT16 image from `disk_root/`.
   `make kfs` runs it.
 - **`kfs.py check IMAGE`** checks an image: every checksum, the tree's
-  key order, the bitmap against what the trees reference, and that every
-  directory entry has an inode. It exits with an error if anything is
+  key order, the bitmap against what the trees reference, that every
+  object has an inode and is in exactly one folder, that link counts,
+  sizes and block counts add up, and that every directory entry sits at
+  its name's hash. It exits with an error if anything is
   wrong; the tests run it after every scenario.
 - **`kfs.py ls|cat|get`** reads files out of an image on the host.
 
@@ -321,6 +358,13 @@ code: if the two disagree about the format, the tests catch it.
   every file back and compares checksums.
 - **Behaviour:** the Files/Notepad/DOOM scenarios from the FAT16 work,
   then `kfs.py check`.
+- **`kfstest`** (a Terminal command) makes random new files (sizes
+  either side of the inline limit and the extent size), overwrites,
+  renames, moves, new folders and folder deletes, checking every file
+  against what it should hold. `kfstest N SEED keep` leaves its folder
+  for `kfs.py check`; `fill` then writes 1 MiB files until the disk is
+  full, checks the failed write left nothing behind, deletes them and
+  checks every block came back.
 - **Crash testing**, which is what backs the "never corrupts" goal: a
   shell command writes, renames and deletes in a loop while the harness
   kills QEMU at a random moment. The image must then pass `kfs.py check` and
@@ -337,8 +381,8 @@ Each one ends in something that boots and passes its tests.
 1. **Read-only KFS** (done). `kfs.py`, the VFS layer, and a kernel that
    mounts a KFS disk read-only at `/kfs` and reads it. FAT16 stays `/`
    until 3.
-2. **Writing.** Commits, the allocator, deferred frees, inline data and
-   extents. Files and Notepad work on KFS.
+2. **Writing** (done). Commits, the allocator, deferred frees, inline
+   data and extents. Files and Notepad work on KFS.
 3. **Crash-tested, then default.** Crash and bit-rot testing pass, `make`
    builds a 512 MiB KFS disk, FAT16 moves to `/fat`. Released as a new
    version.

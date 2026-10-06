@@ -481,6 +481,76 @@ class Image:
         return sorted(out)
 
 
+def check_objects(items, sb):
+    """Every object is whole and in exactly one folder (v1 has no hard
+    links), link counts and sizes add up, and entries sit at their hash."""
+    problems = []
+    inodes, entries, inline, extents, owners = {}, {}, {}, {}, {}
+    for (obj, kind, off), d in items:
+        if kind == K_INODE:
+            inodes[obj] = unpack_inode(d)
+        elif kind == K_DIR_ENTRY:
+            child, t, n = struct.unpack_from("<QBB", d)
+            name = d[10:10 + n]
+            entries.setdefault(obj, []).append((name, child, t))
+            owners.setdefault(child, []).append(obj)
+            if not 0 <= off - name_hash(name) < 8:
+                problems.append(f"folder {obj}: entry {name!r} isn't at its name's hash")
+        elif kind == K_INLINE:
+            inline[obj] = len(d)
+        elif kind == K_EXTENT:
+            bp = unpack_bp(d)
+            (length,) = struct.unpack_from("<Q", d, BP)
+            extents.setdefault(obj, []).append((off, length, bp))
+        else:
+            problems.append(f"object {obj} has an item of unknown kind {kind}")
+    if ROOT_OBJECT not in inodes:
+        problems.append("no root folder")
+    everything = set(inodes) | set(entries) | set(inline) | set(extents) | set(owners)
+    for obj in sorted(everything):
+        ino = inodes.get(obj)
+        if ino is None:
+            where = owners.get(obj)
+            problems.append(f"object {obj} has no inode" + (f" (named in folder {where[0]})" if where else ""))
+            continue
+        if obj >= sb["next_object"]:
+            problems.append(f"object {obj} is at or past next_object ({sb['next_object']})")
+        held_by = owners.get(obj, [])
+        if obj != ROOT_OBJECT and len(held_by) != 1:
+            problems.append(f"object {obj} is in {len(held_by)} folders (should be 1)")
+        is_dir = ino["mode"] & 0o170000 == S_IFDIR
+        if is_dir:
+            kids = entries.get(obj, [])
+            subdirs = sum(1 for _, _, t in kids if t == T_DIR)
+            if ino["links"] != 2 + subdirs:
+                problems.append(f"folder {obj} has link count {ino['links']}, expected {2 + subdirs}")
+            for name, child, t in kids:
+                cino = inodes.get(child)
+                if cino and (t == T_DIR) != (cino["mode"] & 0o170000 == S_IFDIR):
+                    problems.append(f"folder {obj}: entry {name!r} has the wrong type")
+            if obj in inline or obj in extents:
+                problems.append(f"folder {obj} has file data")
+        else:
+            if obj in entries:
+                problems.append(f"file {obj} has folder entries")
+            if obj in inline and obj in extents:
+                problems.append(f"file {obj} has both inline data and extents")
+            if obj in inline and inline[obj] != ino["size"]:
+                problems.append(f"file {obj}: inline data is {inline[obj]} bytes, size says {ino['size']}")
+            blocks = 0
+            for off, length, bp in extents.get(obj, []):
+                blocks += bp["count"]
+                if off % BLOCK or length > bp["count"] * BLOCK or bp["count"] > EXTENT_MAX_BLOCKS:
+                    problems.append(f"file {obj}: bad extent at {off}")
+                if off + length > ino["size"]:
+                    problems.append(f"file {obj}: extent at {off} runs past its size {ino['size']}")
+            if blocks != ino["blocks"]:
+                problems.append(f"file {obj}: {blocks} blocks in extents, the inode says {ino['blocks']}")
+            if obj not in inline and obj not in extents and ino["size"]:
+                problems.append(f"file {obj} has size {ino['size']} but no data")
+    return problems
+
+
 def check(path):
     img = Image(path)
     sb = img.sb
@@ -572,14 +642,8 @@ def check(path):
     except IOError:
         items = None
     if items is not None:
+        problems += check_objects(items, sb)
         inodes = {k[0] for k, d in items if k[1] == K_INODE}
-        for (obj, kind, off), d in items:
-            if kind == K_DIR_ENTRY:
-                child = struct.unpack_from("<Q", d)[0]
-                if child not in inodes:
-                    problems.append(f"folder {obj} names object {child}, which has no inode")
-        if ROOT_OBJECT not in inodes:
-            problems.append("no root folder")
 
     print(f"kfs: {path}: txg {sb['txg']} (slot {sb['slot']}), {sb['total']} blocks, {sb['free']} free, "
           f"{len(inodes)} objects, label {sb['label']!r}")

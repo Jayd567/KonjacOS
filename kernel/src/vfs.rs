@@ -3,7 +3,6 @@
 //! and sends it to the filesystem that holds it:
 //!
 //! - `/kfs/...` goes to KonjacFS (`kfs.rs`), when a KFS disk is attached.
-//!   Read-only until milestone 2 of docs/kfs-design.md.
 //! - Everything else goes to FAT16 (`fat16.rs`), which is still `/`.
 //!
 //! The FAT16 driver only ever sees absolute paths from here, so its own
@@ -19,7 +18,7 @@ use crate::{fat16, kfs};
 
 /// Where the KFS volume appears.
 pub const KFS_MOUNT: &str = "/kfs";
-const READ_ONLY: &str = "KFS is read-only for now (writing comes in the next milestone)";
+const MOUNT_POINT: &str = "that's where the KFS disk is attached; it can't be moved or deleted";
 
 pub use fat16::VolumeStats;
 
@@ -76,13 +75,10 @@ fn on(path: &str) -> On {
     On::Fat(abs)
 }
 
-/// Whether files under `path` can't be changed (or `path` itself is a
-/// mount point).
+/// Whether `path` itself can't be renamed, moved or deleted: it's where a
+/// volume is attached. (What's inside it can be changed.)
 pub fn read_only(path: &str) -> bool {
-    match on(path) {
-        On::Kfs(_) => true,
-        On::Fat(p) => p == KFS_MOUNT && kfs::mounted(),
-    }
+    kfs::mounted() && absolute(path) == KFS_MOUNT
 }
 
 pub fn cwd_path_string() -> String {
@@ -185,48 +181,74 @@ pub fn read_file_range(path: &str, offset: u32, len: usize) -> Result<Vec<u8>, &
 
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
     match on(path) {
-        On::Kfs(_) => Err(READ_ONLY),
+        On::Kfs(p) => kfs::write_file(&p, data),
         On::Fat(p) => fat16::write_file(&p, data),
     }
 }
 
 pub fn create_dir(path: &str) -> Result<(), &'static str> {
     match on(path) {
-        On::Kfs(_) => Err(READ_ONLY),
+        On::Kfs(p) => kfs::create_dir(&p),
         On::Fat(p) => fat16::create_dir(&p),
     }
 }
 
 pub fn remove_file(path: &str) -> Result<(), &'static str> {
+    if read_only(path) {
+        return Err(MOUNT_POINT);
+    }
     match on(path) {
-        On::Kfs(_) => Err(READ_ONLY),
+        On::Kfs(p) => kfs::remove_file(&p),
         On::Fat(p) => fat16::remove_file(&p),
     }
 }
 
 /// Deletes a file, or a folder with everything in it.
 pub fn remove(path: &str) -> Result<(), &'static str> {
+    if read_only(path) {
+        return Err(MOUNT_POINT);
+    }
     match on(path) {
-        On::Kfs(_) => Err(READ_ONLY),
-        On::Fat(p) if p == KFS_MOUNT && kfs::mounted() => Err(READ_ONLY),
+        On::Kfs(p) => kfs::remove(&p),
         On::Fat(p) => fat16::remove(&p),
     }
 }
 
+/// Renames or moves a file or folder. Between volumes that means copying
+/// it, then deleting the original.
 pub fn rename(from: &str, to: &str) -> Result<(), &'static str> {
+    if read_only(from) || read_only(to) {
+        return Err(MOUNT_POINT);
+    }
     match (on(from), on(to)) {
         (On::Fat(a), On::Fat(b)) => fat16::rename(&a, &b),
-        _ => Err(READ_ONLY),
+        (On::Kfs(a), On::Kfs(b)) => kfs::rename(&a, &b),
+        _ => {
+            if stat_path(to).is_ok() {
+                return Err("something with that name is already there");
+            }
+            if let Err(e) = copy_across(&absolute(from), &absolute(to), 0) {
+                // Don't leave half a copy behind.
+                let _ = remove(to);
+                return Err(e);
+            }
+            remove(from)
+        }
     }
 }
 
 /// Copies a file, or a folder with everything in it, to a new path --
-/// across volumes too (e.g. from the read-only KFS disk to FAT16).
+/// across volumes too.
 pub fn copy(from: &str, to: &str) -> Result<(), &'static str> {
     match (on(from), on(to)) {
         (On::Fat(a), On::Fat(b)) => fat16::copy(&a, &b),
-        (_, On::Kfs(_)) => Err(READ_ONLY),
-        _ => copy_across(&absolute(from), &absolute(to), 0),
+        _ => {
+            let (from, to) = (absolute(from), absolute(to));
+            if to.strip_prefix(from.as_str()).is_some_and(|rest| rest.starts_with('/')) {
+                return Err("can't copy a folder into itself");
+            }
+            copy_across(&from, &to, 0)
+        }
     }
 }
 

@@ -22,6 +22,7 @@ const COMMAND: u16 = 0x1F7;
 
 const CMD_READ_SECTORS: u8 = 0x20;
 const CMD_WRITE_SECTORS: u8 = 0x30;
+const CMD_FLUSH_CACHE: u8 = 0xE7;
 
 const STATUS_ERR: u8 = 1 << 0;
 const STATUS_DRQ: u8 = 1 << 3;
@@ -139,6 +140,19 @@ pub unsafe fn read_sector(lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), &
         insw(DATA, buf);
 
         Ok(())
+    }
+}
+
+/// Asks the drive to write out its cache (FLUSH CACHE).
+///
+/// # Safety
+/// Same as [`read_sector`]: direct hardware I/O.
+pub unsafe fn flush() -> Result<(), &'static str> {
+    let _bus = BUS.lock();
+    unsafe {
+        outb(DRIVE_HEAD, 0xE0);
+        outb(COMMAND, CMD_FLUSH_CACHE);
+        wait_bsy_clear().map_err(status_to_message)
     }
 }
 

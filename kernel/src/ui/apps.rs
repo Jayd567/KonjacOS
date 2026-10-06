@@ -617,7 +617,7 @@ impl Files {
     fn reload(&mut self, select: Option<&str>) {
         let scroll = self.scroll;
         self.load();
-        self.selected = select.and_then(|n| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(n)));
+        self.selected = select.and_then(|n| self.find(n));
         self.scroll = scroll.min(self.max_scroll());
         self.reveal_selected();
     }
@@ -696,15 +696,14 @@ impl Files {
 
     fn enabled(&self, t: Tool) -> bool {
         let sel = self.selected.is_some();
-        // Nothing changes on a read-only volume (KFS, for now); copying
-        // from it still works.
-        let writable = !crate::vfs::read_only(&self.path);
+        // A mount point (/kfs) can't be moved or deleted; what's in it can.
+        let changeable = self.selected.is_some_and(|i| !crate::vfs::read_only(&self.child(&self.entries[i].name)));
         match t {
             Tool::Up => self.path != "/",
-            Tool::NewFolder | Tool::NewFile => self.error.is_none() && writable,
+            Tool::NewFolder | Tool::NewFile => self.error.is_none(),
             Tool::Copy => sel,
-            Tool::Cut | Tool::Rename | Tool::Delete => sel && writable,
-            Tool::Paste => self.clip.is_some() && writable,
+            Tool::Cut | Tool::Rename | Tool::Delete => changeable,
+            Tool::Paste => self.clip.is_some(),
             Tool::ConfirmDelete | Tool::CancelDelete => true,
         }
     }
@@ -724,8 +723,15 @@ impl Files {
             .find(|&t| Self::tool_rect(t, w).contains(x, y) && self.enabled(t))
     }
 
+    /// Whether `name` is taken here. The filesystem decides: FAT16 ignores
+    /// case, KFS doesn't.
     fn exists(&self, name: &str) -> bool {
-        self.entries.iter().any(|e| e.name.eq_ignore_ascii_case(name))
+        crate::vfs::stat_path(&self.child(name)).is_ok()
+    }
+
+    /// The entry called `name`: exactly, or else ignoring case.
+    fn find(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|e| e.name == name).or_else(|| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(name)))
     }
 
     /// `stem ext`, or `stem (2) ext`, `stem (3) ext`... whichever is free.
@@ -1272,28 +1278,27 @@ impl App for Files {
         }
         self.commit_edit();
         self.selected = self.row_at(y);
-        // Read-only volumes (KFS, for now) offer only what doesn't change them.
-        let writable = !crate::vfs::read_only(&self.path);
-        let paste = (self.clip.is_some() && writable).then_some(7);
+        let paste = self.clip.is_some().then_some(7);
         match self.selected {
             Some(i) => {
                 let e = &self.entries[i];
                 let child = self.child(&e.name);
-                let changeable = writable && !crate::vfs::read_only(&child);
+                // A mount point (/kfs) can't be moved or deleted.
+                let changeable = !crate::vfs::read_only(&child);
                 let mut v = alloc::vec![("Open", (e.is_dir || opener(&e.name).is_some()).then_some(0))];
                 if !e.is_dir {
                     v.push(("Edit in Notepad", Some(10)));
                 }
                 v.extend_from_slice(&[("", None), ("Cut", changeable.then_some(5)), ("Copy", Some(6))]);
                 if e.is_dir {
-                    v.push(("Paste Into Folder", (self.clip.is_some() && !crate::vfs::read_only(&child)).then_some(11)));
+                    v.push(("Paste Into Folder", self.clip.is_some().then_some(11)));
                 }
                 v.extend_from_slice(&[("", None), ("Rename", changeable.then_some(8)), ("Delete", changeable.then_some(9)), ("", None), ("Create Shortcut", Some(3))]);
                 v
             }
             None => alloc::vec![
-                ("New Folder", writable.then_some(12)),
-                ("New Text Document", writable.then_some(13)),
+                ("New Folder", Some(12)),
+                ("New Text Document", Some(13)),
                 ("", None),
                 ("Paste", paste),
                 ("", None),
@@ -1345,7 +1350,7 @@ impl App for Files {
         self.commit_edit();
         self.path = String::from(dir);
         self.load();
-        self.selected = select.and_then(|name| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(name)));
+        self.selected = select.and_then(|name| self.find(name));
         self.reveal_selected();
     }
 
