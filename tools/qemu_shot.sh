@@ -12,7 +12,7 @@
 #   click X Y       move there and left-click (dclick: double-click,
 #                   rclick: right-click)
 #   drag X1 Y1 X2 Y2  press at (X1, Y1), move to (X2, Y2), release
-#   type TEXT       type lowercase TEXT (spaces, / . - _ allowed)
+#   type TEXT       type TEXT (letters, digits, spaces, / . - _)
 #   wheel N         turn the scroll wheel N notches down (negative: up)
 #   anything else   a raw QEMU monitor command (`sendkey ret`, ...)
 # Serial output goes to OUT_PREFIX-serial.log. Needs image.iso + disk.img.
@@ -26,6 +26,7 @@ sock="$(mktemp -u /tmp/konjac-mon.XXXXXX)"
 qemu-system-x86_64 -m 256M -no-reboot -boot order=d -rtc base=localtime \
     -cdrom image.iso \
     -drive file=disk.img,format=raw,if="${DISK_IF:-virtio}" \
+    $( [ -f kfs.img ] && echo "-drive file=kfs.img,format=raw,if=virtio" ) \
     -display none -serial "file:$out-serial.log" \
     -monitor "unix:$sock,server,nowait" &
 qpid=$!
@@ -85,7 +86,7 @@ for c in "${cmds[@]}"; do
         drag\ *) read -r _ x1 y1 x2 y2 <<< "$c"; moveto "$x1" "$y1"; sleep 0.2; mon "mouse_button 1"; sleep 0.2; step_move $((x2 - x1)) $((y2 - y1)); sleep 0.3; mon "mouse_button 0" ;;
         dclick\ *) read -r _ x y <<< "$c"; moveto "$x" "$y"; sleep 0.2; mon "mouse_button 1"; mon "mouse_button 0"; sleep 0.05; mon "mouse_button 1"; mon "mouse_button 0" ;;
         wheel\ *) n="${c#wheel }"; z=-1; [ "$n" -lt 0 ] && { z=1; n=$((-n)); }; for ((k=0; k<n; k++)); do mon "mouse_move 0 0 $z"; done ;;
-        type\ *) t="${c#type }"; for ((k=0; k<${#t}; k++)); do ch="${t:k:1}"; case "$ch" in " ") ch=spc;; "/") ch=slash;; ".") ch=dot;; "-") ch=minus;; "_") ch=shift-minus;; esac; mon "sendkey $ch"; done ;;
+        type\ *) t="${c#type }"; for ((k=0; k<${#t}; k++)); do ch="${t:k:1}"; case "$ch" in " ") ch=spc;; "/") ch=slash;; ".") ch=dot;; "-") ch=minus;; "_") ch=shift-minus;; [A-Z]) ch="shift-$(echo "$ch" | tr A-Z a-z)";; esac; mon "sendkey $ch"; done ;;
         *) mon "$c" ;;
     esac
 done

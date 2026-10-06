@@ -281,7 +281,7 @@ const NSIG: usize = 32;
 /// Static content supports the existing synthetic proc files without allocation.
 #[derive(Clone, Copy)]
 pub enum FileBacking {
-    Disk(crate::fat16::File),
+    Disk(crate::vfs::File),
     Static(&'static [u8]),
 }
 

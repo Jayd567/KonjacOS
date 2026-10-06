@@ -43,13 +43,13 @@ pub static COMMANDS: &[Command] = &[
         handler: cmd_alloc,
     },
     Command { name: "about", summary: "what is this", requires_apex: false, handler: cmd_about },
-    Command { name: "ls", summary: "list the current directory", requires_apex: false, handler: cmd_ls },
+    Command { name: "ls", summary: "[dir]  list a directory (default: the current one)", requires_apex: false, handler: cmd_ls },
     Command { name: "cd", summary: "[dir]  change directory (.., /, multi-level paths); no args prints cwd", requires_apex: false, handler: cmd_cd },
     Command { name: "pwd", summary: "print the current directory", requires_apex: false, handler: cmd_pwd },
     Command { name: "cat", summary: "<file>  print a file's contents", requires_apex: false, handler: cmd_cat },
     Command {
         name: "readat",
-        summary: "<file> <offset> <len>  print a byte range without reading the whole file (tests fat16::read_file_range)",
+        summary: "<file> <offset> <len>  print a byte range without reading the whole file (tests vfs::read_file_range)",
         requires_apex: false,
         handler: cmd_readat,
     },
@@ -127,9 +127,11 @@ fn cmd_about(_rest: &str) {
     println!("KonjacOS -- a hobby kernel, still very much under construction.");
 }
 
-fn cmd_ls(_rest: &str) {
-    match crate::fat16::list_current_dir() {
-        Ok(entries) => {
+fn cmd_ls(rest: &str) {
+    let listing = if rest.is_empty() { crate::vfs::list_current_dir() } else { crate::vfs::list_dir(rest) };
+    match listing {
+        Ok(mut entries) => {
+            entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())));
             if entries.is_empty() {
                 println!("(empty)");
             }
@@ -151,16 +153,16 @@ fn cmd_cd(rest: &str) {
     // behaviour (go to a "home" directory) since there's no such notion
     // here anyway.
     if rest.is_empty() {
-        println!("{}", crate::fat16::cwd_path_string());
+        println!("{}", crate::vfs::cwd_path_string());
         return;
     }
-    if let Err(e) = crate::fat16::change_dir(rest) {
+    if let Err(e) = crate::vfs::change_dir(rest) {
         println!("cd: {rest}: {e}");
     }
 }
 
 fn cmd_pwd(_rest: &str) {
-    println!("{}", crate::fat16::cwd_path_string());
+    println!("{}", crate::vfs::cwd_path_string());
 }
 
 fn cmd_cat(rest: &str) {
@@ -168,7 +170,7 @@ fn cmd_cat(rest: &str) {
         println!("usage: cat <file>");
         return;
     }
-    match crate::fat16::read_file(rest) {
+    match crate::vfs::read_file(rest) {
         Ok(data) => match core::str::from_utf8(&data) {
             Ok(text) => print!("{text}"),
             Err(_) => println!("cat: {rest} is not valid UTF-8 ({} bytes)", data.len()),
@@ -195,7 +197,7 @@ fn cmd_readat(rest: &str) {
         println!("readat: {len_str} is not a valid length");
         return;
     };
-    match crate::fat16::read_file_range(path, offset, len) {
+    match crate::vfs::read_file_range(path, offset, len) {
         Ok(data) => match core::str::from_utf8(&data) {
             Ok(text) => println!("{} bytes: {text:?}", data.len()),
             Err(_) => println!("{} bytes (not valid UTF-8)", data.len()),
@@ -220,7 +222,7 @@ fn cmd_write(rest: &str) {
     data.extend_from_slice(text.as_bytes());
     data.push(b'\n');
 
-    match crate::fat16::write_file(name, &data) {
+    match crate::vfs::write_file(name, &data) {
         Ok(()) => println!("wrote {} bytes to {name}", data.len()),
         Err(e) => println!("write: {name}: {e}"),
     }
@@ -231,7 +233,7 @@ fn cmd_rm(rest: &str) {
         println!("usage: rm <file>");
         return;
     }
-    match crate::fat16::remove_file(rest) {
+    match crate::vfs::remove_file(rest) {
         Ok(()) => println!("removed {rest}"),
         Err(e) => println!("rm: {rest}: {e}"),
     }
@@ -241,7 +243,7 @@ fn cmd_rm(rest: &str) {
 /// listing the root folder -- the "before and after" numbers for disk
 /// driver and filesystem work.
 fn cmd_diskbench(_rest: &str) {
-    use crate::fat16;
+    use crate::vfs;
     // `ms` and KiB/s from a tick count and a byte count.
     fn report(what: &str, ticks: u64, bytes: usize, sectors: u64) {
         let ms = ticks * 1000 / timer::HZ as u64;
@@ -256,14 +258,21 @@ fn cmd_diskbench(_rest: &str) {
     println!("diskbench ({}):", crate::block::backend_name());
 
     let (t, s) = (timer::ticks(), ops());
-    match fat16::read_file("/DOOM1.WAD") {
+    match vfs::read_file("/DOOM1.WAD") {
         Ok(d) => report("read DOOM1.WAD", timer::ticks() - t, d.len(), ops() - s),
         Err(e) => println!("  read DOOM1.WAD: {e}"),
+    }
+    if crate::kfs::mounted() {
+        let (t, s) = (timer::ticks(), ops());
+        match vfs::read_file("/kfs/DOOM1.WAD") {
+            Ok(d) => report("read it from KFS", timer::ticks() - t, d.len(), ops() - s),
+            Err(e) => println!("  read /kfs/DOOM1.WAD: {e}"),
+        }
     }
 
     let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i * 7 + i / 4096) as u8).collect();
     let (t, s) = (timer::ticks(), ops());
-    match fat16::write_file("/BENCH.TMP", &data) {
+    match vfs::write_file("/BENCH.TMP", &data) {
         Ok(()) => report("write 1 MiB", timer::ticks() - t, data.len(), ops() - s),
         Err(e) => {
             println!("  write 1 MiB: {e}");
@@ -271,7 +280,7 @@ fn cmd_diskbench(_rest: &str) {
         }
     }
     let (t, s) = (timer::ticks(), ops());
-    match fat16::read_file("/BENCH.TMP") {
+    match vfs::read_file("/BENCH.TMP") {
         Ok(d) => {
             report("read it back", timer::ticks() - t, d.len(), ops() - s);
             if d != data {
@@ -282,11 +291,11 @@ fn cmd_diskbench(_rest: &str) {
     }
     let (t, s) = (timer::ticks(), ops());
     for _ in 0..20 {
-        let _ = fat16::list_dir("/");
+        let _ = vfs::list_dir("/");
     }
     report("list / x20", timer::ticks() - t, 0, ops() - s);
     let (t, s) = (timer::ticks(), ops());
-    match fat16::remove_file("/BENCH.TMP") {
+    match vfs::remove_file("/BENCH.TMP") {
         Ok(()) => report("delete it", timer::ticks() - t, 0, ops() - s),
         Err(e) => println!("  delete: {e}"),
     }
@@ -450,7 +459,7 @@ pub fn launch_doom() -> Result<u64, &'static str> {
     if let Some(id) = crate::doom_driver::running_task() {
         return Ok(id);
     }
-    if crate::fat16::stat_path("/DOOM1.WAD").is_err() {
+    if crate::vfs::stat_path("/DOOM1.WAD").is_err() {
         return Err("DOOM1.WAD not found at the filesystem root (boot with the disk image attached)");
     }
     // Drop whatever's still queued in the DOOM key ring, so DOOM's very
@@ -509,7 +518,7 @@ fn cmd_run(rest: &str) {
     argv.push(path.to_string());
     argv.extend(parts.map(|s| s.to_string()));
 
-    let bytes = match crate::fat16::read_file(path) {
+    let bytes = match crate::vfs::read_file(path) {
         Ok(data) => data,
         Err(e) => {
             println!("run: {path}: {e}");

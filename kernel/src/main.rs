@@ -30,6 +30,7 @@ mod heap;
 mod idt;
 mod intrinsics;
 mod keyboard;
+mod kfs;
 mod libc_shim;
 mod limine;
 mod linux_syscall;
@@ -51,6 +52,7 @@ mod task;
 mod timer;
 mod ui;
 mod usermode;
+mod vfs;
 mod virtio_blk;
 mod vm;
 
@@ -164,11 +166,19 @@ pub extern "C" fn kstart() -> ! {
     sprintln!("PIT timer installed at {}Hz.", timer::HZ);
 
     block::init();
-    sprintln!("Data disk: {}.", block::backend_name());
+    sprintln!("Data disks: {} ({}).", block::count(), block::backend_name());
 
     match unsafe { fat16::init() } {
-        Ok(()) => sprintln!("FAT16 filesystem mounted from the primary ATA disk."),
+        Ok(()) => sprintln!("FAT16 filesystem mounted at /."),
         Err(e) => sprintln!("no filesystem mounted ({e}) -- `ls`/`cat` won't work."),
+    }
+    match kfs::mount() {
+        Ok(()) => {
+            if let Some((label, txg, total, free)) = kfs::info() {
+                sprintln!("KonjacFS volume {label:?} mounted at {} (read-only; txg {txg}, {free} of {total} blocks free).", vfs::KFS_MOUNT);
+            }
+        }
+        Err(e) => sprintln!("KonjacFS: {e}."),
     }
 
     // The desktop takes over the screen before interrupts (and with them

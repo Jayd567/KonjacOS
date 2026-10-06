@@ -91,7 +91,7 @@ fn prompt_password(prompt: &str) -> String {
 /// fresh disk with none yet, `Err` for anything else (corrupt file,
 /// unmounted filesystem, ...).
 fn load_stored_hash() -> Result<Option<String>, &'static str> {
-    match crate::fat16::read_file(PASSWORD_PATH) {
+    match crate::vfs::read_file(PASSWORD_PATH) {
         Ok(data) => {
             let text = core::str::from_utf8(&data).map_err(|_| "apex: password file is corrupt (not valid text)")?;
             Ok(Some(String::from(text.trim())))
@@ -102,7 +102,7 @@ fn load_stored_hash() -> Result<Option<String>, &'static str> {
 }
 
 fn save_hash(hash_hex: &str) -> Result<(), &'static str> {
-    crate::fat16::write_file(PASSWORD_PATH, hash_hex.as_bytes())
+    crate::vfs::write_file(PASSWORD_PATH, hash_hex.as_bytes())
 }
 
 /// First-time setup: choose and confirm a new password, hash it, and

@@ -306,7 +306,7 @@ impl SettingsApp {
         self.query.clear();
         self.typing = false;
         if section == Section::Storage {
-            self.disk = crate::fat16::volume_stats()
+            self.disk = crate::vfs::volume_stats()
                 .ok()
                 .map(|v| ((v.total_clusters - v.free_clusters) * v.cluster_bytes, v.total_clusters * v.cluster_bytes));
         }

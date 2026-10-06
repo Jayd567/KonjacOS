@@ -71,6 +71,7 @@ Things to try in the Terminal:
 
 ```
 ls                 list files on the disk
+ls /kfs            list the KonjacFS disk (read-only for now)
 cat README.TXT     print a file
 run hello.exe      run a Windows-format program
 doom               play DOOM (opens in its own window)
@@ -142,7 +143,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 | `kernel/csrc/` | C code built into the kernel, including the DOOM port |
 | `disk_root/` | Files copied onto the disk image |
 | `userprogs/` | Small test programs |
-| `tools/` | Debugging scripts, the asset generator and a QEMU screenshot harness |
+| `tools/` | Debugging scripts, the asset generator, `kfs.py` (KonjacFS images) and a QEMU screenshot harness |
 | `boot/`, `limine/` | Bootloader configuration and files |
 | `docs/` | Design notes and development history |
 

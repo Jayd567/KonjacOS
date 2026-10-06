@@ -63,7 +63,7 @@
 
 use core::arch::global_asm;
 
-use crate::fat16;
+use crate::vfs;
 use crate::idt;
 use crate::paging;
 use crate::pmm;
@@ -139,7 +139,7 @@ extern "C" fn syscall_handler(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
                 Err(_) => return SYS_ERROR,
             };
             let ino = task::hash_path(path);
-            match fat16::open_file(path).map(FileBacking::Disk) {
+            match vfs::open_file(path).map(FileBacking::Disk) {
                 Ok(data) => task::with_current_open_files(|table| match table.iter().position(|f| f.is_none()) {
                     Some(fd) => {
                         table[fd] = Some(OpenFile { data, pos: 0, ino, extra: None });

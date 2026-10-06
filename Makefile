@@ -4,6 +4,7 @@
 #   make kernel   - build the Rust kernel binary only
 #   make iso      - build the kernel and package a bootable ISO (image.iso)
 #   make disk     - build the FAT16 data disk (disk.img) from disk_root/
+#   make kfs      - build the KonjacFS disk (kfs.img) from disk_root/
 #   make run      - build the ISO + disk and boot them in QEMU (BIOS)
 #   make run-uefi - build the ISO + disk and boot them in QEMU (UEFI, via OVMF)
 #   make release  - build both images and package them into dist/
@@ -22,6 +23,8 @@ IMAGE         := image.iso
 DISK_ROOT     := disk_root
 DISK_IMAGE    := disk.img
 DISK_SIZE_MB  := 400
+KFS_IMAGE     := kfs.img
+KFS_SIZE      := 512M
 LIMINE_VERSION := 9.6.7
 VERSION       ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 DIST          := dist
@@ -92,17 +95,23 @@ disk:
 		echo "Built $(DISK_IMAGE) from $(DISK_ROOT)/ (including subdirectories)"; \
 	fi
 
+# The KonjacFS disk, built by tools/kfs.py (Python 3, standard library
+# only). Mounted read-only at /kfs until KFS can write.
+.PHONY: kfs
+kfs:
+	@if [ -f $(KFS_IMAGE) ]; then 		echo "$(KFS_IMAGE) already exists, leaving it alone (rm it to regenerate from $(DISK_ROOT)/)"; 	else 		python3 tools/kfs.py mkfs $(DISK_ROOT) $(KFS_IMAGE) --size $(KFS_SIZE); 	fi
+
 comma := ,
 # virtio: the fast DMA disk driver (`virtio_blk.rs`). `if=ide` works too,
-# through the slower ATA driver.
-DISK_DRIVE = $(if $(wildcard $(DISK_IMAGE)),-drive file=$(DISK_IMAGE)$(comma)format=raw$(comma)if=virtio)
+# through the slower ATA driver (FAT16 disk only).
+DISK_DRIVE = $(if $(wildcard $(DISK_IMAGE)),-drive file=$(DISK_IMAGE)$(comma)format=raw$(comma)if=virtio) 	$(if $(wildcard $(KFS_IMAGE)),-drive file=$(KFS_IMAGE)$(comma)format=raw$(comma)if=virtio)
 
 .PHONY: run
-run: iso disk
+run: iso disk kfs
 	qemu-system-x86_64 $(QEMU_FLAGS) -cdrom $(IMAGE) $(DISK_DRIVE)
 
 .PHONY: run-uefi
-run-uefi: iso disk
+run-uefi: iso disk kfs
 	@test -f /usr/share/OVMF/OVMF_CODE_4M.fd || \
 		(echo "OVMF firmware not found; install the 'ovmf' package" && exit 1)
 	qemu-system-x86_64 $(QEMU_FLAGS) \

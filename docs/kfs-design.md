@@ -2,7 +2,8 @@
 
 KFS is the filesystem that will replace FAT16 as KonjacOS's main disk
 format. This document fixes its on-disk layout and the rules for changing
-it, before any code is written. Status: **agreed, not implemented yet**.
+it. Status: **milestone 1 (read-only) implemented**; the details below
+match `tools/kfs.py` and `kernel/src/kfs.rs`.
 
 ## Goals
 
@@ -125,8 +126,11 @@ A node is one 4 KiB block:
 - **Header (64 bytes):** magic `"KFSN"`, `level` (0 = leaf), item count,
   the owning tree, `birth_txg`, and padding. The node's checksum isn't in
   the node itself; it's in the parent's pointer to it.
-- **Interior node:** keys and child block pointers, about 80 per node.
-- **Leaf:** an array of `(key, data offset, data size)` from the front, and
+- **Interior node:** up to 72 entries of 56 bytes: a key (24 bytes:
+  `object` u64, `offset` u64, `kind` u8, 7 bytes padding) and the
+  child's block pointer. The key is the smallest key in that child.
+- **Leaf:** 24-byte item headers from the front (`object` u64, `offset`
+  u64, `kind` u8, 3 bytes padding, data offset u16, data size u16), and
   item data packed from the back of the block, like a slotted page.
 
 The tree is a standard B+tree, with one rule: **a node is never modified
@@ -155,11 +159,13 @@ generation counter could be confused (v1 simply never reuses them).
 
 ### Directories
 
-Each entry is a `DIR_ENTRY` item under the directory's object, keyed by a
-64-bit hash of the name. The item holds the name itself (up to 255 bytes
-of UTF-8), so a hash collision is resolved by comparing names; colliding
-entries take the next free `offset`. Looking a name up costs one tree
-search.
+Each entry is a `DIR_ENTRY` item under the directory's object, keyed by
+the xxHash64 of the name with its low three bits cleared. The item holds
+the child's object number (u64), its type (u8: 1 file, 2 folder), the
+name's length (u8) and the name itself (up to 255 bytes of UTF-8). A hash
+collision is resolved by comparing names: colliding entries take the
+next free `offset` among the following seven. Looking a name up costs
+one tree search.
 
 **Names are case-sensitive and case-preserving**, like Linux (decided):
 `Notes.txt` and `notes.txt` are different files. FAT16 is
@@ -175,11 +181,14 @@ in name order, the caller sorts the entries, as Files already does.
 - **Inline:** a file of up to 2 KiB has its data in an `INLINE` item next
   to its inode. Reading it costs the one leaf read that found the inode.
   This covers configuration files, `DESKTOP.CFG` and most notes.
-- **Extents:** larger files are a list of `EXTENT` items, each mapping a
-  byte range of the file to a run of up to 32768 blocks (128 MiB). Writing
-  a file in one go allocates one large run when free space allows, so
-  reading it back is one request per 64 KiB (the virtio-blk limit) with
-  no lookups in between.
+- **Extents:** larger files are a list of `EXTENT` items (a block pointer
+  plus the number of bytes used, 40 bytes), each covering **at most
+  64 KiB** (16 blocks). The limit is there for the checksum: a read
+  anywhere in an extent has to read and verify all of it, so a 128 MiB
+  extent would make every small read cost 128 MiB. Writing a file in one
+  go still allocates one long run of blocks when free space allows, so
+  the extents sit end to end and reading the file is one request per
+  64 KiB (also the virtio-blk limit) with no seeking in between.
 - **Sparse:** a range with no extent reads as zeros and uses no space.
   The format supports it from v1; the write path creates holes only
   where something explicitly seeks past the end.
@@ -191,10 +200,13 @@ extents.
 
 v1 keeps free space as a **bitmap**: one bit per block, 32 KiB of bitmap
 per GiB of disk (1 MiB for a 32 GiB disk). The bitmap is stored in
-4 KiB blocks, each covering 128 MiB of disk, found through an index
-(`bitmap_root`). The index is a small tree of pointer blocks: one index
-block holds 128 pointers (16 GiB of disk), and another level is added
-when the disk outgrows it. Like everything else, it's copy-on-write.
+4 KiB blocks, each covering 128 MiB of disk (bit *n* of bitmap block *k*
+is block `k * 32768 + n`, 1 = in use; bits past the end of the volume
+are set). The blocks are found through an index (`bitmap_root`): a small
+tree of nodes with the usual header (tree 2) and up to 126 block
+pointers each (almost 16 GiB of disk); level 1 points at bitmap blocks,
+and another level is added when the disk outgrows one node. Like
+everything else, it's copy-on-write.
 
 - At mount, the bitmap blocks are read as needed rather than all at once.
   The allocator keeps a small in-memory summary (free blocks per 16 MiB
@@ -290,25 +302,28 @@ switch from `fat16::` to `vfs::`, which is a mechanical change.
 
 ## Tools
 
-- **`tools/mkkfs.py`** builds a KFS image from a folder, the way `mtools`
-  builds the FAT16 image from `disk_root/` today, so `make` keeps working
-  with no new system packages. It's written from this document, separately
-  from the kernel code: if the two disagree about the format, the tests
-  catch it.
-- **`tools/kfsck.py`** checks an image: every checksum, every tree's
-  ordering, the bitmap against what the trees reference, and link counts.
-  The tests run it after every scenario.
-- **`tools/kfs.py ls|cat|get`** reads files out of an image on the host.
+`tools/kfs.py` (Python 3, standard library only, so `make` needs no new
+packages). It's written from this document, separately from the kernel
+code: if the two disagree about the format, the tests catch it.
+
+- **`kfs.py mkfs DIR IMAGE --size 512M`** builds a KFS image from a
+  folder, the way `mtools` builds the FAT16 image from `disk_root/`.
+  `make kfs` runs it.
+- **`kfs.py check IMAGE`** checks an image: every checksum, the tree's
+  key order, the bitmap against what the trees reference, and that every
+  directory entry has an inode. It exits with an error if anything is
+  wrong; the tests run it after every scenario.
+- **`kfs.py ls|cat|get`** reads files out of an image on the host.
 
 ## Testing
 
-- **Format round-trip:** `mkkfs.py` builds an image, the kernel reads
+- **Format round-trip:** `kfs.py mkfs` builds an image, the kernel reads
   every file back and compares checksums.
 - **Behaviour:** the Files/Notepad/DOOM scenarios from the FAT16 work,
-  then `kfsck.py`.
+  then `kfs.py check`.
 - **Crash testing**, which is what backs the "never corrupts" goal: a
   shell command writes, renames and deletes in a loop while the harness
-  kills QEMU at a random moment. The image must then pass `kfsck.py` and
+  kills QEMU at a random moment. The image must then pass `kfs.py check` and
   mount, with every file either at its last committed contents or absent.
   This runs hundreds of times with different timings.
 - **Bit rot:** flip a byte in an image; reading the affected file must
@@ -319,8 +334,9 @@ switch from `fat16::` to `vfs::`, which is a mechanical change.
 
 Each one ends in something that boots and passes its tests.
 
-1. **Read-only KFS.** `mkkfs.py`, the VFS layer, and a kernel that mounts
-   and reads a KFS disk. FAT16 stays the default until 3.
+1. **Read-only KFS** (done). `kfs.py`, the VFS layer, and a kernel that
+   mounts a KFS disk read-only at `/kfs` and reads it. FAT16 stays `/`
+   until 3.
 2. **Writing.** Commits, the allocator, deferred frees, inline data and
    extents. Files and Notepad work on KFS.
 3. **Crash-tested, then default.** Crash and bit-rot testing pass, `make`
@@ -345,7 +361,7 @@ FAT16 goes once KFS has shown it's better *and* works. The checklist:
   or faster.
 - **Everything works:** booting, the shell, Files, Notepad, DOOM, Java
   and the Linux programs, on KFS alone, for a full release.
-- **Files can still get in and out:** `mkkfs.py` and `kfs.py` cover
+- **Files can still get in and out:** `kfs.py` covers
   everything `mtools` did (adding files to an image, reading them back).
 
 Then `fat16.rs`, the `/fat` mount and the `mtools` build steps are
@@ -378,7 +394,7 @@ already guarantees that changing one copy never changes the other.
 
 | Idea | In this design |
 |---|---|
-| Extents instead of cluster chains | v1: `EXTENT` items, up to 128 MiB each |
+| Extents instead of cluster chains | v1: `EXTENT` items, up to 64 KiB each, laid end to end |
 | 64-bit block addressing | v1 |
 | Copy-on-write + atomic superblock switch | v1: [Commits](#commits), 8-slot superblock ring |
 | Small files inside the index record | v1: `INLINE`, up to 2 KiB |

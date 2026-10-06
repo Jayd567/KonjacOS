@@ -54,7 +54,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::fat16;
+use crate::vfs;
 use crate::paging::{self, PAGE_USER, PAGE_WRITABLE};
 use crate::pmm;
 use crate::task;
@@ -1201,7 +1201,7 @@ fn load_and_run_with_interp(name: &'static str, argv: &[String], envp: &[String]
     // (see its own doc comment) -- exactly the shape a real PT_INTERP
     // string always has (e.g. "/libc.so"), so no massaging needed here,
     // unlike the DT_NEEDED scheme's bare-soname lookups above.
-    let interp_bytes = fat16::read_file(interp_path).map_err(|_| "loader: couldn't find this program's PT_INTERP dynamic linker on disk")?;
+    let interp_bytes = vfs::read_file(interp_path).map_err(|_| "loader: couldn't find this program's PT_INTERP dynamic linker on disk")?;
     if detect(&interp_bytes) != Format::Elf {
         return Err("loader: this program's PT_INTERP dynamic linker isn't an ELF file");
     }
@@ -1263,7 +1263,7 @@ pub fn load_and_run(name: &'static str, argv: &[String], envp: &[String], bytes:
         // FAT16 is flat/8.3 (see fat16.rs) -- a soname like "libfoo.so" is
         // looked up directly at the filesystem root, case-insensitively,
         // same as every other file `run` loads.
-        let lib_bytes = fat16::read_file(lib_name).map_err(|_| "loader: couldn't find a DT_NEEDED shared library on disk")?;
+        let lib_bytes = vfs::read_file(lib_name).map_err(|_| "loader: couldn't find a DT_NEEDED shared library on disk")?;
         if detect(&lib_bytes) != Format::Elf {
             return Err("loader: a DT_NEEDED dependency isn't an ELF shared library");
         }

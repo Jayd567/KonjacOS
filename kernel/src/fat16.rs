@@ -7,20 +7,16 @@
 //! driver supports 8.3 short filenames and real VFAT long filenames
 //! (reading them, and writing them with proper `~N` short aliases),
 //! reading and writing whole files, creating, renaming, moving, copying
-//! and deleting files and folders, and walking subdirectories (including
-//! a `cd`-style current-directory tracked here rather than in the shell,
-//! so any future caller besides the shell gets the same notion of "where
-//! we are"). Timestamps are still unsupported -- writes always store a
-//! zeroed date/time, which real FAT tools treat as "unknown," not an
-//! error.
+//! and deleting files and folders, and walking subdirectories.
+//! Timestamps are still unsupported -- writes always store a zeroed
+//! date/time, which real FAT tools treat as "unknown," not an error.
 //!
-//! Subdirectory traversal deliberately does *not* rely on the on-disk "."
-//! and ".." entries every FAT directory has -- [`Cwd`] keeps its own
-//! stack of (name, cluster) instead. That's what lets [`cwd_path_string`]
-//! print a real path (FAT doesn't store a directory's name or parent
-//! anywhere *in* the directory itself, only in whichever parent entry
-//! points at it) and lets `cd ..` be a plain stack pop instead of an
-//! extra disk read.
+//! The rest of the kernel reaches this through `vfs.rs`, which owns the
+//! current directory and only ever passes absolute paths here; [`Cwd`]
+//! (still used to resolve a path's folders) therefore always stays at the
+//! root. Subdirectory traversal deliberately does *not* rely on the
+//! on-disk "." and ".." entries every FAT directory has -- it keeps its
+//! own stack of (name, cluster) instead.
 
 extern crate alloc;
 
@@ -119,7 +115,7 @@ fn flush_fat() -> Result<(), &'static str> {
         }
         let bytes = &fat.table[start * SECTOR_SIZE..i * SECTOR_SIZE];
         for copy in 0..l.num_fats {
-            block::write((l.fat_start_lba + copy * l.fat_sectors + start as u32) as u64, bytes)?;
+            block::write(disk(), (l.fat_start_lba + copy * l.fat_sectors + start as u32) as u64, bytes)?;
         }
     }
     Ok(())
@@ -133,25 +129,46 @@ fn committed<T>(result: Result<T, &'static str>) -> Result<T, &'static str> {
     flushed.map(|_| value)
 }
 
+/// Which disk (see `block.rs`) holds the FAT16 volume.
+static DISK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn disk() -> usize {
+    DISK.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn read_sector(lba: u32) -> Result<[u8; SECTOR_SIZE], &'static str> {
     let mut buf = [0u8; SECTOR_SIZE];
-    block::read(lba as u64, &mut buf)?;
+    block::read(disk(), lba as u64, &mut buf)?;
     Ok(buf)
 }
 
 fn write_sector(lba: u32, buf: &[u8; SECTOR_SIZE]) -> Result<(), &'static str> {
-    block::write(lba as u64, buf)
+    block::write(disk(), lba as u64, buf)
 }
 
-/// Parses the boot sector / BIOS Parameter Block and caches the derived
-/// layout for every later call in this module. Also resets the current
-/// directory to root, in case this is ever called more than once.
+/// Finds the disk with a FAT16 volume on it (see [`mount`]).
 ///
 /// # Safety
-/// Must be called after the ATA driver is usable (no init needed there
-/// beyond the kernel being far enough into boot to do port I/O) and before
-/// any other function in this module.
+/// Must be called after `block::init` and before any other function in
+/// this module.
 pub unsafe fn init() -> Result<(), &'static str> {
+    let mut first_error = "fat16: no disks";
+    for d in 0..block::count() {
+        DISK.store(d, core::sync::atomic::Ordering::Relaxed);
+        match unsafe { mount() } {
+            Ok(()) => return Ok(()),
+            Err(e) if d == 0 => first_error = e,
+            Err(_) => {}
+        }
+    }
+    Err(first_error)
+}
+
+/// Parses the boot sector / BIOS Parameter Block of the disk in [`DISK`]
+/// and caches the derived layout for every later call in this module.
+/// Also resets the current directory to root, in case this is ever called
+/// more than once.
+unsafe fn mount() -> Result<(), &'static str> {
     let boot = read_sector(0)?;
 
     if boot[510] != 0x55 || boot[511] != 0xAA {
@@ -195,7 +212,7 @@ pub unsafe fn init() -> Result<(), &'static str> {
     };
 
     let mut fat = alloc::vec![0u8; (fat_sectors_16 as usize) * SECTOR_SIZE];
-    block::read(fat_start_lba as u64, &mut fat)?;
+    block::read(disk(), fat_start_lba as u64, &mut fat)?;
     let sectors = fat_sectors_16 as usize;
     *FAT.lock() = FatCache { table: fat, dirty: alloc::vec![false; sectors] };
     *LAYOUT.lock() = Some(layout);
@@ -474,11 +491,6 @@ fn list_dir_at(location: DirLocation) -> Result<Vec<DirEntry>, &'static str> {
     Ok(out)
 }
 
-/// Lists the current directory (see [`cwd_path_string`]).
-pub fn list_current_dir() -> Result<Vec<DirEntry>, &'static str> {
-    list_dir_at(CWD.lock().location)
-}
-
 /// Lists the directory at `path` without changing the current directory
 /// -- what the desktop's Files window browses with, so it never moves the
 /// shell's own working directory out from under it.
@@ -564,33 +576,6 @@ fn resolve_dir(path: &str) -> Result<DirLocation, &'static str> {
     let (location, stack) = (cwd.location, cwd.stack.clone());
     drop(cwd);
     walk_path(location, stack, path).map(|(loc, _)| loc)
-}
-
-/// Changes the current directory, same path syntax `resolve_dir` accepts:
-/// `/`-separated, `.`/`..`, absolute (leading `/`) or relative.
-pub fn change_dir(path: &str) -> Result<(), &'static str> {
-    let cwd_before = { let cwd = CWD.lock(); (cwd.location, cwd.stack.clone()) };
-    let (location, stack) = walk_path(cwd_before.0, cwd_before.1, path)?;
-
-    let mut cwd = CWD.lock();
-    cwd.location = location;
-    cwd.stack = stack;
-    Ok(())
-}
-
-/// The current directory as a human-readable path, e.g. `/DOCS/SUB`, or
-/// `/` at the root.
-pub fn cwd_path_string() -> String {
-    let cwd = CWD.lock();
-    if cwd.stack.is_empty() {
-        return String::from("/");
-    }
-    let mut out = String::new();
-    for (name, _) in &cwd.stack {
-        out.push('/');
-        out.push_str(name);
-    }
-    out
 }
 
 /// Splits a path into `(directory portion, filename portion)` for feeding
@@ -686,7 +671,7 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, &'static str> {
             }
         }
         let bytes = run as usize * cluster_bytes;
-        block::read(cluster_to_lba(l, start) as u64, &mut data[done..done + bytes])?;
+        block::read(disk(), cluster_to_lba(l, start) as u64, &mut data[done..done + bytes])?;
         done += bytes;
     }
     if done < size {
@@ -755,7 +740,7 @@ impl File {
             let whole = ((cluster_bytes - within) as usize / SECTOR_SIZE).min((want - done) / SECTOR_SIZE);
             let take = if lo == 0 && whole > 0 {
                 let n = whole * SECTOR_SIZE;
-                block::read(lba as u64, &mut out[done..done + n])?;
+                block::read(disk(), lba as u64, &mut out[done..done + n])?;
                 n
             } else {
                 let sector = read_sector(lba)?;
@@ -771,16 +756,6 @@ impl File {
         }
         Ok(done)
     }
-}
-
-pub fn read_file_range(path: &str, offset: u32, len: usize) -> Result<Vec<u8>, &'static str> {
-    let mut file = open_file(path)?;
-    let size = len.min(file.size.saturating_sub(offset) as usize);
-    let mut out = Vec::new();
-    out.try_reserve_exact(size).map_err(|_| "file buffer allocation failed")?;
-    out.resize(size, 0);
-    file.read_at(offset as u64, &mut out)?;
-    Ok(out)
 }
 
 // --- Writing ---------------------------------------------------------
@@ -843,7 +818,7 @@ fn free_chain(l: Layout, mut cluster: u32) -> Result<(), &'static str> {
 /// entries free" rather than whatever garbage was on disk before.
 fn zero_cluster(l: Layout, cluster: u32) -> Result<(), &'static str> {
     let zero = alloc::vec![0u8; (l.sectors_per_cluster * l.bytes_per_sector) as usize];
-    block::write(cluster_to_lba(l, cluster) as u64, &zero)
+    block::write(disk(), cluster_to_lba(l, cluster) as u64, &zero)
 }
 
 /// The real VFAT checksum of an 8.3 short name -- stored in every LFN
@@ -1234,7 +1209,7 @@ fn write_file_inner(path: &str, data: &[u8]) -> Result<(), &'static str> {
         let here = (data.len() - offset_in_data).min(cluster_bytes);
         let whole = here / SECTOR_SIZE * SECTOR_SIZE;
         if whole > 0 {
-            block::write(lba as u64, &data[offset_in_data..offset_in_data + whole])?;
+            block::write(disk(), lba as u64, &data[offset_in_data..offset_in_data + whole])?;
         }
         if here > whole {
             let mut buf = [0u8; SECTOR_SIZE];

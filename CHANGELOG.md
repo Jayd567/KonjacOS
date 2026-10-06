@@ -13,9 +13,18 @@ ready-to-boot images.
   I/O port. `make run` attaches the disk this way; the ATA driver is
   still used when the disk is attached as IDE.
 - `diskbench` in the Terminal times reading, writing and deleting files.
+- KonjacFS, KonjacOS's own copy-on-write filesystem
+  ([design](docs/kfs-design.md)), first milestone: a second disk,
+  `kfs.img`, built by `make kfs`, mounts read-only at `/kfs`. Every block
+  is checksummed, so a damaged disk gives an error instead of wrong data.
+  `tools/kfs.py` builds, reads and checks images on the host.
+- Several disks at once; each filesystem finds its own.
+- Files can copy from `/kfs` to the FAT16 disk; `ls` takes a folder.
 
 ### Changed
 
+- The kernel reaches files through one layer (`vfs.rs`) that owns the
+  current directory and routes each path to FAT16 or KonjacFS.
 - The FAT16 driver keeps the FAT in memory, reads and writes whole runs
   of clusters per request, and writes changed FAT sectors once per
   operation instead of once per cluster. With virtio, writing 1 MiB went

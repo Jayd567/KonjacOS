@@ -32,7 +32,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::CStr;
 
-use crate::fat16;
+use crate::vfs;
 
 /// What C sees as `FILE*`: an opaque pointer. Never dereferenced as
 /// anything but `*mut CFile` internally, and only by the functions in this
@@ -137,7 +137,7 @@ pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> RawFile {
     let base = mode.chars().next().unwrap_or('\0');
 
     let (data, pos, writable) = match base {
-        'r' => match fat16::read_file(&path) {
+        'r' => match vfs::read_file(&path) {
             Ok(data) => (data, 0, plus),
             Err(_) => return core::ptr::null_mut(),
         },
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> RawFile {
             // Append: start from whatever's already there (or empty, if
             // the file doesn't exist yet -- "a" creates it), positioned
             // at the end.
-            let data = fat16::read_file(&path).unwrap_or_default();
+            let data = vfs::read_file(&path).unwrap_or_default();
             let pos = data.len();
             (data, pos, true)
         }
@@ -173,7 +173,7 @@ pub unsafe extern "C" fn fclose(file: RawFile) -> i32 {
     }
     if file.dirty && file.writable {
         if let Some(path) = &file.path {
-            if fat16::write_file(path, &file.data).is_err() {
+            if vfs::write_file(path, &file.data).is_err() {
                 return -1;
             }
         }

@@ -3215,7 +3215,7 @@ fn disk_index() -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut dirs = alloc::vec![String::from("/")];
     while let Some(dir) = dirs.pop() {
-        let Ok(list) = crate::fat16::list_dir(&dir) else { continue };
+        let Ok(list) = crate::vfs::list_dir(&dir) else { continue };
         for e in list {
             if e.name == "." || e.name == ".." {
                 continue;
