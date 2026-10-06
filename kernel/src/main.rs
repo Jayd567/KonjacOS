@@ -13,6 +13,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod apex;
 mod ata;
 mod block;
@@ -168,17 +170,39 @@ pub extern "C" fn kstart() -> ! {
     block::init();
     sprintln!("Data disks: {} ({}).", block::count(), block::backend_name());
 
-    match unsafe { fat16::init() } {
-        Ok(()) => sprintln!("FAT16 filesystem mounted at /."),
-        Err(e) => sprintln!("no filesystem mounted ({e}) -- `ls`/`cat` won't work."),
-    }
+    // KonjacFS is `/` when there's a KFS disk; FAT16 is then `/fat`.
+    let fat = unsafe { fat16::init() };
     match kfs::mount() {
         Ok(()) => {
             if let Some((label, txg, total, free)) = kfs::info() {
-                sprintln!("KonjacFS volume {label:?} mounted at {} (txg {txg}, {free} of {total} blocks free).", vfs::KFS_MOUNT);
+                sprintln!("KonjacFS volume {label:?} mounted at / (txg {txg}, {free} of {total} blocks free).");
+                if let Some(newest) = kfs::fell_back_from() {
+                    sprintln!("KonjacFS: the newest commit (txg {newest}) is damaged; using txg {txg}, the newest one that reads back.");
+                }
             }
         }
         Err(e) => sprintln!("KonjacFS: {e}."),
+    }
+    match fat {
+        Ok(()) if kfs::mounted() => sprintln!("FAT16 filesystem mounted at {}.", vfs::FAT_MOUNT),
+        Ok(()) => sprintln!("FAT16 filesystem mounted at /."),
+        Err(e) if kfs::mounted() => sprintln!("FAT16: {e}."),
+        Err(e) => sprintln!("no filesystem mounted ({e}) -- `ls`/`cat` won't work."),
+    }
+    // Settings, pins and the admin password used to live on the FAT16
+    // disk; bring them over the first time KonjacFS is `/`.
+    if kfs::mounted() && fat16::mounted() {
+        for name in ["DESKTOP.CFG", "APEX.PWD"] {
+            let (to, mut from) = (alloc::string::String::from("/") + name, alloc::string::String::from(vfs::FAT_MOUNT));
+            from.push('/');
+            from.push_str(name);
+            if vfs::stat_path(&to).is_err() && vfs::stat_path(&from).is_ok() {
+                match vfs::copy(&from, &to) {
+                    Ok(()) => sprintln!("Copied {name} from the FAT16 disk to KonjacFS."),
+                    Err(e) => sprintln!("Couldn't copy {name} to KonjacFS: {e}."),
+                }
+            }
+        }
     }
 
     // The desktop takes over the screen before interrupts (and with them

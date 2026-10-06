@@ -1068,7 +1068,6 @@ fn sys_statx(path_ptr: u64, statxbuf_ptr: u64) -> i64 {
     0
 }
 
-const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const ST_VALID: u64 = 0x20;
 
@@ -1102,7 +1101,7 @@ fn sys_fstatfs(fd: u64, buf_ptr: u64) -> i64 {
 fn statfs_disk(buf_ptr: u64) -> i64 {
     match vfs::volume_stats() {
         Ok(v) => {
-            write_statfs(buf_ptr, MSDOS_SUPER_MAGIC, v.cluster_bytes, v.total_clusters, v.free_clusters);
+            write_statfs(buf_ptr, v.magic, v.block_bytes, v.total_blocks, v.free_blocks);
             0
         }
         Err(_) => EIO,
@@ -1111,7 +1110,7 @@ fn statfs_disk(buf_ptr: u64) -> i64 {
 
 /// Real Linux x86_64 `struct statfs`, 120 bytes: f_type, f_bsize, f_blocks,
 /// f_bfree, f_bavail, f_files, f_ffree (u64 each), f_fsid (2 x i32),
-/// f_namelen, f_frsize, f_flags, then 4 spare u64s. FAT has no inodes, so
+/// f_namelen, f_frsize, f_flags, then 4 spare u64s. Inode counts aren't tracked, so
 /// f_files/f_ffree are 0, matching Linux's vfat driver.
 fn write_statfs(buf_ptr: u64, fs_type: u64, block: u64, blocks: u64, free: u64) {
     let fields: [u64; 15] = [fs_type, block, blocks, free, free, 0, 0, 0, 255, block, ST_VALID, 0, 0, 0, 0];

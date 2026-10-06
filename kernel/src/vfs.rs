@@ -2,11 +2,12 @@
 //! current directory, turns every path into an absolute, normalised one,
 //! and sends it to the filesystem that holds it:
 //!
-//! - `/kfs/...` goes to KonjacFS (`kfs.rs`), when a KFS disk is attached.
-//! - Everything else goes to FAT16 (`fat16.rs`), which is still `/`.
+//! - With a KonjacFS disk attached, KonjacFS (`kfs.rs`) is `/`, and the
+//!   FAT16 disk (`fat16.rs`), if there is one, is `/fat`.
+//! - Without one, FAT16 is `/`, as before KonjacFS existed.
 //!
-//! The FAT16 driver only ever sees absolute paths from here, so its own
-//! notion of a current directory stays at the root.
+//! The filesystems only ever see absolute paths within themselves, so the
+//! FAT16 driver's own notion of a current directory stays at its root.
 
 extern crate alloc;
 
@@ -16,11 +17,24 @@ use alloc::vec::Vec;
 use crate::sync::SpinLock;
 use crate::{fat16, kfs};
 
-/// Where the KFS volume appears.
-pub const KFS_MOUNT: &str = "/kfs";
-const MOUNT_POINT: &str = "that's where the KFS disk is attached; it can't be moved or deleted";
+/// Where the FAT16 disk appears when KonjacFS is `/`.
+pub const FAT_MOUNT: &str = "/fat";
+const MOUNT_POINT: &str = "that's where the FAT16 disk is attached; it can't be moved or deleted";
 
-pub use fat16::VolumeStats;
+/// Size and free space of a volume, for `statfs` and Settings.
+pub struct VolumeStats {
+    /// "KonjacFS" or "FAT16".
+    pub name: &'static str,
+    /// `f_type` for Linux's `statfs`.
+    pub magic: u64,
+    pub block_bytes: u64,
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+}
+
+/// Linux's `MSDOS_SUPER_MAGIC`, and one for KonjacFS ("KONJ").
+const MAGIC_FAT: u64 = 0x4d44;
+const MAGIC_KFS: u64 = 0x4b4f_4e4a;
 
 static CWD: SpinLock<String> = SpinLock::new(String::new());
 
@@ -64,21 +78,30 @@ pub fn absolute(path: &str) -> String {
 
 fn on(path: &str) -> On {
     let abs = absolute(path);
-    if kfs::mounted() {
-        if abs == KFS_MOUNT {
-            return On::Kfs(String::from("/"));
+    if !kfs::mounted() {
+        return On::Fat(abs);
+    }
+    if fat16::mounted() {
+        if abs == FAT_MOUNT {
+            return On::Fat(String::from("/"));
         }
-        if let Some(rest) = abs.strip_prefix(KFS_MOUNT).filter(|r| r.starts_with('/')) {
-            return On::Kfs(String::from(rest));
+        if let Some(rest) = abs.strip_prefix(FAT_MOUNT).filter(|r| r.starts_with('/')) {
+            return On::Fat(String::from(rest));
         }
     }
-    On::Fat(abs)
+    On::Kfs(abs)
+}
+
+/// Whether the FAT16 disk is mounted at [`FAT_MOUNT`] (rather than at `/`,
+/// or not at all).
+fn fat_at_mount() -> bool {
+    kfs::mounted() && fat16::mounted()
 }
 
 /// Whether `path` itself can't be renamed, moved or deleted: it's where a
 /// volume is attached. (What's inside it can be changed.)
 pub fn read_only(path: &str) -> bool {
-    kfs::mounted() && absolute(path) == KFS_MOUNT
+    fat_at_mount() && absolute(path) == FAT_MOUNT
 }
 
 pub fn cwd_path_string() -> String {
@@ -99,18 +122,15 @@ pub fn change_dir(path: &str) -> Result<(), &'static str> {
 
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, &'static str> {
     match on(path) {
-        On::Kfs(p) => Ok(kfs::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect()),
-        On::Fat(p) => {
-            let mut v: Vec<DirEntry> = fat16::list_dir(&p)?
-                .into_iter()
-                .map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64 })
-                .collect();
-            // The KFS volume shows up as a folder in the root.
-            if p == "/" && kfs::mounted() {
-                v.push(DirEntry { name: String::from(&KFS_MOUNT[1..]), is_dir: true, size: 0 });
+        On::Kfs(p) => {
+            let mut v: Vec<DirEntry> = kfs::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect();
+            // The FAT16 disk shows up as a folder in the root.
+            if p == "/" && fat_at_mount() {
+                v.push(DirEntry { name: String::from(&FAT_MOUNT[1..]), is_dir: true, size: 0 });
             }
             Ok(v)
         }
+        On::Fat(p) => Ok(fat16::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64 }).collect()),
     }
 }
 
@@ -281,5 +301,9 @@ fn copy_across(from: &str, to: &str, depth: u32) -> Result<(), &'static str> {
 
 /// Space on the root volume, for `statfs` and Settings.
 pub fn volume_stats() -> Result<VolumeStats, &'static str> {
-    fat16::volume_stats()
+    if let Some((_, _, total, free)) = kfs::info() {
+        return Ok(VolumeStats { name: "KonjacFS", magic: MAGIC_KFS, block_bytes: kfs::BLOCK as u64, total_blocks: total, free_blocks: free });
+    }
+    let v = fat16::volume_stats()?;
+    Ok(VolumeStats { name: "FAT16", magic: MAGIC_FAT, block_bytes: v.cluster_bytes, total_blocks: v.total_clusters, free_blocks: v.free_clusters })
 }

@@ -56,7 +56,8 @@ pub static COMMANDS: &[Command] = &[
     Command { name: "write", summary: "<file> <text>  create/overwrite a file with <text>", requires_apex: false, handler: cmd_write },
     Command { name: "rm", summary: "<file>  delete a file", requires_apex: true, handler: cmd_rm },
     Command { name: "diskbench", summary: "time disk reads and writes (needs DOOM1.WAD; writes and deletes /BENCH.TMP)", requires_apex: false, handler: cmd_diskbench },
-    Command { name: "kfstest", summary: "[steps] [seed] [keep] [fill]  random writes, renames and deletes under /kfs/kfstest, checked as it goes", requires_apex: false, handler: cmd_kfstest },
+    Command { name: "verify", summary: "[folder]  read every file under a folder and report any that fail", requires_apex: false, handler: cmd_verify },
+    Command { name: "kfstest", summary: "[steps] [seed] [keep] [fill]  random writes, renames and deletes under /kfstest, checked as it goes", requires_apex: false, handler: cmd_kfstest },
     Command { name: "reboot", summary: "reset the machine", requires_apex: true, handler: cmd_reboot },
     Command { name: "halt", summary: "stop the CPU (interrupts off, spins on hlt)", requires_apex: true, handler: cmd_halt },
     Command { name: "apex", summary: "show whether an apex check is currently cached", requires_apex: false, handler: cmd_apex },
@@ -258,10 +259,8 @@ fn cmd_diskbench(_rest: &str) {
     let ops = || crate::block::stats().0;
     println!("diskbench ({}):", crate::block::backend_name());
     let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i * 7 + i / 4096) as u8).collect();
-    let mut volumes = alloc::vec![("FAT16", "")];
-    if crate::kfs::mounted() {
-        volumes.push(("KFS", vfs::KFS_MOUNT));
-    }
+    // `/` first, then FAT16 at /fat if KonjacFS is `/`.
+    let volumes = if crate::kfs::mounted() { alloc::vec![("KonjacFS", ""), ("FAT16", vfs::FAT_MOUNT)] } else { alloc::vec![("FAT16", "")] };
     for (name, root) in volumes {
         println!("  {name} ({}):", if root.is_empty() { "/" } else { root });
         let path = |p: &str| {
@@ -309,7 +308,7 @@ fn cmd_diskbench(_rest: &str) {
 }
 
 /// Exercises KFS writing: random new files, overwrites, renames, moves,
-/// new folders and deletes under /kfs/kfstest, checking every file
+/// new folders and deletes under /kfstest, checking every file
 /// against what it should hold as it goes. `kfstest [steps] [seed] [keep]
 /// [fill]`: `keep` leaves the folder there for `tools/kfs.py check`; `fill`
 /// then fills the disk (see [`kfstest_fill`]).
@@ -334,8 +333,16 @@ fn cmd_kfstest(rest: &str) {
     };
     // Sizes either side of the inline limit and the extent size.
     const SIZES: [usize; 9] = [0, 1, 100, 2048, 2049, 5000, 65536, 70000, 300_000];
+    // Files of 16 bytes or more start with "KFST", the tag and the size, so
+    // tools/crash_test.py can check that any file it finds is whole.
     let content = |size: usize, tag: usize| -> Vec<u8> {
-        (0..size).map(|i| (i.wrapping_mul(31) + tag * 7 + i / 4096) as u8).collect()
+        let mut d: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) + tag * 7 + i / 4096) as u8).collect();
+        if size >= 16 {
+            d[0..4].copy_from_slice(b"KFST");
+            d[4..8].copy_from_slice(&(tag as u32).to_le_bytes());
+            d[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+        }
+        d
     };
     let join = |dir: &str, prefix: &str, n: u32| {
         let mut p = String::from(dir);
@@ -346,7 +353,7 @@ fn cmd_kfstest(rest: &str) {
     };
     let under = |path: &str, dir: &str| path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'));
 
-    let base = "/kfs/kfstest";
+    let base = "/kfstest";
     let _ = vfs::remove(base);
     if let Err(e) = vfs::create_dir(base) {
         println!("kfstest: can't create {base}: {e}");
@@ -461,7 +468,7 @@ fn cmd_kfstest(rest: &str) {
         if bad == 0 { "all good" } else { "FAILED" },
         files.len(),
         dirs.len(),
-        if cleanup.is_ok() { "" } else { " (couldn't delete /kfs/kfstest)" }
+        if cleanup.is_ok() { "" } else { " (couldn't delete /kfstest)" }
     );
 }
 
@@ -514,6 +521,48 @@ fn kfstest_fill(dir: &str) -> usize {
     }
     println!("kfstest: fill: {n} MiB written, then \"{error}\" with {full} blocks left; {after} free after deleting (was {before})");
     bad
+}
+
+/// Reads every file under a folder (default `/`), so damage anywhere shows
+/// up as an error naming the file. The summary also goes to the serial
+/// port, for tools/bitrot_test.py. `verify [folder]`.
+fn cmd_verify(rest: &str) {
+    fn walk(dir: &str, depth: u32, files: &mut u32, bad: &mut u32, bytes: &mut u64) {
+        let list = match crate::vfs::list_dir(dir) {
+            Ok(l) => l,
+            Err(e) => {
+                println!("verify: {dir}: {e}");
+                crate::sprintln!("verify: {dir}: {e}");
+                *bad += 1;
+                return;
+            }
+        };
+        for e in list {
+            let mut path = String::from(dir.trim_end_matches('/'));
+            path.push('/');
+            path.push_str(&e.name);
+            if e.is_dir {
+                if depth < 32 {
+                    walk(&path, depth + 1, files, bad, bytes);
+                }
+                continue;
+            }
+            *files += 1;
+            match crate::vfs::read_file(&path) {
+                Ok(d) => *bytes += d.len() as u64,
+                Err(err) => {
+                    println!("verify: {path}: {err}");
+                    crate::sprintln!("verify: {path}: {err}");
+                    *bad += 1;
+                }
+            }
+        }
+    }
+    let dir = if rest.trim().is_empty() { "/" } else { rest.trim() };
+    let (mut files, mut bad, mut bytes) = (0, 0, 0);
+    walk(dir, 0, &mut files, &mut bad, &mut bytes);
+    println!("verify: {files} files, {} KiB read, {bad} errors", bytes / 1024);
+    crate::sprintln!("verify: {files} files, {} KiB read, {bad} errors", bytes / 1024);
 }
 
 fn cmd_apex(_rest: &str) {
@@ -635,20 +684,13 @@ unsafe extern "C" {
 /// structures), and running its main loop forever would otherwise block
 /// the shell -- and everything else -- from ever getting scheduled again.
 fn doom_task_entry() {
-    // A single dummy argv[0] rather than a real argc/argv pair: nothing
-    // on DOOM's startup path here actually parses command-line options
-    // (DOOM1.WAD is found via D_FindWADByName's bare-filename check in
-    // d_iwad.c, not an -iwad argument -- it just needs to be sitting at
-    // the filesystem root, true as long as DOOM is launched from cwd `/`,
-    // which every task is today since there's no per-task cwd yet, just
-    // fat16.rs's single global one), but keeping argv[0] non-null avoids
-    // a latent null-pointer footgun in anything that ever calls
-    // M_GetExecutableName (myargv[0]) even though nothing on this path
-    // does today.
-    let argv0: *const u8 = b"doom\0".as_ptr();
-    let argv: [*const u8; 1] = [argv0];
+    // `doom -iwad <path>`: DOOM on its own only looks for `doom1.wad`,
+    // spelled that way, which a case-sensitive disk (KonjacFS) doesn't
+    // match to `DOOM1.WAD`; `launch_doom` found the real name.
+    let wad = DOOM_WAD.load(core::sync::atomic::Ordering::Acquire) as *const u8;
+    let argv: [*const u8; 3] = [b"doom\0".as_ptr(), b"-iwad\0".as_ptr(), wad];
     unsafe {
-        doomgeneric_Create(1, argv.as_ptr());
+        doomgeneric_Create(3, argv.as_ptr());
         loop {
             doomgeneric_Tick();
         }
@@ -660,6 +702,9 @@ fn doom_task_entry() {
 /// `cio` C-toolchain groundwork's use of `spawn_with_stack` for anything
 /// that isn't a tiny leaf demo.
 const DOOM_STACK_SIZE: usize = 1024 * 1024;
+
+/// The WAD's path for DOOM's `-iwad`, set by `launch_doom`.
+static DOOM_WAD: core::sync::atomic::AtomicPtr<u8> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 fn cmd_doom(_rest: &str) {
     match launch_doom() {
@@ -674,9 +719,16 @@ pub fn launch_doom() -> Result<u64, &'static str> {
     if let Some(id) = crate::doom_driver::running_task() {
         return Ok(id);
     }
-    if crate::vfs::stat_path("/DOOM1.WAD").is_err() {
-        return Err("DOOM1.WAD not found at the filesystem root (boot with the disk image attached)");
-    }
+    let wad = crate::vfs::list_dir("/")
+        .ok()
+        .and_then(|l| l.into_iter().find(|e| !e.is_dir && e.name.eq_ignore_ascii_case("DOOM1.WAD")))
+        .ok_or("DOOM1.WAD not found at the filesystem root (boot with the disk image attached)")?;
+    // NUL-terminated for C, and alive for as long as DOOM might read its
+    // argv: a few bytes per launch, never freed.
+    let mut path = alloc::vec![b'/'];
+    path.extend_from_slice(wad.name.as_bytes());
+    path.push(0);
+    DOOM_WAD.store(alloc::boxed::Box::leak(path.into_boxed_slice()).as_mut_ptr(), core::sync::atomic::Ordering::Release);
     // Drop whatever's still queued in the DOOM key ring, so DOOM's very
     // first DG_GetKey call doesn't see stale keystrokes as game input.
     crate::keyboard::clear_doom_events();

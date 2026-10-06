@@ -696,7 +696,7 @@ impl Files {
 
     fn enabled(&self, t: Tool) -> bool {
         let sel = self.selected.is_some();
-        // A mount point (/kfs) can't be moved or deleted; what's in it can.
+        // A mount point (/fat) can't be moved or deleted; what's in it can.
         let changeable = self.selected.is_some_and(|i| !crate::vfs::read_only(&self.child(&self.entries[i].name)));
         match t {
             Tool::Up => self.path != "/",
@@ -1283,7 +1283,7 @@ impl App for Files {
             Some(i) => {
                 let e = &self.entries[i];
                 let child = self.child(&e.name);
-                // A mount point (/kfs) can't be moved or deleted.
+                // A mount point (/fat) can't be moved or deleted.
                 let changeable = !crate::vfs::read_only(&child);
                 let mut v = alloc::vec![("Open", (e.is_dir || opener(&e.name).is_some()).then_some(0))];
                 if !e.is_dir {
