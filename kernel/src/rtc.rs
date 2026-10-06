@@ -71,3 +71,18 @@ pub fn now() -> DateTime {
         second: dec(sec),
     }
 }
+
+/// Seconds since 1970-01-01 00:00, for file timestamps. (The clock is in
+/// local time under the Makefile's QEMU, so these are too.)
+pub fn unix_seconds() -> u64 {
+    let t = now();
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (m, d) = (t.month as i64, t.day as i64);
+    let y = t.year as i64 - (m <= 2) as i64;
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    (days * 86400 + t.hour as i64 * 3600 + t.minute as i64 * 60 + t.second as i64).max(0) as u64
+}

@@ -1,11 +1,10 @@
 //! A small kernel heap: a fixed virtual region, eagerly mapped a page at a
-//! time at init, managed by a singly-linked free-list allocator
-//! (first-fit, no coalescing). Good enough for a hobby kernel's early
-//! `alloc` needs -- not something you'd want in production, and the lack
-//! of coalescing means long-running alloc/free churn of mixed sizes will
-//! fragment over time. That's a known, accepted limitation for now; a
-//! bump-then-free-list-with-coalescing design would be the natural
-//! upgrade if it ever matters.
+//! time at init, managed by a singly-linked free-list allocator: first-fit,
+//! with the list kept in address order so freed neighbours coalesce. (It
+//! didn't coalesce at first; KFS's churn of small tree items alongside
+//! large file buffers fragmented it until a 300 KB read couldn't find room
+//! in a mostly free heap.) Allocation and freeing both walk the list, so
+//! they cost more as it grows; fine at this kernel's scale.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
@@ -83,18 +82,9 @@ impl FreeList {
         FreeList { head: None }
     }
 
-    /// Adds a block of `size` bytes at `ptr` back onto the free list.
-    unsafe fn push(&mut self, ptr: *mut u8, size: usize) {
-        let block = ptr as *mut FreeBlock;
-        unsafe {
-            block.write(FreeBlock { size, next: self.head });
-        }
-        self.head = NonNull::new(block);
-    }
-
-    /// First-fit: walks the list, unlinks the first block big enough,
-    /// splits off and re-frees any leftover tail that's still big enough
-    /// to be useful on its own.
+    /// First-fit: walks the list, takes the first block big enough, and
+    /// leaves any leftover tail in its place in the list (so the list
+    /// stays in address order).
     unsafe fn pop_fit(&mut self, size: usize) -> Option<*mut u8> {
         let mut prev: Option<NonNull<FreeBlock>> = None;
         let mut current = self.head;
@@ -103,18 +93,21 @@ impl FreeList {
             let block = unsafe { node.as_mut() };
             if block.size >= size {
                 let next = block.next;
-                match prev {
-                    Some(mut p) => unsafe { p.as_mut().next = next },
-                    None => self.head = next,
-                }
-
                 let leftover = block.size - size;
                 let node_ptr = node.as_ptr() as *mut u8;
-                if leftover >= MIN_BLOCK_SIZE {
-                    let tail = unsafe { node_ptr.add(size) };
-                    unsafe { self.push(tail, leftover) };
+                // Sizes are multiples of MIN_ALIGN, so a leftover is either
+                // nothing or big enough to hold its own header.
+                let replacement = if leftover >= MIN_BLOCK_SIZE {
+                    let tail = unsafe { node_ptr.add(size) } as *mut FreeBlock;
+                    unsafe { tail.write(FreeBlock { size: leftover, next }) };
+                    NonNull::new(tail)
+                } else {
+                    next
+                };
+                match prev {
+                    Some(mut p) => unsafe { p.as_mut().next = replacement },
+                    None => self.head = replacement,
                 }
-
                 return Some(node_ptr);
             }
             prev = current;
@@ -130,6 +123,63 @@ struct Heap {
     /// backing the free list before anything's ever been freed.
     bump: u64,
     limit: u64,
+}
+
+impl Heap {
+    /// Returns a block to the free list, kept in address order, merged
+    /// with any free neighbour on either side -- so blocks freed next to
+    /// each other become one big block again instead of fragments only
+    /// small allocations fit in. A free block that ends at the bump edge
+    /// goes back to the bump region.
+    unsafe fn release(&mut self, ptr: *mut u8, size: usize) {
+        let addr = ptr as usize;
+        let end = |b: NonNull<FreeBlock>| b.as_ptr() as usize + unsafe { b.as_ref().size };
+        // `prev` is the last free block before `ptr`, `before_prev` the one
+        // before that; `next` the first after it.
+        let mut before_prev: Option<NonNull<FreeBlock>> = None;
+        let mut prev: Option<NonNull<FreeBlock>> = None;
+        let mut next = self.free.head;
+        while let Some(n) = next {
+            if n.as_ptr() as usize > addr {
+                break;
+            }
+            before_prev = prev;
+            prev = next;
+            next = unsafe { n.as_ref().next };
+        }
+        let mut size = size;
+        if let Some(n) = next.filter(|&n| addr + size == n.as_ptr() as usize) {
+            size += unsafe { n.as_ref().size };
+            next = unsafe { n.as_ref().next };
+        }
+        // The merged block, and the free block linking to it.
+        let (block, link) = match prev {
+            Some(mut p) if end(p) == addr => {
+                unsafe {
+                    p.as_mut().size += size;
+                    p.as_mut().next = next;
+                }
+                (p, before_prev)
+            }
+            _ => {
+                let b = ptr as *mut FreeBlock;
+                unsafe { b.write(FreeBlock { size, next }) };
+                let b = unsafe { NonNull::new_unchecked(b) };
+                match prev {
+                    Some(mut p) => unsafe { p.as_mut().next = Some(b) },
+                    None => self.free.head = Some(b),
+                }
+                (b, prev)
+            }
+        };
+        if next.is_none() && end(block) as u64 == self.bump {
+            self.bump = block.as_ptr() as u64;
+            match link {
+                Some(mut l) => unsafe { l.as_mut().next = None },
+                None => self.free.head = None,
+            }
+        }
+    }
 }
 
 /// Interrupt-safe on purpose. With a plain spinlock, a task preempted
@@ -177,7 +227,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         let size = (size + MIN_ALIGN - 1) & !(MIN_ALIGN - 1);
         let mut heap = HEAP.lock();
         unsafe {
-            heap.free.push(ptr, size);
+            heap.release(ptr, size);
         }
     }
 }

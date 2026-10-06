@@ -175,7 +175,7 @@ pub extern "C" fn kstart() -> ! {
     match kfs::mount() {
         Ok(()) => {
             if let Some((label, txg, total, free)) = kfs::info() {
-                sprintln!("KonjacFS volume {label:?} mounted at {} (read-only; txg {txg}, {free} of {total} blocks free).", vfs::KFS_MOUNT);
+                sprintln!("KonjacFS volume {label:?} mounted at {} (txg {txg}, {free} of {total} blocks free).", vfs::KFS_MOUNT);
             }
         }
         Err(e) => sprintln!("KonjacFS: {e}."),

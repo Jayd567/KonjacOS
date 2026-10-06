@@ -14,12 +14,23 @@ ready-to-boot images.
   still used when the disk is attached as IDE.
 - `diskbench` in the Terminal times reading, writing and deleting files.
 - KonjacFS, KonjacOS's own copy-on-write filesystem
-  ([design](docs/kfs-design.md)), first milestone: a second disk,
-  `kfs.img`, built by `make kfs`, mounts read-only at `/kfs`. Every block
-  is checksummed, so a damaged disk gives an error instead of wrong data.
-  `tools/kfs.py` builds, reads and checks images on the host.
+  ([design](docs/kfs-design.md)), on a second disk, `kfs.img`, built by
+  `make kfs` and mounted at `/kfs`:
+  - Every block is checksummed, so a damaged disk gives an error instead
+    of wrong data.
+  - Writing is copy-on-write: each change (a save, a new folder, a
+    rename, a delete) is written to free space and then made live by a
+    single superblock write, so a crash can't leave the disk half
+    changed. Old blocks are reused only once the change has landed.
+  - Files, Notepad and the Terminal work on it like on the FAT16 disk.
+    Names are case-sensitive.
+  - Writing 1 MiB takes 10 ms, against 40 ms on FAT16.
+  - `tools/kfs.py` builds, reads and checks images on the host.
+- `kfstest` in the Terminal runs random writes, overwrites, renames and
+  deletes on KonjacFS and checks every file as it goes; `kfstest fill`
+  also fills the disk and checks the space all comes back.
 - Several disks at once; each filesystem finds its own.
-- Files can copy from `/kfs` to the FAT16 disk; `ls` takes a folder.
+- Files copies and moves between the two disks; `ls` takes a folder.
 
 ### Changed
 
@@ -29,6 +40,17 @@ ready-to-boot images.
   of clusters per request, and writes changed FAT sectors once per
   operation instead of once per cluster. With virtio, writing 1 MiB went
   from 11.2 s to 40 ms and reading DOOM1.WAD from 1.3 s to about 10 ms.
+- `diskbench` times FAT16 and KonjacFS side by side.
+
+### Fixed
+
+- The kernel heap now merges freed memory with free neighbours. Before,
+  long runs of mixed small and large allocations broke free memory into
+  pieces until a 300 KB allocation could fail with most of the heap
+  free.
+- Files checks for a name clash the way the disk does, so pasting
+  `HELLO.EXE` next to `hello.exe` on KonjacFS no longer makes a
+  " - Copy".
 
 ## v0.2.0
 
