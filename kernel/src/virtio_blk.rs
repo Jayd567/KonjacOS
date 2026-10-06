@@ -1,4 +1,5 @@
-//! virtio-blk: the disk QEMU attaches with `-drive ...,if=virtio`.
+//! virtio-blk: the disks QEMU attaches with `-drive ...,if=virtio`.
+//! Every one found is started, in PCI order; callers pick one by index.
 //!
 //! Unlike the ATA PIO driver, where the CPU copies every 16-bit word of
 //! every sector through an I/O port and each command moves one sector,
@@ -18,6 +19,8 @@
 //! allocated once at start-up; callers' buffers are copied in and out of
 //! it, which costs little next to the disk itself and keeps every address
 //! the device sees physically contiguous.
+
+extern crate alloc;
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
@@ -89,14 +92,22 @@ struct Disk {
 // the lock.
 unsafe impl Send for Disk {}
 
-static DISK: IrqSpinLock<Option<Disk>> = IrqSpinLock::new(None);
+static DISKS: IrqSpinLock<alloc::vec::Vec<Disk>> = IrqSpinLock::new(alloc::vec::Vec::new());
 
-/// Finds and starts the virtio disk. Returns whether there is one.
-pub fn init() -> bool {
-    let Some(dev) = pci::find(VENDOR_VIRTIO, DEVICE_BLK_LEGACY) else { return false };
+/// Finds and starts every virtio disk; returns how many there are.
+pub fn init() -> usize {
+    for dev in pci::find_all(VENDOR_VIRTIO, DEVICE_BLK_LEGACY) {
+        if let Some(disk) = start(dev) {
+            DISKS.lock().push(disk);
+        }
+    }
+    DISKS.lock().len()
+}
+
+fn start(dev: pci::Device) -> Option<Disk> {
     let bar0 = dev.bar(0);
     if bar0 & 1 == 0 {
-        return false; // No I/O BAR: modern-only device, not supported here.
+        return None; // No I/O BAR: modern-only device, not supported here.
     }
     dev.enable_io_and_dma();
     let io = (bar0 & !0x3) as u16;
@@ -116,7 +127,7 @@ pub fn init() -> bool {
         let qs = inw(io + REG_QUEUE_SIZE);
         if qs < 3 {
             outb(io + REG_STATUS, STATUS_FAILED);
-            return false;
+            return None;
         }
         // Legacy layout: descriptors, then the available ring, then (on
         // the next page) the used ring, all physically contiguous.
@@ -127,12 +138,12 @@ pub fn init() -> bool {
         let pages = total / PAGE;
         let Some(queue_phys) = pmm::alloc_contiguous(pages) else {
             outb(io + REG_STATUS, STATUS_FAILED);
-            return false;
+            return None;
         };
         let data_pages = MAX_BYTES as u64 / PAGE;
         let (Some(hdr_phys), Some(data_phys)) = (pmm::alloc_contiguous(1), pmm::alloc_contiguous(data_pages)) else {
             outb(io + REG_STATUS, STATUS_FAILED);
-            return false;
+            return None;
         };
         let queue = (queue_phys + hhdm) as *mut u8;
         core::ptr::write_bytes(queue, 0, total as usize);
@@ -146,7 +157,7 @@ pub fn init() -> bool {
         outb(io + REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
 
         let capacity = inl(io + REG_CAPACITY) as u64 | (inl(io + REG_CAPACITY + 4) as u64) << 32;
-        *DISK.lock() = Some(Disk {
+        Some(Disk {
             io,
             queue_size: qs,
             desc: queue,
@@ -160,15 +171,13 @@ pub fn init() -> bool {
             capacity,
             flush: wanted & FEATURE_FLUSH != 0,
             read_only: wanted & FEATURE_RO != 0,
-        });
+        })
     }
-    true
 }
 
-/// The disk's size in sectors (0 if there's no virtio disk).
-#[allow(dead_code)] // For the filesystem to size itself against.
-pub fn capacity() -> u64 {
-    DISK.lock().as_ref().map_or(0, |d| d.capacity)
+/// Disk `dev`'s size in sectors (0 if there's no such disk).
+pub fn capacity(dev: usize) -> u64 {
+    DISKS.lock().get(dev).map_or(0, |d| d.capacity)
 }
 
 impl Disk {
@@ -239,10 +248,10 @@ impl Disk {
     }
 }
 
-/// Reads `buf.len() / 512` sectors starting at `sector`.
-pub fn read(sector: u64, buf: &mut [u8]) -> Result<(), &'static str> {
-    let mut guard = DISK.lock();
-    let d = guard.as_mut().ok_or("virtio-blk: no disk")?;
+/// Reads `buf.len() / 512` sectors of disk `dev` starting at `sector`.
+pub fn read(dev: usize, sector: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    let mut guard = DISKS.lock();
+    let d = guard.get_mut(dev).ok_or("virtio-blk: no such disk")?;
     for (k, chunk) in buf.chunks_mut(MAX_BYTES).enumerate() {
         let at = sector + (k * MAX_BYTES / SECTOR) as u64;
         if at + (chunk.len() / SECTOR) as u64 > d.capacity {
@@ -254,10 +263,10 @@ pub fn read(sector: u64, buf: &mut [u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Writes `buf.len() / 512` sectors starting at `sector`.
-pub fn write(sector: u64, buf: &[u8]) -> Result<(), &'static str> {
-    let mut guard = DISK.lock();
-    let d = guard.as_mut().ok_or("virtio-blk: no disk")?;
+/// Writes `buf.len() / 512` sectors of disk `dev` starting at `sector`.
+pub fn write(dev: usize, sector: u64, buf: &[u8]) -> Result<(), &'static str> {
+    let mut guard = DISKS.lock();
+    let d = guard.get_mut(dev).ok_or("virtio-blk: no such disk")?;
     if d.read_only {
         return Err("virtio-blk: the disk is read-only");
     }
@@ -274,10 +283,9 @@ pub fn write(sector: u64, buf: &[u8]) -> Result<(), &'static str> {
 
 /// Makes everything written so far durable (a no-op if the device
 /// doesn't cache writes).
-#[allow(dead_code)] // For the copy-on-write filesystem's commit points.
-pub fn flush() -> Result<(), &'static str> {
-    let mut guard = DISK.lock();
-    let d = guard.as_mut().ok_or("virtio-blk: no disk")?;
+pub fn flush(dev: usize) -> Result<(), &'static str> {
+    let mut guard = DISKS.lock();
+    let d = guard.get_mut(dev).ok_or("virtio-blk: no such disk")?;
     if d.flush {
         d.request(REQ_FLUSH, 0, 0)?;
     }

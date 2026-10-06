@@ -2,7 +2,9 @@
 
 KFS is the filesystem that will replace FAT16 as KonjacOS's main disk
 format. This document fixes its on-disk layout and the rules for changing
-it, before any code is written. Status: **agreed, not implemented yet**.
+it. Status: **milestones 1-3 implemented**: KFS reads and writes, has
+passed the crash and bit-rot tests, and is KonjacOS's main disk (`/`).
+The details below match `tools/kfs.py` and `kernel/src/kfs.rs`.
 
 ## Goals
 
@@ -74,8 +76,18 @@ everything is.
 **Mounting:** read all eight slots and use the valid one (right magic,
 correct checksum) with the highest `txg`. A commit writes slot
 `txg % 8`, so a torn or failed superblock write only loses that one slot.
-The previous seven are still there, each pointing at an older but
-complete state.
+
+The older slots point at older states, but only the **previous one** is
+guaranteed complete. Blocks a commit frees are reusable as soon as it
+lands, so commit N+1 may overwrite what N-1 used; N-1 itself stays whole
+until a commit after the newest one happens. (An earlier draft said all
+seven older slots were complete; that would need frees held back for
+eight commits, and across reboots.) So mounting tries the newest
+superblock and, if its tree root or bitmap fails its checksum, the next
+newest, saying so at boot. Going further back is a last resort: anything
+reused since then fails its checksum rather than being read as data.
+`kfs.py mkfs` writes the first superblock to all eight slots, so even a
+fresh image survives one damaged slot.
 
 ### Block pointer (32 bytes)
 
@@ -125,8 +137,11 @@ A node is one 4 KiB block:
 - **Header (64 bytes):** magic `"KFSN"`, `level` (0 = leaf), item count,
   the owning tree, `birth_txg`, and padding. The node's checksum isn't in
   the node itself; it's in the parent's pointer to it.
-- **Interior node:** keys and child block pointers, about 80 per node.
-- **Leaf:** an array of `(key, data offset, data size)` from the front, and
+- **Interior node:** up to 72 entries of 56 bytes: a key (24 bytes:
+  `object` u64, `offset` u64, `kind` u8, 7 bytes padding) and the
+  child's block pointer. The key is the smallest key in that child.
+- **Leaf:** 24-byte item headers from the front (`object` u64, `offset`
+  u64, `kind` u8, 3 bytes padding, data offset u16, data size u16), and
   item data packed from the back of the block, like a slotted page.
 
 The tree is a standard B+tree, with one rule: **a node is never modified
@@ -136,6 +151,13 @@ root. The new root goes into the next superblock. This is what makes a
 commit atomic, and it's also why changes are batched (see
 [Commits](#commits)): ten changes to one leaf in a commit write it once,
 not ten times.
+
+A node that overflows splits into as many nodes as its items need
+(usually two). After a removal, an empty node is dropped, and a node
+under a quarter full is merged into a neighbour if the two fit in one
+block; a root left with one child gives way to it. Interior keys are
+lower bounds: the key for a child is never more than the smallest key
+in it.
 
 ### Inode (128 bytes)
 
@@ -155,11 +177,13 @@ generation counter could be confused (v1 simply never reuses them).
 
 ### Directories
 
-Each entry is a `DIR_ENTRY` item under the directory's object, keyed by a
-64-bit hash of the name. The item holds the name itself (up to 255 bytes
-of UTF-8), so a hash collision is resolved by comparing names; colliding
-entries take the next free `offset`. Looking a name up costs one tree
-search.
+Each entry is a `DIR_ENTRY` item under the directory's object, keyed by
+the xxHash64 of the name with its low three bits cleared. The item holds
+the child's object number (u64), its type (u8: 1 file, 2 folder), the
+name's length (u8) and the name itself (up to 255 bytes of UTF-8). A hash
+collision is resolved by comparing names: colliding entries take the
+next free `offset` among the following seven. Looking a name up costs
+one tree search.
 
 **Names are case-sensitive and case-preserving**, like Linux (decided):
 `Notes.txt` and `notes.txt` are different files. FAT16 is
@@ -175,11 +199,14 @@ in name order, the caller sorts the entries, as Files already does.
 - **Inline:** a file of up to 2 KiB has its data in an `INLINE` item next
   to its inode. Reading it costs the one leaf read that found the inode.
   This covers configuration files, `DESKTOP.CFG` and most notes.
-- **Extents:** larger files are a list of `EXTENT` items, each mapping a
-  byte range of the file to a run of up to 32768 blocks (128 MiB). Writing
-  a file in one go allocates one large run when free space allows, so
-  reading it back is one request per 64 KiB (the virtio-blk limit) with
-  no lookups in between.
+- **Extents:** larger files are a list of `EXTENT` items (a block pointer
+  plus the number of bytes used, 40 bytes), each covering **at most
+  64 KiB** (16 blocks). The limit is there for the checksum: a read
+  anywhere in an extent has to read and verify all of it, so a 128 MiB
+  extent would make every small read cost 128 MiB. Writing a file in one
+  go still allocates one long run of blocks when free space allows, so
+  the extents sit end to end and reading the file is one request per
+  64 KiB (also the virtio-blk limit) with no seeking in between.
 - **Sparse:** a range with no extent reads as zeros and uses no space.
   The format supports it from v1; the write path creates holes only
   where something explicitly seeks past the end.
@@ -191,16 +218,26 @@ extents.
 
 v1 keeps free space as a **bitmap**: one bit per block, 32 KiB of bitmap
 per GiB of disk (1 MiB for a 32 GiB disk). The bitmap is stored in
-4 KiB blocks, each covering 128 MiB of disk, found through an index
-(`bitmap_root`). The index is a small tree of pointer blocks: one index
-block holds 128 pointers (16 GiB of disk), and another level is added
-when the disk outgrows it. Like everything else, it's copy-on-write.
+4 KiB blocks, each covering 128 MiB of disk (bit *n* of bitmap block *k*
+is block `k * 32768 + n`, 1 = in use; bits past the end of the volume
+are set). The blocks are found through an index (`bitmap_root`): a small
+tree of nodes with the usual header (tree 2) and up to 126 block
+pointers each (almost 16 GiB of disk); level 1 points at bitmap blocks,
+and another level is added when the disk outgrows one node. Like
+everything else, it's copy-on-write.
 
-- At mount, the bitmap blocks are read as needed rather than all at once.
-  The allocator keeps a small in-memory summary (free blocks per 16 MiB
-  region) to find space without scanning everything.
-- **Allocating** looks for a free run big enough for the whole write,
-  close to the file's previous extent, so files stay contiguous.
+- v1 reads the **whole bitmap into memory** at mount (16 KiB for the
+  512 MiB volume), plus a second bitmap of blocks *held* for deferred
+  frees (below). If disks get large enough for that to matter, the
+  bitmap can be read as needed with a small summary (free blocks per
+  16 MiB region) kept in memory instead.
+- **Allocating** goes forward from a cursor (next-fit), looking for a
+  free run big enough for the whole write so the file is one run; if
+  there isn't one, the longest run there is, and so on.
+- **Reserve:** file data may not use the last 64 free blocks or 1/256 of
+  the volume, whichever is more. That space is left for the tree and
+  bitmap blocks commits write, so a full disk still has room for the
+  commit that deletes files to free space.
 - **Freeing is deferred:** a block freed in txg N is still part of the
   last committed state until txg N commits. It goes on a pending list and
   becomes allocatable only after the commit. Reusing it sooner would
@@ -261,6 +298,27 @@ replay and no `fsck` to run.
 previous commit, as on every modern filesystem. `fsync` (and Notepad's
 Save) forces a commit for the data that has to survive.
 
+**What v1 does:** a commit at the end of **every operation** (a file
+written, a folder made, a rename, a delete) rather than on a timer. That
+is simpler, needs no background thread, and makes every operation
+durable when it returns, at about 4 ms each under QEMU. Two other
+differences from the steps above:
+
+- File data is written to its new blocks when the file is written,
+  before the commit, so it doesn't wait in memory. It isn't reachable
+  until the commit lands, so a crash just leaves those blocks free.
+- If an operation fails part-way (the disk is full, a read error), its
+  changes are dropped and the in-memory state is reloaded from the last
+  commit. The operation either happened completely or not at all.
+
+A long operation, such as deleting a big folder, commits part of the way
+through once it has copied 128 tree nodes, after a step that leaves the
+tree consistent (one entry removed with everything under it). A crash
+then leaves some of the folder deleted, never a broken tree.
+
+Batching several operations into one commit on a timer is the upgrade
+if commits ever become the bottleneck.
+
 ## Memory
 
 - **Node cache:** a fixed-size LRU of tree nodes, 1 MiB by default. Nodes
@@ -275,57 +333,93 @@ Save) forces a commit for the data that has to survive.
 
 ## How it fits into the kernel
 
-Today every part of the kernel calls `fat16::` directly. KFS adds a small
-**VFS layer** (`vfs.rs`) with the operations already used (`read_file`,
-`open_file`/`read_at`, `write_file`, `list_dir`, `stat_path`,
-`create_dir`, `rename`, `remove`, `copy`), which dispatches by mount point:
+Every part of the kernel goes through a small **VFS layer** (`vfs.rs`)
+with the operations it uses (`read_file`, `open_file`/`read_at`,
+`write_file`, `list_dir`, `stat_path`, `create_dir`, `rename`, `remove`,
+`copy`), which dispatches by mount point:
 
-- `/` is KFS once a KFS disk is present.
+- `/` is KFS when a KFS disk is present.
 - The FAT16 disk stays available at `/fat` while KFS proves itself (see
   [Removing FAT16](#removing-fat16)). With no KFS disk, FAT16 is `/` as
-  it is today.
-
-The desktop, the shell, the Linux syscall layer, the loader and DOOM
-switch from `fat16::` to `vfs::`, which is a mechanical change.
+  before.
+- Moving between the two copies, then deletes the original. `/fat`
+  itself can't be renamed or deleted.
+- The first time KFS is `/`, `DESKTOP.CFG` (settings and pins) and
+  `APEX.PWD` (the admin password's hash) are copied from `/fat` if KFS
+  doesn't have them yet.
+- `statfs` and Settings report the disk at `/`.
 
 ## Tools
 
-- **`tools/mkkfs.py`** builds a KFS image from a folder, the way `mtools`
-  builds the FAT16 image from `disk_root/` today, so `make` keeps working
-  with no new system packages. It's written from this document, separately
-  from the kernel code: if the two disagree about the format, the tests
-  catch it.
-- **`tools/kfsck.py`** checks an image: every checksum, every tree's
-  ordering, the bitmap against what the trees reference, and link counts.
-  The tests run it after every scenario.
-- **`tools/kfs.py ls|cat|get`** reads files out of an image on the host.
+`tools/kfs.py` (Python 3, standard library only, so `make` needs no new
+packages). It's written from this document, separately from the kernel
+code: if the two disagree about the format, the tests catch it.
+
+- **`kfs.py mkfs DIR IMAGE --size 512M`** builds a KFS image from a
+  folder, the way `mtools` builds the FAT16 image from `disk_root/`.
+  `make kfs` runs it.
+- **`kfs.py check IMAGE`** checks an image: every checksum, the tree's
+  key order, the bitmap against what the trees reference, that every
+  object has an inode and is in exactly one folder, that link counts,
+  sizes and block counts add up, and that every directory entry sits at
+  its name's hash. It exits with an error if anything is
+  wrong; the tests run it after every scenario.
+- **`kfs.py ls|cat|get`** reads files out of an image on the host.
+- **`kfs.py put|mkdir|rm`** changes an image the way the kernel does:
+  new data, a rebuilt tree and a rewritten bitmap go into blocks the
+  current state doesn't use, then the next superblock makes them live,
+  so an interrupted `put` leaves the image as it was. The Makefile's
+  test-program targets use `put` to add their programs to `kfs.img`, as
+  they use `mcopy` for the FAT16 disk.
+- **`tools/crash_test.py`** and **`tools/bitrot_test.py`**: see
+  [Testing](#testing).
 
 ## Testing
 
-- **Format round-trip:** `mkkfs.py` builds an image, the kernel reads
+- **Format round-trip:** `kfs.py mkfs` builds an image, the kernel reads
   every file back and compares checksums.
 - **Behaviour:** the Files/Notepad/DOOM scenarios from the FAT16 work,
-  then `kfsck.py`.
-- **Crash testing**, which is what backs the "never corrupts" goal: a
-  shell command writes, renames and deletes in a loop while the harness
-  kills QEMU at a random moment. The image must then pass `kfsck.py` and
-  mount, with every file either at its last committed contents or absent.
-  This runs hundreds of times with different timings.
-- **Bit rot:** flip a byte in an image; reading the affected file must
-  return an error, not wrong data, and everything else must stay
-  readable.
+  then `kfs.py check`.
+- **`kfstest`** (a Terminal command) makes random new files (sizes
+  either side of the inline limit and the extent size), overwrites,
+  renames, moves, new folders and folder deletes, checking every file
+  against what it should hold. `kfstest N SEED keep` leaves its folder
+  for `kfs.py check`; `fill` then writes 1 MiB files until the disk is
+  full, checks the failed write left nothing behind, deletes them and
+  checks every block came back.
+- **Crash testing** (`tools/crash_test.py`), which is what backs the
+  "never corrupts" goal. It boots KonjacOS on a small KFS disk, starts
+  `kfstest`, and kills QEMU (SIGKILL) at a random moment 0.1-4 s in,
+  over and over on the same disk. After each crash the image must pass
+  `kfs.py check`, the next boot must mount it, and every file kfstest
+  wrote must be whole: each file of 16 bytes or more starts with
+  `KFST`, a tag and its size, and the rest follows from the tag, so a
+  mix of old and new contents is caught. QEMU writes go straight to the
+  host's file, so this tests crashes at every point in the sequence of
+  writes, but not a disk that loses or reorders writes it hadn't been
+  told to flush; the commit order (flush before and after the
+  superblock) is what covers that.
+- **Bit rot** (`tools/bitrot_test.py`): flip one random byte in a random
+  block of a fresh image (a superblock slot, the tree root, another tree
+  node, a file's data, or the bitmap), check `kfs.py check` notices,
+  then boot it and run `verify`, which reads every file. A file's data:
+  exactly that file fails. A tree node: some files fail, the rest read.
+  The root or the bitmap: the mount falls back to the previous commit or
+  refuses, saying the disk is damaged. A superblock slot: nothing is
+  lost. Never wrong data, never a crash.
 
 ## Milestones
 
 Each one ends in something that boots and passes its tests.
 
-1. **Read-only KFS.** `mkkfs.py`, the VFS layer, and a kernel that mounts
-   and reads a KFS disk. FAT16 stays the default until 3.
-2. **Writing.** Commits, the allocator, deferred frees, inline data and
-   extents. Files and Notepad work on KFS.
-3. **Crash-tested, then default.** Crash and bit-rot testing pass, `make`
-   builds a 512 MiB KFS disk, FAT16 moves to `/fat`. Released as a new
-   version.
+1. **Read-only KFS** (done). `kfs.py`, the VFS layer, and a kernel that
+   mounts a KFS disk read-only at `/kfs` and reads it. FAT16 stays `/`
+   until 3.
+2. **Writing** (done). Commits, the allocator, deferred frees, inline
+   data and extents. Files and Notepad work on KFS.
+3. **Crash-tested, then default** (done). Crash and bit-rot testing pass,
+   `make` builds a 512 MiB KFS disk, FAT16 moves to `/fat`. Released as
+   a new version.
 4. **Remove FAT16**, once the checklist under
    [Removing FAT16](#removing-fat16) is met.
 5. **Snapshots** (format already ready: `snap_root`, `birth_txg`).
@@ -345,7 +439,7 @@ FAT16 goes once KFS has shown it's better *and* works. The checklist:
   or faster.
 - **Everything works:** booting, the shell, Files, Notepad, DOOM, Java
   and the Linux programs, on KFS alone, for a full release.
-- **Files can still get in and out:** `mkkfs.py` and `kfs.py` cover
+- **Files can still get in and out:** `kfs.py` covers
   everything `mtools` did (adding files to an image, reading them back).
 
 Then `fat16.rs`, the `/fat` mount and the `mtools` build steps are
@@ -378,7 +472,7 @@ already guarantees that changing one copy never changes the other.
 
 | Idea | In this design |
 |---|---|
-| Extents instead of cluster chains | v1: `EXTENT` items, up to 128 MiB each |
+| Extents instead of cluster chains | v1: `EXTENT` items, up to 64 KiB each, laid end to end |
 | 64-bit block addressing | v1 |
 | Copy-on-write + atomic superblock switch | v1: [Commits](#commits), 8-slot superblock ring |
 | Small files inside the index record | v1: `INLINE`, up to 2 KiB |

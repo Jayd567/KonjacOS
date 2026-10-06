@@ -403,7 +403,7 @@ impl Notepad {
     }
 
     fn load(&mut self, path: &str) {
-        let data = match crate::fat16::read_file(path) {
+        let data = match crate::vfs::read_file(path) {
             Ok(d) => d,
             Err(e) => {
                 let mut msg = String::from("Couldn't open it: ");
@@ -472,7 +472,7 @@ impl Notepad {
 
     fn save(&mut self, after: After) -> Reply {
         let Some(path) = self.path.clone() else { return self.ask_name(after) };
-        match crate::fat16::write_file(&path, &self.contents()) {
+        match crate::vfs::write_file(&path, &self.contents()) {
             Ok(()) => {
                 self.dirty = false;
                 bump_fs_revision();
@@ -518,11 +518,11 @@ impl Notepad {
         if !base_name(&name).contains('.') {
             name.push_str(".txt");
         }
-        if !matches!(crate::fat16::stat_path(parent_path(&name)), Ok((true, _))) {
+        if !matches!(crate::vfs::stat_path(parent_path(&name)), Ok((true, _))) {
             self.prompt = Some(Prompt::Error(String::from("Couldn't save: that folder doesn't exist.")));
             return Reply::repaint(true);
         }
-        let taken = crate::fat16::stat_path(&name).is_ok();
+        let taken = crate::vfs::stat_path(&name).is_ok();
         let same = self.path.as_ref().is_some_and(|p| p.eq_ignore_ascii_case(&name));
         if taken && !same && !force {
             self.prompt = Some(Prompt::Replace(name, after));

@@ -62,7 +62,7 @@ use core::arch::global_asm;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::fat16;
+use crate::vfs;
 use crate::gdt;
 use crate::paging;
 use crate::pmm;
@@ -543,7 +543,7 @@ fn sys_writev(_fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
 /// implemented. Build the owned path before copying so no CWD lock spans a
 /// lazy user write. The raw Linux ABI returns length including the NUL.
 fn sys_getcwd(buf_ptr: u64, size: u64) -> i64 {
-    let path = fat16::cwd_path_string();
+    let path = vfs::cwd_path_string();
     let needed = path.len() + 1;
     if needed > 4096 { return -36; } // ENAMETOOLONG
     if size < needed as u64 { return -34; } // ERANGE
@@ -643,7 +643,7 @@ fn sys_close(fd: u64) -> i64 {
     match removed {
         Some(file) => {
             if let Some(task::OpenExtra::Writable(path, buf)) = file.extra.as_deref() {
-                let _ = fat16::write_file(path, buf);
+                let _ = vfs::write_file(path, buf);
             }
             0
         }
@@ -857,15 +857,15 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     let opened: Result<(FileBacking, Option<task::OpenExtra>), i64> = if let Some(content) = synthetic_proc_file(&path) {
         Ok((FileBacking::Static(content), None))
     } else {
-        match fat16::stat_path(&path) {
+        match vfs::stat_path(&path) {
             Ok((true, _)) if write_mode => Err(EISDIR),
             Ok((true, _)) => Ok((FileBacking::Static(&[]), Some(task::OpenExtra::Dir(path.clone())))),
             Ok((false, _)) if want_dir => Err(ENOTDIR),
-            Ok((false, _)) if write_mode => match fat16::read_file(&path) {
+            Ok((false, _)) if write_mode => match vfs::read_file(&path) {
                 Ok(bytes) => Ok((FileBacking::Static(&[]), Some(task::OpenExtra::Writable(path.clone(), bytes)))),
                 Err(_) => Err(ENOENT),
             },
-            Ok((false, _)) => fat16::open_file(&path).map(|f| (FileBacking::Disk(f), None)).map_err(|_| ENOENT),
+            Ok((false, _)) => vfs::open_file(&path).map(|f| (FileBacking::Disk(f), None)).map_err(|_| ENOENT),
             Err(_) if flags & O_CREAT != 0 => Ok((FileBacking::Static(&[]), Some(task::OpenExtra::Writable(path.clone(), Vec::new())))),
             Err(_) => Err(ENOENT),
         }
@@ -899,7 +899,7 @@ fn sys_mkdir(path_ptr: u64) -> i64 {
     let Some(path) = read_c_string(path_ptr) else {
         return EINVAL;
     };
-    match fat16::create_dir(&path) {
+    match vfs::create_dir(&path) {
         Ok(()) => 0,
         Err("already exists") => EEXIST,
         Err(_) => ENOENT,
@@ -916,7 +916,7 @@ fn sys_unlink(path_ptr: u64) -> i64 {
     let Some(path) = read_c_string(path_ptr) else {
         return EINVAL;
     };
-    match fat16::remove_file(&path) {
+    match vfs::remove_file(&path) {
         Ok(()) => 0,
         Err(_) => ENOENT,
     }
@@ -931,7 +931,7 @@ fn sys_unlink(path_ptr: u64) -> i64 {
 /// honestly-narrower-than-real-Linux scope, not a new limitation.
 fn sys_fchdir(fd: u64) -> i64 {
     match task::open_file_dir_path(fd as usize) {
-        Some(path) => match fat16::change_dir(&path) {
+        Some(path) => match vfs::change_dir(&path) {
             Ok(()) => 0,
             Err(_) => ENOENT,
         },
@@ -1023,7 +1023,7 @@ fn sys_newfstatat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
         write_stat(statbuf_ptr, content.len() as u64, task::hash_path(&path), false);
         return 0;
     }
-    match fat16::stat_path(&path) {
+    match vfs::stat_path(&path) {
         Ok((is_dir, size)) => {
             write_stat(statbuf_ptr, size as u64, task::hash_path(&path), is_dir);
             0
@@ -1059,7 +1059,7 @@ fn sys_statx(path_ptr: u64, statxbuf_ptr: u64) -> i64 {
     let (size, is_dir, ino) = if let Some(content) = synthetic_proc_file(&path) {
         (content.len() as u64, false, task::hash_path(&path))
     } else {
-        match fat16::stat_path(&path) {
+        match vfs::stat_path(&path) {
             Ok((is_dir, size)) => (size as u64, is_dir, task::hash_path(&path)),
             Err(_) => return ENOENT,
         }
@@ -1068,7 +1068,6 @@ fn sys_statx(path_ptr: u64, statxbuf_ptr: u64) -> i64 {
     0
 }
 
-const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const ST_VALID: u64 = 0x20;
 
@@ -1083,7 +1082,7 @@ fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> i64 {
         write_statfs(buf_ptr, PROC_SUPER_MAGIC, 4096, 0, 0);
         return 0;
     }
-    if fat16::stat_path(&path).is_err() {
+    if vfs::stat_path(&path).is_err() {
         return ENOENT;
     }
     statfs_disk(buf_ptr)
@@ -1100,9 +1099,9 @@ fn sys_fstatfs(fd: u64, buf_ptr: u64) -> i64 {
 }
 
 fn statfs_disk(buf_ptr: u64) -> i64 {
-    match fat16::volume_stats() {
+    match vfs::volume_stats() {
         Ok(v) => {
-            write_statfs(buf_ptr, MSDOS_SUPER_MAGIC, v.cluster_bytes, v.total_clusters, v.free_clusters);
+            write_statfs(buf_ptr, v.magic, v.block_bytes, v.total_blocks, v.free_blocks);
             0
         }
         Err(_) => EIO,
@@ -1111,7 +1110,7 @@ fn statfs_disk(buf_ptr: u64) -> i64 {
 
 /// Real Linux x86_64 `struct statfs`, 120 bytes: f_type, f_bsize, f_blocks,
 /// f_bfree, f_bavail, f_files, f_ffree (u64 each), f_fsid (2 x i32),
-/// f_namelen, f_frsize, f_flags, then 4 spare u64s. FAT has no inodes, so
+/// f_namelen, f_frsize, f_flags, then 4 spare u64s. Inode counts aren't tracked, so
 /// f_files/f_ffree are 0, matching Linux's vfat driver.
 fn write_statfs(buf_ptr: u64, fs_type: u64, block: u64, blocks: u64, free: u64) {
     let fields: [u64; 15] = [fs_type, block, blocks, free, free, 0, 0, 0, 255, block, ST_VALID, 0, 0, 0, 0];
@@ -1164,7 +1163,7 @@ fn sys_access(path_ptr: u64) -> i64 {
     if synthetic_proc_file(&path).is_some() {
         return 0;
     }
-    match fat16::stat_path(&path) {
+    match vfs::stat_path(&path) {
         Ok(_) => 0,
         Err(_) => ENOENT,
     }
@@ -1201,7 +1200,7 @@ fn sys_readlink(path_ptr: u64, buf_ptr: u64, bufsize: u64) -> i64 {
         // FAT16 has no symlinks, but an existing non-link is EINVAL, not
         // ENOENT. glibc realpath probes each path component with readlink:
         // EINVAL means keep walking; ENOENT means the path does not exist.
-        return match fat16::stat_path(&path) {
+        return match vfs::stat_path(&path) {
             Ok(_) => EINVAL,
             Err(_) => ENOENT,
         };

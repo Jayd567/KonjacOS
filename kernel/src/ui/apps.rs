@@ -427,7 +427,7 @@ impl App for Terminal {
 struct Entry {
     name: String,
     is_dir: bool,
-    size: u32,
+    size: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -597,7 +597,7 @@ impl Files {
         self.selected = None;
         self.hover = None;
         self.scroll = 0;
-        match crate::fat16::list_dir(&self.path) {
+        match crate::vfs::list_dir(&self.path) {
             Ok(list) => {
                 self.error = None;
                 for e in list {
@@ -617,7 +617,7 @@ impl Files {
     fn reload(&mut self, select: Option<&str>) {
         let scroll = self.scroll;
         self.load();
-        self.selected = select.and_then(|n| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(n)));
+        self.selected = select.and_then(|n| self.find(n));
         self.scroll = scroll.min(self.max_scroll());
         self.reveal_selected();
     }
@@ -696,10 +696,13 @@ impl Files {
 
     fn enabled(&self, t: Tool) -> bool {
         let sel = self.selected.is_some();
+        // A mount point (/fat) can't be moved or deleted; what's in it can.
+        let changeable = self.selected.is_some_and(|i| !crate::vfs::read_only(&self.child(&self.entries[i].name)));
         match t {
             Tool::Up => self.path != "/",
             Tool::NewFolder | Tool::NewFile => self.error.is_none(),
-            Tool::Cut | Tool::Copy | Tool::Rename | Tool::Delete => sel,
+            Tool::Copy => sel,
+            Tool::Cut | Tool::Rename | Tool::Delete => changeable,
             Tool::Paste => self.clip.is_some(),
             Tool::ConfirmDelete | Tool::CancelDelete => true,
         }
@@ -720,8 +723,15 @@ impl Files {
             .find(|&t| Self::tool_rect(t, w).contains(x, y) && self.enabled(t))
     }
 
+    /// Whether `name` is taken here. The filesystem decides: FAT16 ignores
+    /// case, KFS doesn't.
     fn exists(&self, name: &str) -> bool {
-        self.entries.iter().any(|e| e.name.eq_ignore_ascii_case(name))
+        crate::vfs::stat_path(&self.child(name)).is_ok()
+    }
+
+    /// The entry called `name`: exactly, or else ignoring case.
+    fn find(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|e| e.name == name).or_else(|| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(name)))
     }
 
     /// `stem ext`, or `stem (2) ext`, `stem (3) ext`... whichever is free.
@@ -768,7 +778,7 @@ impl Files {
         self.commit_edit();
         let name = if dir { self.free_name("New folder", "") } else { self.free_name("New text document", ".txt") };
         let path = self.child(&name);
-        let result = if dir { crate::fat16::create_dir(&path) } else { crate::fat16::write_file(&path, b"") };
+        let result = if dir { crate::vfs::create_dir(&path) } else { crate::vfs::write_file(&path, b"") };
         if let Err(e) = result {
             return self.fail("Couldn't create it", e);
         }
@@ -795,7 +805,7 @@ impl Files {
             return None;
         }
         let (from, to) = (self.child(&edit.original), self.child(new));
-        if let Err(e) = crate::fat16::rename(&from, &to) {
+        if let Err(e) = crate::vfs::rename(&from, &to) {
             self.fail("Couldn't rename it", e);
             return None;
         }
@@ -839,7 +849,7 @@ impl Files {
     fn delete(&mut self) -> Reply {
         let Some(name) = self.confirm.take() else { return Reply::default() };
         let path = self.child(&name);
-        if let Err(e) = crate::fat16::remove(&path) {
+        if let Err(e) = crate::vfs::remove(&path) {
             return self.fail("Couldn't delete it", e);
         }
         self.follow_clip(&path, None);
@@ -881,7 +891,7 @@ impl Files {
             }
             name
         } else if self.exists(&name) {
-            let (stem, ext) = split_ext(&name, crate::fat16::stat_path(&src).is_ok_and(|(d, _)| d));
+            let (stem, ext) = split_ext(&name, crate::vfs::stat_path(&src).is_ok_and(|(d, _)| d));
             let mut stem = String::from(stem);
             stem.push_str(" - Copy");
             self.free_name(&stem, ext)
@@ -889,7 +899,7 @@ impl Files {
             name
         };
         let dst = self.child(&dst_name);
-        let result = if cut { crate::fat16::rename(&src, &dst) } else { crate::fat16::copy(&src, &dst) };
+        let result = if cut { crate::vfs::rename(&src, &dst) } else { crate::vfs::copy(&src, &dst) };
         if let Err(e) = result {
             return self.fail(if cut { "Couldn't move it" } else { "Couldn't copy it" }, e);
         }
@@ -1030,7 +1040,7 @@ pub fn file_icon(name: &str) -> usize {
     }
 }
 
-fn human_size(size: u32, out: &mut String) {
+fn human_size(size: u64, out: &mut String) {
     out.clear();
     let _ = if size >= 1024 * 1024 {
         write!(out, "{}.{} MB", size / (1024 * 1024), size % (1024 * 1024) * 10 / (1024 * 1024))
@@ -1272,15 +1282,18 @@ impl App for Files {
         match self.selected {
             Some(i) => {
                 let e = &self.entries[i];
+                let child = self.child(&e.name);
+                // A mount point (/fat) can't be moved or deleted.
+                let changeable = !crate::vfs::read_only(&child);
                 let mut v = alloc::vec![("Open", (e.is_dir || opener(&e.name).is_some()).then_some(0))];
                 if !e.is_dir {
                     v.push(("Edit in Notepad", Some(10)));
                 }
-                v.extend_from_slice(&[("", None), ("Cut", Some(5)), ("Copy", Some(6))]);
+                v.extend_from_slice(&[("", None), ("Cut", changeable.then_some(5)), ("Copy", Some(6))]);
                 if e.is_dir {
-                    v.push(("Paste Into Folder", paste.map(|_| 11)));
+                    v.push(("Paste Into Folder", self.clip.is_some().then_some(11)));
                 }
-                v.extend_from_slice(&[("", None), ("Rename", Some(8)), ("Delete", Some(9)), ("", None), ("Create Shortcut", Some(3))]);
+                v.extend_from_slice(&[("", None), ("Rename", changeable.then_some(8)), ("Delete", changeable.then_some(9)), ("", None), ("Create Shortcut", Some(3))]);
                 v
             }
             None => alloc::vec![
@@ -1337,7 +1350,7 @@ impl App for Files {
         self.commit_edit();
         self.path = String::from(dir);
         self.load();
-        self.selected = select.and_then(|name| self.entries.iter().position(|e| e.name.eq_ignore_ascii_case(name)));
+        self.selected = select.and_then(|name| self.find(name));
         self.reveal_selected();
     }
 

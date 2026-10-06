@@ -3,7 +3,8 @@
 # Targets:
 #   make kernel   - build the Rust kernel binary only
 #   make iso      - build the kernel and package a bootable ISO (image.iso)
-#   make disk     - build the FAT16 data disk (disk.img) from disk_root/
+#   make kfs      - build the KonjacFS disk (kfs.img, mounted at /) from disk_root/
+#   make disk     - build the FAT16 disk (disk.img, mounted at /fat) from disk_root/
 #   make run      - build the ISO + disk and boot them in QEMU (BIOS)
 #   make run-uefi - build the ISO + disk and boot them in QEMU (UEFI, via OVMF)
 #   make release  - build both images and package them into dist/
@@ -22,6 +23,8 @@ IMAGE         := image.iso
 DISK_ROOT     := disk_root
 DISK_IMAGE    := disk.img
 DISK_SIZE_MB  := 400
+KFS_IMAGE     := kfs.img
+KFS_SIZE      := 512M
 LIMINE_VERSION := 9.6.7
 VERSION       ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 DIST          := dist
@@ -92,17 +95,31 @@ disk:
 		echo "Built $(DISK_IMAGE) from $(DISK_ROOT)/ (including subdirectories)"; \
 	fi
 
+# The KonjacFS disk, built by tools/kfs.py (Python 3, standard library
+# only): KonjacOS's main disk, mounted at /. FAT16 is then at /fat.
+.PHONY: kfs
+kfs:
+	@if [ -f $(KFS_IMAGE) ]; then 		echo "$(KFS_IMAGE) already exists, leaving it alone (rm it to regenerate from $(DISK_ROOT)/)"; 	else 		python3 tools/kfs.py mkfs $(DISK_ROOT) $(KFS_IMAGE) --size $(KFS_SIZE); 	fi
+
 comma := ,
+
+# Copies files (from disk_root/) to the root of whichever disk images exist,
+# leaving everything else on them alone.
+define add-to-disks
+	@if [ -f $(KFS_IMAGE) ]; then for f in $(1); do python3 tools/kfs.py put $(KFS_IMAGE) $$f /; done; fi
+	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(1) ::/; fi
+endef
+
 # virtio: the fast DMA disk driver (`virtio_blk.rs`). `if=ide` works too,
-# through the slower ATA driver.
-DISK_DRIVE = $(if $(wildcard $(DISK_IMAGE)),-drive file=$(DISK_IMAGE)$(comma)format=raw$(comma)if=virtio)
+# through the slower ATA driver (FAT16 disk only).
+DISK_DRIVE = $(if $(wildcard $(DISK_IMAGE)),-drive file=$(DISK_IMAGE)$(comma)format=raw$(comma)if=virtio) 	$(if $(wildcard $(KFS_IMAGE)),-drive file=$(KFS_IMAGE)$(comma)format=raw$(comma)if=virtio)
 
 .PHONY: run
-run: iso disk
+run: iso disk kfs
 	qemu-system-x86_64 $(QEMU_FLAGS) -cdrom $(IMAGE) $(DISK_DRIVE)
 
 .PHONY: run-uefi
-run-uefi: iso disk
+run-uefi: iso disk kfs
 	@test -f /usr/share/OVMF/OVMF_CODE_4M.fd || \
 		(echo "OVMF firmware not found; install the 'ovmf' package" && exit 1)
 	qemu-system-x86_64 $(QEMU_FLAGS) \
@@ -111,12 +128,15 @@ run-uefi: iso disk
 		-cdrom $(IMAGE) $(DISK_DRIVE)
 
 .PHONY: release
-release: iso disk
+release: iso disk kfs
 	rm -rf $(DIST) && mkdir -p $(DIST)
 	cp $(IMAGE) $(DIST)/konjacos-$(VERSION).iso
 	cd $(DIST) && cp ../$(DISK_IMAGE) konjacos-$(VERSION)-disk.img && \
 		zip -q -9 konjacos-$(VERSION)-disk.zip konjacos-$(VERSION)-disk.img && \
 		rm konjacos-$(VERSION)-disk.img
+	cd $(DIST) && cp ../$(KFS_IMAGE) konjacos-$(VERSION)-kfs.img && \
+		zip -q -9 konjacos-$(VERSION)-kfs.zip konjacos-$(VERSION)-kfs.img && \
+		rm konjacos-$(VERSION)-kfs.img
 	cd $(DIST) && sha256sum * > SHA256SUMS
 	@echo "Release files are in $(DIST)/"
 
@@ -124,72 +144,72 @@ release: iso disk
 clean:
 	cd $(KERNEL_DIR) && cargo clean
 	rm -rf $(ISO_ROOT) $(IMAGE) $(DIST)
-	@echo "(leaving $(DISK_IMAGE) alone -- rm it yourself if you want a fresh one)"
+	@echo "(leaving $(DISK_IMAGE) and $(KFS_IMAGE) alone -- rm them yourself if you want fresh ones)"
 
 # Hosted glibc fixture for the Linux ABI; not linked into the kernel.
 # Preserve an existing data disk, including any JDK installed directly into it.
 .PHONY: futex-fixture
 futex-fixture:
 	gcc -O2 -pthread userprogs/futex_glibc.c -o $(DISK_ROOT)/FUTEST.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/FUTEST.ELF ::/FUTEST.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/FUTEST.ELF)
 
 .PHONY: path-fixture io-fixture
 path-fixture:
 	gcc -O2 userprogs/realpath_glibc.c -o $(DISK_ROOT)/PATHCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/PATHCHK.ELF ::/PATHCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/PATHCHK.ELF)
 
 io-fixture:
 	gcc -O2 userprogs/io_glibc.c -o $(DISK_ROOT)/IOCHK.ELF
 	python3 -c "from pathlib import Path; Path('$(DISK_ROOT)/IOPAT.BIN').write_bytes(bytes((i*37+i//251)&255 for i in range(65539)))"
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/IOCHK.ELF $(DISK_ROOT)/IOPAT.BIN ::/; fi
+	$(call add-to-disks,$(DISK_ROOT)/IOCHK.ELF $(DISK_ROOT)/IOPAT.BIN)
 
 .PHONY: statfs-fixture
 statfs-fixture:
 	gcc -O2 userprogs/statfs_glibc.c -o $(DISK_ROOT)/STATFS.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/STATFS.ELF ::/STATFS.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/STATFS.ELF)
 
 .PHONY: largefile-fixture
 largefile-fixture:
 	gcc -O2 userprogs/largefile_glibc.c -o $(DISK_ROOT)/BIGCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/BIGCHK.ELF ::/BIGCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/BIGCHK.ELF)
 
 .PHONY: vm-fixture
 vm-fixture:
 	gcc -O2 -pthread userprogs/vm_glibc.c -o $(DISK_ROOT)/VMCHK.ELF
 	gcc -O2 userprogs/vm_fault.c -o $(DISK_ROOT)/OOMCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/VMCHK.ELF $(DISK_ROOT)/OOMCHK.ELF ::/; fi
+	$(call add-to-disks,$(DISK_ROOT)/VMCHK.ELF $(DISK_ROOT)/OOMCHK.ELF)
 
 .PHONY: getcpu-fixture
 getcpu-fixture:
 	gcc -O2 userprogs/getcpu_glibc.c -o $(DISK_ROOT)/CPUCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/CPUCHK.ELF ::/CPUCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/CPUCHK.ELF)
 
 .PHONY: sysinfo-fixture
 sysinfo-fixture:
 	gcc -O2 userprogs/sysinfo_glibc.c -o $(DISK_ROOT)/SYSCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/SYSCHK.ELF ::/SYSCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/SYSCHK.ELF)
 
 .PHONY: timed-futex-fixture
 timed-futex-fixture:
 	gcc -O2 -pthread userprogs/futex_timed_glibc.c -o $(DISK_ROOT)/TIMECHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/TIMECHK.ELF ::/TIMECHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/TIMECHK.ELF)
 
 .PHONY: large-read-fixture
 large-read-fixture:
 	gcc -O2 userprogs/read_large_glibc.c -o $(DISK_ROOT)/READCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/READCHK.ELF ::/READCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/READCHK.ELF)
 
 .PHONY: getcwd-fixture
 getcwd-fixture:
 	gcc -O2 userprogs/getcwd_glibc.c -o $(DISK_ROOT)/CWDCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/CWDCHK.ELF ::/CWDCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/CWDCHK.ELF)
 
 .PHONY: clone-files-fixture
 clone-files-fixture:
 	gcc -O2 -pthread userprogs/clone_files_glibc.c -o $(DISK_ROOT)/FDCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/FDCHK.ELF ::/FDCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/FDCHK.ELF)
 
 .PHONY: sleep-fixture
 sleep-fixture:
 	gcc -O2 -pthread userprogs/sleep_glibc.c -o $(DISK_ROOT)/SLEEPCHK.ELF
-	@if [ -f $(DISK_IMAGE) ]; then mcopy -o -i $(DISK_IMAGE) $(DISK_ROOT)/SLEEPCHK.ELF ::/SLEEPCHK.ELF; fi
+	$(call add-to-disks,$(DISK_ROOT)/SLEEPCHK.ELF)

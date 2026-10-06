@@ -64,7 +64,7 @@ impl Icon {
 /// unreadable means a fresh desktop -- nothing pinned, no shortcuts.
 pub fn load_config() -> (Vec<AppKind>, Vec<Icon>) {
     let (mut pinned, mut icons) = (Vec::new(), Vec::new());
-    let Ok(data) = crate::fat16::read_file(CONFIG) else { return (pinned, icons) };
+    let Ok(data) = crate::vfs::read_file(CONFIG) else { return (pinned, icons) };
     // Not `String::from_utf8_lossy`: it needs unwinding support this
     // kernel can't link (see `cfile.rs`). We wrote the file, so it's UTF-8.
     let text = core::str::from_utf8(&data).unwrap_or("");
@@ -117,7 +117,7 @@ pub fn save_config(pinned: &[AppKind], icons: &[Icon]) {
             Target::Dir(p) => writeln!(out, "dir {} {} {}", ic.col, ic.row, p),
         };
     }
-    let _ = crate::fat16::write_file(CONFIG, out.as_bytes());
+    let _ = crate::vfs::write_file(CONFIG, out.as_bytes());
 }
 
 /// How many rows of icons fit in `area`.

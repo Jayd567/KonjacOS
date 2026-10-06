@@ -17,8 +17,10 @@ The long-term goal is to run Minecraft: Java Edition.
 - Preemptive multitasking, with each user program in its own address space.
 - Virtual memory with demand paging, `mmap`, memory protection and
   no-execute pages.
-- A FAT16 filesystem with folders and long filenames, readable and
-  writable by any other OS.
+- KonjacFS, its own copy-on-write filesystem ([design](docs/kfs-design.md)):
+  every block is checksummed, and every change lands all at once or not at
+  all, so a crash or power cut can't leave the disk half written. The
+  FAT16 disk from earlier versions still works, at `/fat`.
 - Runs ELF64 (static and dynamic), PE32+ `.exe` and flat binary programs.
 - A Linux compatibility layer that runs unmodified glibc and musl
   programs, including threads and signals.
@@ -28,19 +30,22 @@ The long-term goal is to run Minecraft: Java Edition.
 
 ## Download and run
 
-Get the latest `.iso` and `-disk.zip` from the
+Get the latest `.iso` and `-kfs.zip` from the
 [Releases](https://github.com/Jayd567/KonjacOS/releases) page, unzip the
 disk image, then boot both in [QEMU](https://www.qemu.org/):
 
 ```sh
 qemu-system-x86_64 -m 256M -boot order=d \
-  -cdrom konjacos-v0.2.0.iso \
-  -drive file=konjacos-v0.2.0-disk.img,format=raw,if=virtio
+  -cdrom konjacos-v0.3.0.iso \
+  -drive file=konjacos-v0.3.0-kfs.img,format=raw,if=virtio
 ```
 
-(`if=ide` works too, through a slower driver.)
+The KonjacFS disk becomes `/`. To keep using a FAT16 disk from an
+earlier version, add it as a second `-drive`: it appears at `/fat`, and
+your settings and pins are copied over the first time. (A FAT16 disk on
+its own, or attached with `if=ide`, is `/` as before.)
 
-The ISO boots on its own, but without the disk image there are no files
+The ISO boots on its own, but without a disk image there are no files
 to browse and no DOOM. For a smoother desktop, add `-accel whpx` on
 Windows, `-accel kvm` on Linux or `-accel hvf` on macOS.
 
@@ -71,6 +76,7 @@ Things to try in the Terminal:
 
 ```
 ls                 list files on the disk
+ls /fat            list the FAT16 disk, if one is attached
 cat README.TXT     print a file
 run hello.exe      run a Windows-format program
 doom               play DOOM (opens in its own window)
@@ -90,6 +96,9 @@ ps                 list running tasks
 | `ps`, `kill <id>` | List or stop running tasks |
 | `doom` | Play DOOM |
 | `meminfo`, `uptime` | Show memory use and uptime |
+| `diskbench` | Time reads, writes and deletes on each disk |
+| `verify [folder]` | Read every file and report any that are damaged |
+| `kfstest [steps] [seed] [keep] [fill]` | Random writes, renames and deletes on KonjacFS, each checked; `fill` also fills the disk |
 | `reboot`, `halt` | Restart or stop the machine (needs the admin password) |
 
 The first time you run a command that needs the admin password, you
@@ -101,6 +110,7 @@ You need a Linux machine with:
 
 - Rust (stable)
 - `gcc` or `clang`
+- Python 3 (for `tools/kfs.py`, which builds the KonjacFS disk)
 - `xorriso`, `mtools`, `dosfstools`
 - `qemu-system-x86_64` to run it
 
@@ -119,6 +129,20 @@ make release      # build the downloadable images into dist/
 ```
 
 Add `MODE=release` to any of these for an optimized build.
+
+`make` builds the disks from `disk_root/` the first time and leaves them
+alone after that. To add a file to the KonjacFS disk:
+
+```sh
+python3 tools/kfs.py put kfs.img myfile.txt /     # also: ls, cat, get, mkdir, rm, check
+```
+
+Two tests boot KonjacOS in QEMU over and over to check KonjacFS:
+
+```sh
+tools/crash_test.py 200     # kills QEMU mid-write; the disk must stay consistent
+tools/bitrot_test.py 100    # damages a random block; it must be caught, never returned
+```
 
 ## Roadmap
 
@@ -140,9 +164,9 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 | `kernel/src/ui/` | The desktop ([design notes](docs/desktop-ui-design.md)) |
 | `kernel/assets/` | Wallpaper, logo, icons and fonts baked into the kernel |
 | `kernel/csrc/` | C code built into the kernel, including the DOOM port |
-| `disk_root/` | Files copied onto the disk image |
+| `disk_root/` | Files copied onto the disk images |
 | `userprogs/` | Small test programs |
-| `tools/` | Debugging scripts, the asset generator and a QEMU screenshot harness |
+| `tools/` | Debugging scripts, the asset generator, `kfs.py` (KonjacFS images), the KonjacFS crash and bit-rot tests, and a QEMU screenshot harness |
 | `boot/`, `limine/` | Bootloader configuration and files |
 | `docs/` | Design notes and development history |
 

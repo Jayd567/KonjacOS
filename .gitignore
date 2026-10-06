@@ -2,6 +2,7 @@
 /iso_root/
 /image.iso
 /disk.img
+/kfs.img
 .work/
 .worktrees/
 .cache/

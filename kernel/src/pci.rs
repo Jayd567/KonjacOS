@@ -2,6 +2,8 @@
 //! a register, `0xCFC` reads or writes it) -- enough to find a device by
 //! its vendor and device IDs, read its BARs and let it do DMA.
 
+extern crate alloc;
+
 use crate::port::{inl, outl};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -36,9 +38,10 @@ fn write32(bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
     }
 }
 
-/// The first device with vendor `vendor` and device `device`, scanning
-/// every bus, slot and function.
-pub fn find(vendor: u16, device: u16) -> Option<Device> {
+/// Every device with vendor `vendor` and device `device`, scanning every
+/// bus, slot and function, in that order.
+pub fn find_all(vendor: u16, device: u16) -> alloc::vec::Vec<Device> {
+    let mut found = alloc::vec::Vec::new();
     for bus in 0..=255u8 {
         for slot in 0..32u8 {
             let id = read32(bus, slot, 0, 0);
@@ -50,12 +53,12 @@ pub fn find(vendor: u16, device: u16) -> Option<Device> {
             for func in 0..if multi { 8 } else { 1 } {
                 let id = read32(bus, slot, func, 0);
                 if id as u16 == vendor && (id >> 16) as u16 == device {
-                    return Some(Device { bus, slot, func });
+                    found.push(Device { bus, slot, func });
                 }
             }
         }
     }
-    None
+    found
 }
 
 impl Device {
