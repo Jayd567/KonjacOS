@@ -205,8 +205,8 @@ in name order, the caller sorts the entries, as Files already does.
   anywhere in an extent has to read and verify all of it, so a 128 MiB
   extent would make every small read cost 128 MiB. Writing a file in one
   go still allocates one long run of blocks when free space allows, so
-  the extents sit end to end and reading the file is one request per
-  64 KiB (also the virtio-blk limit) with no seeking in between.
+  the extents sit end to end and are read together (see
+  [Reading fast](#reading-fast)).
 - **Sparse:** a range with no extent reads as zeros and uses no space.
   The format supports it from v1; the write path creates holes only
   where something explicitly seeks past the end.
@@ -327,9 +327,50 @@ if commits ever become the bottleneck.
   few disk reads.
 - **Dirty nodes** are pinned in memory until their commit. If they fill
   half the cache, a commit is started early, so memory use stays bounded.
-- **Data** isn't cached by KFS in v1 (there's no page cache in the kernel
-  yet). Reads go straight from the disk into the caller's buffer, through
-  `block.rs`.
+- **Data:** reading a whole file goes straight from the disk into the
+  caller's buffer. Small reads (`read_at`) go through an 8 MiB cache of
+  whole, already-checked extents, keyed by block number and checksum,
+  so an entry can never stand in for data written since and nothing
+  needs invalidating.
+
+### Reading fast
+
+FAT16 was the bar to clear ([Removing FAT16](#removing-fat16)). What
+KFS does:
+
+- **Neighbouring extents are read together**, up to 256 KiB per disk
+  request, and each is checked against its own checksum afterwards.
+- **Several requests are in flight at once** (`block::read_many`): QEMU
+  works on them in parallel, which nearly doubles throughput from an
+  image on a slow host filesystem. Each extent is checked as soon as its
+  request arrives, while the others are still on their way, so the
+  checksums cost almost no time: the CPU would otherwise just be
+  waiting.
+- **The disk writes straight into the caller's buffer**: virtio-blk
+  hands the device the buffer's physical pages instead of copying
+  through a bounce buffer.
+- **Small reads read ahead:** a `read_at` that misses the cache fetches
+  the next 256 KiB along with what it needs, so reading a file in small
+  pieces costs one disk request per 256 KiB instead of one per call.
+- **Writes go out together:** a file's extents, and a commit's tree
+  nodes and bitmap blocks, are written with several requests in flight.
+
+`diskbench` (median of 5 runs, caches emptied before each, release
+build, images on the WSL host's Windows drive):
+
+| | KonjacFS | FAT16 |
+|---|---:|---:|
+| Read DOOM1.WAD (4 MB) | 9.0 ms | 13.7 ms |
+| Read it in 4 KiB pieces | 31.1 ms | 160.1 ms |
+| 256 random 4 KiB reads | 21.0 ms | 137.1 ms |
+| ... again (cached) | 2.8 ms | 149.5 ms |
+| Write 1 MiB | 6.5 ms | 37.1 ms |
+| Read it back | 5.7 ms | 5.6 ms |
+| List a folder x20 | 0.9 ms | 2.9 ms |
+| Delete it | 2.1 ms | 1.2 ms |
+
+Delete is slower because a KFS delete is durable when it returns (two
+flushes around the superblock); FAT16 never flushes.
 
 ## How it fits into the kernel
 
@@ -436,7 +477,9 @@ FAT16 goes once KFS has shown it's better *and* works. The checklist:
 - **Safe:** the crash and bit-rot tests pass, hundreds of runs each, with
   no failures.
 - **At least as fast:** every `diskbench` line on KFS is as fast as FAT16
-  or faster.
+  or faster. *Met except for delete* (2.1 against 1.2 ms), which costs
+  more only because a KFS delete is durable when it returns and FAT16's
+  isn't; see [Reading fast](#reading-fast).
 - **Everything works:** booting, the shell, Files, Notepad, DOOM, Java
   and the Linux programs, on KFS alone, for a full release.
 - **Files can still get in and out:** `kfs.py` covers

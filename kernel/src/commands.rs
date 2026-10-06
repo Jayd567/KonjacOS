@@ -55,7 +55,7 @@ pub static COMMANDS: &[Command] = &[
     },
     Command { name: "write", summary: "<file> <text>  create/overwrite a file with <text>", requires_apex: false, handler: cmd_write },
     Command { name: "rm", summary: "<file>  delete a file", requires_apex: true, handler: cmd_rm },
-    Command { name: "diskbench", summary: "time disk reads and writes (needs DOOM1.WAD; writes and deletes /BENCH.TMP)", requires_apex: false, handler: cmd_diskbench },
+    Command { name: "diskbench", summary: "time reads (whole files, 4 KiB pieces, random), writes and deletes on each disk (needs DOOM1.WAD; writes and deletes BENCH.TMP)", requires_apex: false, handler: cmd_diskbench },
     Command { name: "verify", summary: "[folder]  read every file under a folder and report any that fail", requires_apex: false, handler: cmd_verify },
     Command { name: "kfstest", summary: "[steps] [seed] [keep] [fill]  random writes, renames and deletes under /kfstest, checked as it goes", requires_apex: false, handler: cmd_kfstest },
     Command { name: "reboot", summary: "reset the machine", requires_apex: true, handler: cmd_reboot },
@@ -241,69 +241,100 @@ fn cmd_rm(rest: &str) {
     }
 }
 
-/// Times the disks: a big read, a 1 MiB write, reading that back, listing
-/// a folder and deleting -- on FAT16 and, if attached, on KFS -- the
-/// "before and after" numbers for disk driver and filesystem work.
+/// Times the disks -- KonjacFS, then FAT16 if it's attached too: reading
+/// DOOM1.WAD whole and in 4 KiB pieces, random 4 KiB reads, writing 1 MiB
+/// and reading it back, listing a folder and deleting. Each test runs
+/// [`BENCH_RUNS`] times and the median is shown, timed with the CPU's
+/// cycle counter (calibrated against the timer first). KonjacFS's caches
+/// are emptied before every run, so its numbers are first-time reads --
+/// except "again", which repeats the random reads to show its cache.
 fn cmd_diskbench(_rest: &str) {
     use crate::vfs;
-    // `ms` and KiB/s from a tick count and a byte count.
-    fn report(what: &str, ticks: u64, bytes: usize, sectors: u64) {
-        let ms = ticks * 1000 / timer::HZ as u64;
-        let kib_s = if ms == 0 { 0 } else { bytes as u64 * 1000 / 1024 / ms };
-        if bytes > 0 {
-            println!("    {what:<22} {ms:>6} ms  {kib_s:>7} KiB/s  ({sectors} disk requests)");
-        } else {
-            println!("    {what:<22} {ms:>6} ms  ({sectors} disk requests)");
-        }
-    }
+    const BENCH_RUNS: usize = 5;
+    let tsc = || unsafe { core::arch::x86_64::_rdtsc() };
+    // Cycles per millisecond, over 20 timer ticks.
+    let t0 = timer::ticks();
+    while timer::ticks() == t0 {}
+    let (c0, t1) = (tsc(), timer::ticks());
+    while timer::ticks() < t1 + 20 {}
+    let per_ms = ((tsc() - c0) * timer::HZ as u64 / 20 / 1000).max(1);
     let ops = || crate::block::stats().0;
-    println!("diskbench ({}):", crate::block::backend_name());
+    // Runs `prep` (untimed) then `f`, BENCH_RUNS times, and reports the
+    // median time and the disk requests one run took.
+    let run = |what: &str, bytes: usize, prep: &mut dyn FnMut(), f: &mut dyn FnMut() -> Result<(), &'static str>| {
+        let mut times = [0u64; BENCH_RUNS];
+        let mut requests = 0;
+        for t in times.iter_mut() {
+            prep();
+            let (c, s) = (tsc(), ops());
+            if let Err(e) = f() {
+                println!("    {what:<26} {e}");
+                return;
+            }
+            *t = (tsc() - c) * 1000 / per_ms;
+            requests = ops() - s;
+        }
+        times.sort_unstable();
+        let us = times[BENCH_RUNS / 2];
+        let mut line = String::new();
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!("    {what:<26} {:>4}.{} ms", us / 1000, us % 1000 / 100));
+        if bytes > 0 && us > 0 {
+            let _ = core::fmt::Write::write_fmt(&mut line, format_args!("  {:>5} MB/s", bytes as u64 / us));
+        }
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!("  ({requests} disk requests)"));
+        println!("{line}");
+    };
+    let cold = &mut || crate::kfs::drop_caches();
+    println!("diskbench ({}, median of {BENCH_RUNS} runs):", crate::block::backend_name());
     let data: Vec<u8> = (0..1024 * 1024u32).map(|i| (i * 7 + i / 4096) as u8).collect();
     // `/` first, then FAT16 at /fat if KonjacFS is `/`.
     let volumes = if crate::kfs::mounted() { alloc::vec![("KonjacFS", ""), ("FAT16", vfs::FAT_MOUNT)] } else { alloc::vec![("FAT16", "")] };
     for (name, root) in volumes {
         println!("  {name} ({}):", if root.is_empty() { "/" } else { root });
         let path = |p: &str| {
-            let mut s = alloc::string::String::from(root);
+            let mut s = String::from(root);
             s.push('/');
             s.push_str(p);
             s
         };
-        let (t, s) = (timer::ticks(), ops());
-        match vfs::read_file(&path("DOOM1.WAD")) {
-            Ok(d) => report("read DOOM1.WAD", timer::ticks() - t, d.len(), ops() - s),
-            Err(e) => println!("    read DOOM1.WAD: {e}"),
-        }
+        let wad = path("DOOM1.WAD");
+        let size = vfs::stat_path(&wad).map(|(_, s)| s as usize).unwrap_or(0);
+        let mut chunk = alloc::vec![0u8; 4096];
+        run("read DOOM1.WAD", size, cold, &mut || vfs::read_file(&wad).map(|_| ()));
+        run("read it in 4 KiB pieces", size, cold, &mut || {
+            let mut f = vfs::open_file(&wad)?;
+            let mut off = 0u64;
+            while off < f.size as u64 {
+                off += f.read_at(off, &mut chunk)?.max(1) as u64;
+            }
+            Ok(())
+        });
+        // The same 256 offsets each time.
+        let random = |chunk: &mut [u8]| -> Result<(), &'static str> {
+            let mut f = vfs::open_file(&wad)?;
+            let mut x = 12345u64;
+            for _ in 0..256 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                f.read_at((x >> 33) % (f.size as u64).saturating_sub(4096).max(1), chunk)?;
+            }
+            Ok(())
+        };
+        run("256 random 4 KiB reads", 256 * 4096, cold, &mut || random(&mut chunk));
+        run("  again", 256 * 4096, &mut || {}, &mut || random(&mut chunk));
         let bench = path("BENCH.TMP");
-        let (t, s) = (timer::ticks(), ops());
-        match vfs::write_file(&bench, &data) {
-            Ok(()) => report("write 1 MiB", timer::ticks() - t, data.len(), ops() - s),
-            Err(e) => {
-                println!("    write 1 MiB: {e}");
-                continue;
-            }
-        }
-        let (t, s) = (timer::ticks(), ops());
-        match vfs::read_file(&bench) {
-            Ok(d) => {
-                report("read it back", timer::ticks() - t, d.len(), ops() - s);
-                if d != data {
-                    println!("    ** read-back mismatch: the disk returned different data **");
-                }
-            }
-            Err(e) => println!("    read it back: {e}"),
-        }
+        run("write 1 MiB", data.len(), &mut || drop(vfs::remove_file(&bench)), &mut || vfs::write_file(&bench, &data));
+        run("read it back", data.len(), cold, &mut || match vfs::read_file(&bench)? {
+            d if d == data => Ok(()),
+            _ => Err("** read-back mismatch: the disk returned different data **"),
+        });
         let dir = if root.is_empty() { "/" } else { root };
-        let (t, s) = (timer::ticks(), ops());
-        for _ in 0..20 {
-            let _ = vfs::list_dir(dir);
-        }
-        report("list the folder x20", timer::ticks() - t, 0, ops() - s);
-        let (t, s) = (timer::ticks(), ops());
-        match vfs::remove_file(&bench) {
-            Ok(()) => report("delete it", timer::ticks() - t, 0, ops() - s),
-            Err(e) => println!("    delete: {e}"),
-        }
+        run("list the folder x20", 0, cold, &mut || {
+            for _ in 0..20 {
+                vfs::list_dir(dir)?;
+            }
+            Ok(())
+        });
+        run("delete it", 0, &mut || drop(vfs::write_file(&bench, &data)), &mut || vfs::remove_file(&bench));
     }
 }
 

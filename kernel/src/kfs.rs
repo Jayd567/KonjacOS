@@ -73,6 +73,13 @@ const INLINE_MAX: usize = 2048;
 /// The longest an extent can be: one checksum's worth.
 const EXTENT_MAX: u64 = 64 * 1024;
 const EXTENT_BLOCKS: u64 = EXTENT_MAX / BLOCK as u64;
+/// The most of a file read in one disk request: neighbouring extents are
+/// read together, then checked one by one.
+const READ_GROUP: usize = 256 * 1024;
+/// How far past a small read `read_at` fetches, into the data cache.
+const READ_AHEAD: u64 = 256 * 1024;
+/// File data kept in memory for `read_at`: 8 MiB of the heap.
+const DATA_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Tree nodes kept in memory: 256 x 4 KiB = 1 MiB.
 const CACHE_SLOTS: usize = 256;
@@ -442,6 +449,47 @@ impl Cache {
     }
 }
 
+/// File data recently read through `read_at`, already checked: whole
+/// extents, keyed by where they are and their checksum, so an entry can
+/// never stand in for different data (a block rewritten since has a new
+/// checksum). Least recently used goes first once [`DATA_CACHE_BYTES`]
+/// is reached.
+struct DataCache {
+    slots: Vec<(u64, u64, u64, Vec<u8>)>, // block, checksum, last use, contents
+    bytes: usize,
+    clock: u64,
+}
+
+impl DataCache {
+    fn find(&self, bp: Bp) -> Option<usize> {
+        self.slots.iter().position(|s| s.0 == bp.block && s.1 == bp.checksum)
+    }
+
+    fn contains(&self, bp: Bp) -> bool {
+        self.find(bp).is_some()
+    }
+
+    fn get(&mut self, bp: Bp) -> Option<&[u8]> {
+        let i = self.find(bp)?;
+        self.clock += 1;
+        self.slots[i].2 = self.clock;
+        Some(&self.slots[i].3)
+    }
+
+    fn put(&mut self, bp: Bp, data: Vec<u8>) {
+        if self.contains(bp) {
+            return;
+        }
+        while self.bytes + data.len() > DATA_CACHE_BYTES && !self.slots.is_empty() {
+            let oldest = (0..self.slots.len()).min_by_key(|&i| self.slots[i].2).unwrap_or(0);
+            self.bytes -= self.slots.swap_remove(oldest).3.len();
+        }
+        self.clock += 1;
+        self.bytes += data.len();
+        self.slots.push((bp.block, bp.checksum, self.clock, data));
+    }
+}
+
 struct Fs {
     disk: usize,
     /// The newest committed superblock; the next one starts as a copy.
@@ -453,6 +501,9 @@ struct Fs {
     /// Set when the newest commit couldn't be read and an older one is in use.
     fell_back_from: Option<u64>,
     cache: Cache,
+    data: DataCache,
+    /// Blocks a commit has built and not yet written.
+    pending: Vec<(u64, Box<[u8; BLOCK]>)>,
 
     // Free space. The whole bitmap is in memory (32 KiB per GiB of disk).
     /// 1 = in use, in the state being built.
@@ -563,6 +614,8 @@ fn open(disk: usize, sb: Box<[u8; BLOCK]>) -> Result<Fs, &'static str> {
         next_object: le64(&sb[..], 144),
         fell_back_from: None,
         cache: Cache { slots: Vec::with_capacity(CACHE_SLOTS), clock: 0 },
+        data: DataCache { slots: Vec::new(), bytes: 0, clock: 0 },
+        pending: Vec::new(),
         bits: Vec::new(),
         held: Vec::new(),
         bitmap: Vec::new(),
@@ -1041,6 +1094,10 @@ impl Fs {
         let txg = self.txg + 1;
         let root = self.write_child(self.root, txg)?;
         let bitmap_root = self.write_bitmap(txg)?;
+        // The new nodes and bitmap blocks, several requests at once.
+        let pending = core::mem::take(&mut self.pending);
+        let items: Vec<(u64, &[u8])> = pending.iter().map(|(b, d)| (b * SECTORS_PER_BLOCK, &d[..])).collect();
+        block::write_many(self.disk, &items)?;
         block::flush(self.disk)?;
 
         let mut sb = self.sb.clone();
@@ -1069,6 +1126,7 @@ impl Fs {
     /// simply free again).
     fn abort(&mut self) -> Result<(), &'static str> {
         self.nodes.clear();
+        self.pending.clear();
         self.root = Child::Disk(Bp::parse(&self.sb[..], 40));
         self.next_object = le64(&self.sb[..], 144);
         self.dirty = false;
@@ -1094,9 +1152,9 @@ impl Fs {
         }
         let raw = self.nodes[i].serialize(txg);
         let block = self.alloc(1)?;
-        write_blocks(self.disk, block, &raw[..])?;
         let checksum = xxh64(&raw[..]);
         self.cache.put(block, checksum, &raw);
+        self.pending.push((block, raw));
         Ok(Bp { block, count: 1, kind: BP_NODE, birth: txg, checksum })
     }
 
@@ -1138,7 +1196,7 @@ impl Fs {
             for w in 0..WORDS_PER_BITMAP {
                 put64(&mut buf[..], w * 8, self.bits[k * WORDS_PER_BITMAP + w]);
             }
-            write_blocks(self.disk, self.bitmap[k].block, &buf[..])?;
+            self.pending.push((self.bitmap[k].block, buf.clone()));
             self.bitmap[k] = Bp { block: self.bitmap[k].block, count: 1, kind: BP_BITMAP, birth: txg, checksum: xxh64(&buf[..]) };
         }
         self.bitmap_dirty.fill(false);
@@ -1160,7 +1218,7 @@ impl Fs {
                     bp.put(&mut buf[..], HEADER + j * BP);
                 }
                 let block = next.next().ok_or("kfs: bitmap index miscounted")?;
-                write_blocks(self.disk, block, &buf[..])?;
+                self.pending.push((block, buf.clone()));
                 let bp = Bp { block, count: 1, kind: BP_BITMAP_INDEX, birth: txg, checksum: xxh64(&buf[..]) };
                 self.index.push(bp);
                 up.push(bp);
@@ -1309,6 +1367,9 @@ impl Fs {
         let txg = self.txg + 1;
         let nblocks = data.len().div_ceil(BLOCK) as u64;
         let mut pad: Vec<u8> = Vec::new();
+        // Written all together at the end: (block, offset in `data`, bytes).
+        let mut writes: Vec<(u64, usize, usize)> = Vec::new();
+        let mut pad_at = None;
         let mut done = 0;
         let reserve = RESERVE_MIN.max(self.total_blocks / 256);
         while done < nblocks {
@@ -1324,16 +1385,16 @@ impl Fs {
                 let at = ((done + k) as usize) * BLOCK;
                 let bytes = &data[at..(at + count as usize * BLOCK).min(data.len())];
                 // The last extent's final block is padded with zeros.
-                let whole: &[u8] = if bytes.len() == count as usize * BLOCK {
-                    bytes
+                let checksum = if bytes.len() == count as usize * BLOCK {
+                    writes.push((start + k, at, bytes.len()));
+                    xxh64(bytes)
                 } else {
-                    pad.clear();
                     pad.extend_from_slice(bytes);
                     pad.resize(count as usize * BLOCK, 0);
-                    &pad
+                    pad_at = Some(start + k);
+                    xxh64(&pad)
                 };
-                write_blocks(self.disk, start + k, whole)?;
-                let bp = Bp { block: start + k, count: count as u32, kind: BP_DATA, birth: txg, checksum: xxh64(whole) };
+                let bp = Bp { block: start + k, count: count as u32, kind: BP_DATA, birth: txg, checksum };
                 let mut item = vec![0u8; BP + 8];
                 bp.put(&mut item, 0);
                 put64(&mut item, BP, bytes.len() as u64);
@@ -1342,6 +1403,13 @@ impl Fs {
             }
             done += got;
         }
+        // Several requests in flight; all of it is on the disk before the
+        // commit that makes it reachable.
+        let mut items: Vec<(u64, &[u8])> = writes.iter().map(|&(b, at, n)| (b * SECTORS_PER_BLOCK, &data[at..at + n])).collect();
+        if let Some(b) = pad_at {
+            items.push((b * SECTORS_PER_BLOCK, &pad));
+        }
+        block::write_many(self.disk, &items)?;
         Ok(nblocks)
     }
 
@@ -1497,6 +1565,11 @@ impl Fs {
         let rounded = (size as usize).div_ceil(BLOCK) * BLOCK;
         data.try_reserve_exact(rounded).map_err(|_| "file buffer allocation failed")?;
         data.resize(rounded.max(size as usize), 0);
+        // Extents next to each other on disk and in the file are read
+        // together, up to READ_GROUP at a time; several reads are in flight
+        // at once, and each extent is checked as soon as its read arrives,
+        // while the others are still on their way.
+        let mut groups: Vec<(usize, usize, Vec<Bp>)> = Vec::new(); // at, bytes, extents
         for p in self.pieces(obj, 0, size)? {
             match p {
                 Piece::Inline(d) => {
@@ -1504,14 +1577,46 @@ impl Fs {
                     data[..n].copy_from_slice(&d[..n]);
                 }
                 Piece::Extent { offset, bp, .. } => {
-                    let at = offset as usize;
-                    let bytes = bp.count as usize * BLOCK;
-                    if at + bytes > data.len() {
-                        return Err("kfs: an extent runs past the end of its file (damaged)");
+                    let (at, bytes) = (offset as usize, bp.count as usize * BLOCK);
+                    if bp.count == 0 || bp.count as u64 > EXTENT_BLOCKS || at + bytes > data.len() {
+                        return Err("kfs: damaged extent");
                     }
-                    read_extent(self.disk, bp, &mut data[at..at + bytes])?;
+                    match groups.last_mut() {
+                        Some((g_at, g_bytes, bps))
+                            if *g_at + *g_bytes == at
+                                && *g_bytes + bytes <= READ_GROUP
+                                && bps.last().is_some_and(|l| l.block + l.count as u64 == bp.block) =>
+                        {
+                            *g_bytes += bytes;
+                            bps.push(bp);
+                        }
+                        _ => groups.push((at, bytes, alloc::vec![bp])),
+                    }
                 }
             }
+        }
+        let mut items: Vec<(u64, &mut [u8])> = Vec::with_capacity(groups.len());
+        let (mut rest, mut pos) = (&mut data[..], 0);
+        for (at, bytes, bps) in &groups {
+            if *at < pos {
+                return Err("kfs: overlapping extents (damaged)");
+            }
+            let (mine, tail) = core::mem::take(&mut rest)[*at - pos..].split_at_mut(*bytes);
+            items.push((bps[0].block * SECTORS_PER_BLOCK, mine));
+            rest = tail;
+            pos = at + bytes;
+        }
+        let mut damaged = false;
+        block::read_many(self.disk, &mut items, &mut |i, buf| {
+            let mut k = 0;
+            for bp in &groups[i].2 {
+                let n = bp.count as usize * BLOCK;
+                damaged |= xxh64(&buf[k..k + n]) != bp.checksum;
+                k += n;
+            }
+        })?;
+        if damaged {
+            return Err("kfs: checksum mismatch in file data (the disk is damaged)");
         }
         data.truncate(size as usize);
         Ok(data)
@@ -1524,14 +1629,32 @@ impl Fs {
         let want = out.len().min((file.size - offset) as usize);
         let end = offset + want as u64;
         out[..want].fill(0);
-        let mut buf: Vec<u8> = Vec::new();
-        for p in self.pieces(file.obj, offset, end)? {
-            let (start, bytes): (u64, &[u8]) = match &p {
+        // Extents come from the data cache. If any this read needs isn't
+        // there, it's fetched along with what follows it, up to READ_AHEAD,
+        // so reading a file a little at a time costs one disk read per
+        // READ_AHEAD rather than one per call.
+        let ahead = self.pieces(file.obj, offset, end.max(offset + READ_AHEAD).min(file.size))?;
+        let needed = |p: &Piece| match p {
+            Piece::Extent { offset: at, length, .. } => *at < end && at + length > offset,
+            Piece::Inline(_) => true,
+        };
+        let missing = ahead.iter().any(|p| needed(p) && matches!(p, Piece::Extent { bp, .. } if !self.data.contains(*bp)));
+        if missing {
+            let fetch: Vec<Bp> = ahead
+                .iter()
+                .filter_map(|p| match p {
+                    Piece::Extent { bp, .. } if !self.data.contains(*bp) => Some(*bp),
+                    _ => None,
+                })
+                .collect();
+            self.fetch(&fetch)?;
+        }
+        for p in ahead.iter().filter(|p| needed(p)) {
+            let (start, bytes): (u64, &[u8]) = match p {
                 Piece::Inline(d) => (0, &d[..]),
                 Piece::Extent { offset: at, length, bp } => {
-                    buf.resize(bp.count as usize * BLOCK, 0);
-                    read_extent(self.disk, *bp, &mut buf)?;
-                    (*at, &buf[..(*length as usize).min(buf.len())])
+                    let data = self.data.get(*bp).ok_or("kfs: file data fell out of the cache")?;
+                    (*at, &data[..(*length as usize).min(data.len())])
                 }
             };
             // The overlap of this piece with offset..end.
@@ -1543,24 +1666,56 @@ impl Fs {
         }
         Ok(want)
     }
+
+    /// Reads extents `bps` (in file order), checks each against its
+    /// checksum, and puts them in the data cache. Extents next to each other
+    /// on disk are read together, several reads at once.
+    fn fetch(&mut self, bps: &[Bp]) -> Result<(), &'static str> {
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new(); // first, last + 1, bytes
+        for (i, bp) in bps.iter().enumerate() {
+            if bp.count == 0 || bp.count as u64 > EXTENT_BLOCKS {
+                return Err("kfs: damaged extent");
+            }
+            let bytes = bp.count as usize * BLOCK;
+            match groups.last_mut() {
+                Some((first, last, g)) if *g + bytes <= READ_GROUP && bps[*last - 1].block + bps[*last - 1].count as u64 == bp.block => {
+                    let _ = first;
+                    *last += 1;
+                    *g += bytes;
+                }
+                _ => groups.push((i, i + 1, bytes)),
+            }
+        }
+        let mut bufs: Vec<Vec<u8>> = groups.iter().map(|g| vec![0u8; g.2]).collect();
+        let mut items: Vec<(u64, &mut [u8])> = bufs.iter_mut().zip(&groups).map(|(b, g)| (bps[g.0].block * SECTORS_PER_BLOCK, &mut b[..])).collect();
+        let mut damaged = false;
+        block::read_many(self.disk, &mut items, &mut |i, buf| {
+            let mut k = 0;
+            for bp in &bps[groups[i].0..groups[i].1] {
+                let n = bp.count as usize * BLOCK;
+                damaged |= xxh64(&buf[k..k + n]) != bp.checksum;
+                k += n;
+            }
+        })?;
+        if damaged {
+            return Err("kfs: checksum mismatch in file data (the disk is damaged)");
+        }
+        for (buf, g) in bufs.iter().zip(&groups) {
+            let mut k = 0;
+            for bp in &bps[g.0..g.1] {
+                let n = bp.count as usize * BLOCK;
+                self.data.put(*bp, Vec::from(&buf[k..k + n]));
+                k += n;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One piece of a file: inline data, or an extent of whole blocks.
 enum Piece {
     Inline(Vec<u8>),
     Extent { offset: u64, length: u64, bp: Bp },
-}
-
-/// Reads extent `bp` into `buf` (exactly `bp.count` blocks) and checks it.
-fn read_extent(disk: usize, bp: Bp, buf: &mut [u8]) -> Result<(), &'static str> {
-    if bp.count == 0 || bp.count as u64 * BLOCK as u64 > EXTENT_MAX {
-        return Err("kfs: damaged extent");
-    }
-    read_blocks(disk, bp.block, buf)?;
-    if xxh64(buf) != bp.checksum {
-        return Err("kfs: checksum mismatch in file data (the disk is damaged)");
-    }
-    Ok(())
 }
 
 // --- The interface `vfs.rs` uses. Paths are absolute within the volume. ---
@@ -1645,4 +1800,13 @@ pub fn remove(path: &str) -> Result<(), &'static str> {
 /// Renames or moves a file or folder within the volume.
 pub fn rename(from: &str, to: &str) -> Result<(), &'static str> {
     change(|fs| fs.rename(from, to))
+}
+
+/// Empties the tree-node and file-data caches, so `diskbench` can time
+/// first-time reads.
+pub fn drop_caches() {
+    if let Some(fs) = FS.lock().as_mut() {
+        fs.cache.slots.clear();
+        fs.data = DataCache { slots: Vec::new(), bytes: 0, clock: 0 };
+    }
 }

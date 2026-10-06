@@ -5,10 +5,14 @@
 //! Because we compile against the `x86_64-unknown-linux-gnu` target (see
 //! `.cargo/config.toml`), `compiler_builtins` assumes libc will supply
 //! `mem*`, since on a normal Linux binary it always would. We have no libc,
-//! so we define them ourselves. `memcpy`/`memset` (and `memmove`'s forward
-//! case) use the CPU's own `rep movsb`/`rep stosb` string instructions,
-//! which are both simple and fast -- the desktop compositor moves whole
-//! frames through them. Everything else is a plain byte loop.
+//! so we define them ourselves. `memcpy` (and `memmove`'s forward case)
+//! copies 64 bytes at a time through SSE2 registers, and `memset` fills 8
+//! bytes at a time with `rep stosq`; the last few bytes go one at a time.
+//! (They used `rep movsb`/`rep stosb` at first, which is fast on hardware
+//! with "enhanced rep movsb" but crawls under QEMU without acceleration,
+//! which emulates it byte by byte: 36 MB/s for `memcpy` against 1.1 GB/s
+//! for the SSE2 loop. Every file read and every frame the desktop draws
+//! goes through these.) Everything else is a plain byte loop.
 //!
 //! `strlen` joined this list once `cfile.rs` started using
 //! `core::ffi::CStr::from_ptr` (part of the DOOM-porting groundwork's libc
@@ -25,15 +29,43 @@ pub extern "C" fn rust_eh_personality() {}
 /// (use `memmove` if they might).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    // The ABI guarantees the direction flag is clear on entry, so this
-    // copies forwards -- which also makes it a correct `memmove` whenever
-    // `dest < src`.
+    // Forwards only, 64 bytes per round (unaligned loads and stores are
+    // fine), which also makes it a correct `memmove` whenever `dest < src`.
+    // The ABI guarantees the direction flag is clear for the `rep movsb`
+    // tail.
+    let bulk = n & !63;
     unsafe {
+        let (mut d, mut s) = (dest, src);
+        if bulk != 0 {
+            core::arch::asm!(
+                "2:",
+                "movdqu xmm0, [rsi]",
+                "movdqu xmm1, [rsi + 16]",
+                "movdqu xmm2, [rsi + 32]",
+                "movdqu xmm3, [rsi + 48]",
+                "movdqu [rdi], xmm0",
+                "movdqu [rdi + 16], xmm1",
+                "movdqu [rdi + 32], xmm2",
+                "movdqu [rdi + 48], xmm3",
+                "add rsi, 64",
+                "add rdi, 64",
+                "sub rcx, 64",
+                "jnz 2b",
+                inout("rcx") bulk => _,
+                inout("rdi") d,
+                inout("rsi") s,
+                out("xmm0") _,
+                out("xmm1") _,
+                out("xmm2") _,
+                out("xmm3") _,
+                options(nostack)
+            );
+        }
         core::arch::asm!(
             "rep movsb",
-            inout("rcx") n => _,
-            inout("rdi") dest => _,
-            inout("rsi") src => _,
+            inout("rcx") n - bulk => _,
+            inout("rdi") d => _,
+            inout("rsi") s => _,
             options(nostack, preserves_flags)
         );
     }
@@ -44,12 +76,17 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
 /// `dest` must be valid for `n` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    // Eight bytes at a time, then the rest one at a time.
+    let pattern = (c as u8 as u64) * 0x0101_0101_0101_0101;
     unsafe {
         core::arch::asm!(
+            "rep stosq",
+            "mov rcx, {tail}",
             "rep stosb",
-            inout("rcx") n => _,
+            tail = in(reg) n & 7,
+            inout("rcx") n / 8 => _,
             inout("rdi") dest => _,
-            in("al") c as u8,
+            in("rax") pattern,
             options(nostack, preserves_flags)
         );
     }
