@@ -2,7 +2,7 @@
 
 KFS is the filesystem that will replace FAT16 as KonjacOS's main disk
 format. This document fixes its on-disk layout and the rules for changing
-it, before any code is written. Status: **proposal, not implemented**.
+it, before any code is written. Status: **agreed, not implemented yet**.
 
 ## Goals
 
@@ -161,7 +161,8 @@ of UTF-8), so a hash collision is resolved by comparing names; colliding
 entries take the next free `offset`. Looking a name up costs one tree
 search.
 
-**Names are case-sensitive and case-preserving**, like Linux. FAT16 is
+**Names are case-sensitive and case-preserving**, like Linux (decided):
+`Notes.txt` and `notes.txt` are different files. FAT16 is
 case-insensitive; the Java and glibc programs that run here expect Linux
 behaviour. The desktop can still offer case-insensitive matching on top
 (Start's search already does).
@@ -190,8 +191,10 @@ extents.
 
 v1 keeps free space as a **bitmap**: one bit per block, 32 KiB of bitmap
 per GiB of disk (1 MiB for a 32 GiB disk). The bitmap is stored in
-4 KiB blocks found through an index (`bitmap_root`) and is copy-on-write
-like everything else.
+4 KiB blocks, each covering 128 MiB of disk, found through an index
+(`bitmap_root`). The index is a small tree of pointer blocks: one index
+block holds 128 pointers (16 GiB of disk), and another level is added
+when the disk outgrows it. Like everything else, it's copy-on-write.
 
 - At mount, the bitmap blocks are read as needed rather than all at once.
   The allocator keeps a small in-memory summary (free blocks per 16 MiB
@@ -210,6 +213,26 @@ like everything else.
 A range tree that uses less space on huge, fragmented disks can replace
 the bitmap later (feature bit), but at hobby-OS disk sizes the bitmap is
 small and simple.
+
+## Growing a volume
+
+`make` builds a **512 MiB** volume. Nothing in the format depends on that
+size, so a volume can grow up to the 64-bit limit later:
+
+- Block pointers are 64-bit, and the tree doesn't depend on the disk
+  size at all.
+- Growing means one ordinary commit: write bitmap blocks for the new space
+  (all free), adding an index level if needed; then the superblock with
+  the larger `total_blocks`. A crash during it leaves the old size, just
+  like any other commit.
+- **On the host:** `tools/kfs.py grow disk.img 4G` enlarges the image
+  file, then makes that commit.
+- **In KonjacOS:** at mount, if the disk is larger than `total_blocks`
+  (the image was enlarged, or QEMU was given a bigger disk), KFS asks
+  before growing into the new space. Later it can grow automatically.
+
+Shrinking isn't supported: it would mean moving live data out of the
+space being removed, which is defragmentation (milestone 8).
 
 ## Commits
 
@@ -258,8 +281,9 @@ Today every part of the kernel calls `fat16::` directly. KFS adds a small
 `create_dir`, `rename`, `remove`, `copy`), which dispatches by mount point:
 
 - `/` is KFS once a KFS disk is present.
-- The FAT16 disk stays available at `/fat` for moving files to and from
-  the host. With no KFS disk, FAT16 is `/` as it is today.
+- The FAT16 disk stays available at `/fat` while KFS proves itself (see
+  [Removing FAT16](#removing-fat16)). With no KFS disk, FAT16 is `/` as
+  it is today.
 
 The desktop, the shell, the Linux syscall layer, the loader and DOOM
 switch from `fat16::` to `vfs::`, which is a mechanical change.
@@ -300,13 +324,32 @@ Each one ends in something that boots and passes its tests.
 2. **Writing.** Commits, the allocator, deferred frees, inline data and
    extents. Files and Notepad work on KFS.
 3. **Crash-tested, then default.** Crash and bit-rot testing pass, `make`
-   builds a KFS disk, FAT16 moves to `/fat`. Released as a new version.
-4. **Snapshots** (format already ready: `snap_root`, `birth_txg`).
-5. **Reflinks and sparse writes** (instant copies in Files).
-6. **LZ4 compression** (the `compression` byte in block pointers).
-7. **Scrubbing and defragmentation.**
-8. **Direct I/O and a page cache**, once there are DMA drivers worth
+   builds a 512 MiB KFS disk, FAT16 moves to `/fat`. Released as a new
+   version.
+4. **Remove FAT16**, once the checklist under
+   [Removing FAT16](#removing-fat16) is met.
+5. **Snapshots** (format already ready: `snap_root`, `birth_txg`).
+6. **Reflinks and sparse writes** (instant copies in Files).
+7. **LZ4 compression** (the `compression` byte in block pointers).
+8. **Scrubbing, defragmentation and shrinking.**
+9. **Direct I/O and a page cache**, once there are DMA drivers worth
    bypassing a cache for.
+
+### Removing FAT16
+
+FAT16 goes once KFS has shown it's better *and* works. The checklist:
+
+- **Safe:** the crash and bit-rot tests pass, hundreds of runs each, with
+  no failures.
+- **At least as fast:** every `diskbench` line on KFS is as fast as FAT16
+  or faster.
+- **Everything works:** booting, the shell, Files, Notepad, DOOM, Java
+  and the Linux programs, on KFS alone, for a full release.
+- **Files can still get in and out:** `mkkfs.py` and `kfs.py` cover
+  everything `mtools` did (adding files to an image, reading them back).
+
+Then `fat16.rs`, the `/fat` mount and the `mtools` build steps are
+deleted.
 
 ### Snapshots (v2)
 
@@ -342,21 +385,20 @@ already guarantees that changing one copy never changes the other.
 | Checksums in parent pointers (Merkle tree) | v1: xxHash64 in every block pointer |
 | Bounded LRU cache / "on-demand node paging" | v1: one 1 MiB node cache |
 | Sequential write buffer | v1: transaction groups (5 s / 4 MiB) |
-| Instant snapshots | Milestone 4; format ready in v1 |
-| Block cloning (reflinks) | Milestone 5 |
-| Sparse files | Format in v1, write path in milestone 5 |
-| Inline compression | Milestone 6; LZ4 first (fast, simple), Zstd maybe later |
-| Background scrubbing | Milestone 7 |
-| CoW aging / defragmentation | Milestone 7; reduced up front by allocating whole runs |
-| Direct I/O for the JVM | Milestone 8: needs a page cache to bypass first |
+| Instant snapshots | Milestone 5; format ready in v1 |
+| Block cloning (reflinks) | Milestone 6 |
+| Sparse files | Format in v1, write path in milestone 6 |
+| Inline compression | Milestone 7; LZ4 first (fast, simple), Zstd maybe later |
+| Background scrubbing | Milestone 8 |
+| CoW aging / defragmentation | Milestone 8; reduced up front by allocating whole runs |
+| Direct I/O for the JVM | Milestone 9: needs a page cache to bypass first |
 | "A few KB of RAM at any size" | Replaced by a fixed, configurable cache (1 MiB); a few KB would make every lookup a disk read |
 | BLAKE3 | xxHash64 instead: detecting bit rot doesn't need a cryptographic hash, and BLAKE3 costs far more CPU under QEMU |
 
-## Open questions
+## Decisions
 
-1. **Case sensitivity.** This document picks case-sensitive (Linux
-   behaviour). The other option is FAT-like case-insensitive lookups.
-2. **Default disk size** for `make`: FAT16's limit is 2 GiB; KFS could
-   default to 512 MiB and grow later.
-3. **Keep FAT16 at `/fat`** after the switch, or drop it once `mkkfs.py`
-   and `kfs.py` cover moving files to and from the host.
+1. **Case-sensitive names**, like Linux.
+2. **512 MiB** default volume, growable later
+   ([Growing a volume](#growing-a-volume)).
+3. **FAT16 is removed** once KFS meets the
+   [checklist](#removing-fat16); until then it stays at `/fat`.
