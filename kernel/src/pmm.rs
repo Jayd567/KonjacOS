@@ -157,6 +157,32 @@ pub fn alloc_frame() -> Option<u64> {
     None
 }
 
+/// Allocates `count` physically contiguous frames below 4 GiB (what a
+/// device doing DMA through 32-bit registers can reach), returning the
+/// first one's physical address.
+pub fn alloc_contiguous(count: u64) -> Option<u64> {
+    let mut pmm = PMM.lock();
+    let bitmap = pmm.bitmap.as_mut()?;
+    let limit = bitmap.frame_count.min((4u64 << 30) / FRAME_SIZE);
+    let mut run = 0;
+    for frame in 1..limit {
+        if bitmap.get(frame) {
+            run = 0;
+            continue;
+        }
+        run += 1;
+        if run == count {
+            let first = frame + 1 - count;
+            for f in first..=frame {
+                bitmap.set(f, true);
+            }
+            bitmap.free_count -= count;
+            return Some(first * FRAME_SIZE);
+        }
+    }
+    None
+}
+
 /// Frees a frame previously returned by [`alloc_frame`].
 ///
 /// # Safety

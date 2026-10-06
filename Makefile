@@ -93,7 +93,9 @@ disk:
 	fi
 
 comma := ,
-DISK_DRIVE = $(if $(wildcard $(DISK_IMAGE)),-drive file=$(DISK_IMAGE)$(comma)format=raw$(comma)if=ide$(comma)index=0$(comma)media=disk)
+# virtio: the fast DMA disk driver (`virtio_blk.rs`). `if=ide` works too,
+# through the slower ATA driver.
+DISK_DRIVE = $(if $(wildcard $(DISK_IMAGE)),-drive file=$(DISK_IMAGE)$(comma)format=raw$(comma)if=virtio)
 
 .PHONY: run
 run: iso disk

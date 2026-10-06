@@ -4,6 +4,23 @@ Each version here is published on the
 [Releases](https://github.com/Jayd567/KonjacOS/releases) page with
 ready-to-boot images.
 
+## Unreleased
+
+### New
+
+- A virtio-blk disk driver: the disk moves data into memory itself (DMA),
+  64 KiB per request, instead of the CPU copying every sector through an
+  I/O port. `make run` attaches the disk this way; the ATA driver is
+  still used when the disk is attached as IDE.
+- `diskbench` in the Terminal times reading, writing and deleting files.
+
+### Changed
+
+- The FAT16 driver keeps the FAT in memory, reads and writes whole runs
+  of clusters per request, and writes changed FAT sectors once per
+  operation instead of once per cluster. With virtio, writing 1 MiB went
+  from 11.2 s to 40 ms and reading DOOM1.WAD from 1.3 s to about 10 ms.
+
 ## v0.2.0
 
 ### New

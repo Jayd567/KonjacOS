@@ -15,6 +15,7 @@
 
 mod apex;
 mod ata;
+mod block;
 mod boot;
 mod cfile;
 mod commands;
@@ -36,6 +37,7 @@ mod loader;
 mod memory;
 mod mouse;
 mod paging;
+mod pci;
 mod pic;
 mod pmm;
 mod port;
@@ -49,6 +51,7 @@ mod task;
 mod timer;
 mod ui;
 mod usermode;
+mod virtio_blk;
 mod vm;
 
 use core::panic::PanicInfo;
@@ -159,6 +162,9 @@ pub extern "C" fn kstart() -> ! {
         timer::init();
     }
     sprintln!("PIT timer installed at {}Hz.", timer::HZ);
+
+    block::init();
+    sprintln!("Data disk: {}.", block::backend_name());
 
     match unsafe { fat16::init() } {
         Ok(()) => sprintln!("FAT16 filesystem mounted from the primary ATA disk."),
