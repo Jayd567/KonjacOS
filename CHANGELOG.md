@@ -4,7 +4,7 @@ Each version here is published on the
 [Releases](https://github.com/Jayd567/KonjacOS/releases) page with
 ready-to-boot images.
 
-## Unreleased
+## v0.2.0
 
 ### New
 

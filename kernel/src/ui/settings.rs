@@ -563,7 +563,7 @@ impl SettingsApp {
                 let _ = write!(up, "{}h {:02}m {:02}s", sn.uptime_secs / 3600, sn.uptime_secs / 60 % 60, sn.uptime_secs % 60);
                 let _ = write!(cpu, "{}%", sn.cpu);
                 heading(p, 66, "ABOUT THIS COMPUTER");
-                Self::paint_card(p, 90, w, &[("Operating system", "KonjacOS 0.1.0"), ("Kernel", "x86_64, written in Rust"), ("Boots with", "Limine (BIOS + UEFI)")]);
+                Self::paint_card(p, 90, w, &[("Operating system", concat!("KonjacOS ", env!("CARGO_PKG_VERSION"))), ("Kernel", "x86_64, written in Rust"), ("Boots with", "Limine (BIOS + UEFI)")]);
                 heading(p, 228, "RESOURCES");
                 Self::paint_card(p, 252, w, &[("Memory", &mem), ("CPU usage", &cpu), ("Uptime", &up)]);
             }
