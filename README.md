@@ -34,8 +34,8 @@ disk image, then boot both in [QEMU](https://www.qemu.org/):
 
 ```sh
 qemu-system-x86_64 -m 256M -boot order=d \
-  -cdrom konjacos-v0.1.0.iso \
-  -drive file=konjacos-v0.1.0-disk.img,format=raw,if=ide
+  -cdrom konjacos-v0.2.0.iso \
+  -drive file=konjacos-v0.2.0-disk.img,format=raw,if=ide
 ```
 
 The ISO boots on its own, but without the disk image there are no files

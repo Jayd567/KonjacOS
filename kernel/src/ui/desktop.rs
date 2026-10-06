@@ -3140,7 +3140,7 @@ fn paint_start(p: &mut Painter, start: &StartMenu, now: u64) {
     let (iw, ih, m) = assets::icon(icon::PERSON_20_FILLED);
     p.draw_mask(avatar.x + (avatar.w - iw) / 2, avatar.y + (avatar.h - ih) / 2, iw, ih, m, rgb(18, 40, 38), 255);
     p.text_shadowed(&font::UI_BOLD, avatar.right() + 10, ur.y + 4, "konjac", TEXT, 255);
-    p.text(&font::SMALL, avatar.right() + 10, ur.y + 22, "KonjacOS 0.1.0", TEXT_DIM, 255);
+    p.text(&font::SMALL, avatar.right() + 10, ur.y + 22, concat!("KonjacOS ", env!("CARGO_PKG_VERSION")), TEXT_DIM, 255);
 
     let pr = Desktop::power_rect();
     if hover == Some(START_POWER) {

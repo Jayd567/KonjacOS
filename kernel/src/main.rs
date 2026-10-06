@@ -56,7 +56,8 @@ use core::panic::PanicInfo;
 use framebuffer::Canvas;
 
 const OS_NAME: &str = "KonjacOS";
-const OS_VERSION: &str = "0.1.0";
+/// From `Cargo.toml`, like the version the desktop shows.
+const OS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kstart() -> ! {

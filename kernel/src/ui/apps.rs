@@ -1628,7 +1628,7 @@ impl App for About {
         p.draw_mask((w - lw) / 2, 12, lw, lh, m, TEXT, 255);
         let title = "KonjacOS";
         p.text_shadowed(&font::DISPLAY, (w - font::DISPLAY.width(title)) / 2, 90, title, TEXT, 255);
-        let ver = "Version 0.1.0";
+        let ver = concat!("Version ", env!("CARGO_PKG_VERSION"));
         p.text(&font::UI, (w - font::UI.width(ver)) / 2, 130, ver, TEXT_DIM, 255);
 
         let s = sysmon::latest();
