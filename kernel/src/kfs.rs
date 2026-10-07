@@ -1724,6 +1724,9 @@ pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Nanoseconds since 1970.
+    pub modified: u64,
+    pub created: u64,
 }
 
 pub fn list_dir(path: &str) -> Result<Vec<Entry>, &'static str> {
@@ -1734,8 +1737,9 @@ pub fn list_dir(path: &str) -> Result<Vec<Entry>, &'static str> {
         }
         let mut out = Vec::new();
         for (name, obj, is_dir, _) in fs.entries(dir)? {
-            let size = if is_dir { 0 } else { fs.inode(obj)?.size };
-            out.push(Entry { name, is_dir, size });
+            let ino = fs.inode(obj)?;
+            let size = if is_dir { 0 } else { ino.size };
+            out.push(Entry { name, is_dir, size, modified: ino.modified, created: ino.created });
         }
         Ok(out)
     })

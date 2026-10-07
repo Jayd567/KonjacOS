@@ -6,6 +6,43 @@ ready-to-boot images.
 
 ## Unreleased
 
+### New
+
+- ks, KonjacShell ([design](docs/ks-design.md)), is the Terminal's shell
+  now. Its commands pass values to each other instead of text:
+  - `ls` gives a table of name, type, size and modified date, so
+    `ls | filter size > 1MB | sort-by modified` works on real sizes and
+    dates, and the result shows as an aligned table.
+  - Values have types: numbers, text, sizes (`50MB` is 1000-based,
+    `50MiB` 1024-based), durations, dates, lists, records, tables and
+    closures. Arithmetic keeps units (`1MB + 500KB` is `1.5 MB`), and
+    mixing them up is an error with a hint: `size > 5` says "5 has no
+    unit; did you mean 5MB?".
+  - A failing step stops the pipeline. The error names the step and the
+    item, and points at the place in the line. Unknown commands and flags
+    are caught before anything runs, with a suggestion ("did you mean
+    `ls`?").
+  - `delete` looks everything up before deleting anything, and asks
+    first when files are piped in: "delete 3 files (209 B)?". `--dry-run`
+    shows what it would delete, and `move` and `copy` refuse to start if
+    anything is missing or in the way.
+  - `let`, `mut`, `def` (with typed parameters and flags), `if`, `for`,
+    `while`, closures (`{|f| $f.size > 1MB}`), string interpolation
+    (`"hi $name, (1 + 2)"`) and `.ks` scripts (`source`).
+  - About 50 new commands: `filter`, `sort-by`, `select`, `get`, `each`,
+    `group-by`, `open` (`.json` files become values), `save`, `str ...`,
+    `math ...`, `from json`/`to json`, `disks`, `mem`, `stat`, and more.
+    `help` is a table of them all; `help <command>` explains one.
+  - The original commands (`run`, `doom`, `diskbench`, `write`, ...)
+    still work as before.
+  - Ctrl+C stops a running command, or cancels the line being typed.
+- The language is its own crate (`ks/`), and `cargo test` there runs 15
+  tests on the host in about a second, including one that feeds it
+  thousands of random lines to check it never crashes the kernel.
+- The shell's stack is 1 MiB (it was Limine's default 64 KiB), since ks
+  evaluates nested expressions and calls recursively.
+- `tools/qemu_shot.sh` can type symbols (`| > " * { }` and more).
+
 ### Changed
 
 - KonjacFS is now faster than FAT16 at nearly everything (`diskbench`,

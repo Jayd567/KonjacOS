@@ -1,9 +1,10 @@
-//! A tiny line-based shell: reads characters the keyboard driver has
-//! queued, echoes them to the on-screen console, and dispatches whatever
-//! was typed through the command table in `commands.rs` on Enter.
+//! The prompt: reads characters the keyboard driver has queued, echoes
+//! them to the on-screen console, and runs each line through ks
+//! (KonjacShell, the `ks` crate) on Enter. The kernel side of ks lives in
+//! `ks_host.rs`.
 
-use crate::commands;
 use crate::console;
+use crate::ks_host::KernelHost;
 use crate::timer;
 use crate::{print, println};
 
@@ -49,28 +50,22 @@ impl LineBuffer {
     }
 }
 
-/// Splits a typed line into a command word and the rest of the line, looks
-/// the word up in the command table, and runs it. All the actual command
-/// behaviour lives in `commands.rs` -- this is just dispatch.
-fn run_command(line: &str) {
-    let line = line.trim();
-    if line.is_empty() {
+/// Runs a typed line through ks and shows the result, or the error with
+/// the line underlined where it went wrong.
+fn run_line(engine: &mut ks::Engine, line: &str) {
+    if line.trim().is_empty() {
         return;
     }
-    let (command, rest) = match line.split_once(' ') {
-        Some((c, r)) => (c, r.trim_start()),
-        None => (line, ""),
-    };
-
-    match commands::find(command) {
-        Some(cmd) => {
-            if cmd.requires_apex && !crate::apex::authenticate(cmd.name) {
-                println!("{command}: apex authentication failed, aborting.");
-                return;
-            }
-            (cmd.handler)(rest);
+    // A Ctrl+C pressed at the prompt isn't meant for this line.
+    crate::keyboard::take_interrupt();
+    let mut host = KernelHost;
+    match engine.run(line, &mut host) {
+        Ok(ks::Value::Nothing) => {}
+        Ok(v) => {
+            let width = ks::Host::width(&mut host);
+            println!("{}", ks::display::render(&v, width));
         }
-        None => println!("unknown command: {command} (try `help`)"),
+        Err(e) => println!("{}", engine.render_error(&e)),
     }
 }
 
@@ -79,9 +74,10 @@ fn run_command(line: &str) {
 /// someone to type.
 pub fn run() -> ! {
     println!();
-    println!("KonjacOS shell. Type `help` for a list of commands.");
+    println!("KonjacOS shell (ks). Type `help` for a list of commands.");
     print!("{PROMPT}");
 
+    let mut engine = crate::ks_host::engine();
     let mut line = LineBuffer::new();
     let mut last_blink = timer::ticks();
 
@@ -95,6 +91,13 @@ pub fn run() -> ! {
             last_blink = now;
         }
 
+        if crate::keyboard::take_interrupt() {
+            // Ctrl+C at the prompt: drop the line.
+            println!("^C");
+            line.clear();
+            print!("{PROMPT}");
+        }
+
         match crate::keyboard::read_char() {
             Some(0x08) => {
                 // Backspace: only erase if there's something on this line
@@ -105,7 +108,7 @@ pub fn run() -> ! {
             }
             Some(b'\n') => {
                 println!();
-                run_command(line.as_str());
+                run_line(&mut engine, line.as_str());
                 line.clear();
                 print!("{PROMPT}");
             }

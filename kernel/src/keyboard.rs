@@ -527,6 +527,14 @@ pub unsafe fn init() {
     }
 }
 
+/// Set by Ctrl+C, cleared by [`take_interrupt`].
+static INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+/// Whether Ctrl+C was pressed since the last call.
+pub fn take_interrupt() -> bool {
+    INTERRUPT.swap(false, Ordering::Relaxed)
+}
+
 /// Called by `isr_stub_33` for every keyboard interrupt. Reads the
 /// scancode, updates shift state or pushes a translated character, and
 /// sends the PIC an EOI so it'll deliver the next one.
@@ -556,7 +564,11 @@ extern "C" fn irq1_handler() {
             let shift = SHIFT_HELD.load(Ordering::Relaxed);
             let table = if shift { &SCANCODE_ASCII_SHIFT } else { &SCANCODE_ASCII };
             let ch = table[code as usize];
-            if ch != 0 {
+            if ch == b'c' && CTRL_HELD.load(Ordering::Relaxed) {
+                // Ctrl+C: stops whatever the shell is running, or cancels
+                // the line at the prompt (both poll `take_interrupt`).
+                INTERRUPT.store(true, Ordering::Relaxed);
+            } else if ch != 0 {
                 ring_push(ch);
             }
         }

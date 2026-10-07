@@ -94,6 +94,42 @@ pub fn bootloader_info() -> Option<BootloaderInfo> {
 }
 
 // ---------------------------------------------------------------------
+// Stack size
+// ---------------------------------------------------------------------
+
+#[repr(C)]
+struct StackSizeRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: AtomicU64,
+    stack_size: u64,
+}
+
+unsafe impl Sync for StackSizeRequest {}
+
+/// The boot stack is the shell's stack for good (it's task 0), and ks
+/// evaluates nested expressions and function calls recursively, so ask
+/// for 1 MiB instead of Limine's default 64 KiB.
+#[used]
+#[unsafe(link_section = ".requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest {
+    id: [
+        COMMON_MAGIC[0],
+        COMMON_MAGIC[1],
+        0x224ef0460a8e8926,
+        0xe1cb0fc25f46ea3d,
+    ],
+    revision: 0,
+    response: AtomicU64::new(0),
+    stack_size: 1024 * 1024,
+};
+
+/// Whether Limine gave us the stack size we asked for.
+pub fn stack_size_granted() -> bool {
+    STACK_SIZE_REQUEST.response.load(Ordering::Acquire) != 0
+}
+
+// ---------------------------------------------------------------------
 // Higher-half direct map (HHDM)
 // ---------------------------------------------------------------------
 

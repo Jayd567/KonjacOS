@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "konjac-os"
 version = "0.3.0"
+dependencies = [
+ "ks",
+]
+
+[[package]]
+name = "ks"
+version = "0.1.0"

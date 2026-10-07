@@ -28,3 +28,8 @@ opt-level = 2
 lto = true
 codegen-units = 1
 strip = false
+
+[dependencies]
+# The shell's language (lexer, parser, values, evaluator): its own crate so
+# its tests run on the host. See docs/ks-design.md.
+ks = { path = "../ks" }

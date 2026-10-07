@@ -89,6 +89,11 @@ impl Console {
         self.revision
     }
 
+    /// How many characters fit on a line.
+    pub fn cols(&self) -> u64 {
+        self.cols
+    }
+
     /// `(cols, rows, characters, cursor col, cursor row, cursor visible)`
     /// in grid mode.
     pub fn grid(&self) -> Option<(u64, u64, &[u8], u64, u64, bool)> {

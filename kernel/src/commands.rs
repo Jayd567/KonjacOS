@@ -74,13 +74,6 @@ pub static COMMANDS: &[Command] = &[
     },
 ];
 
-/// Looks up `name` in [`COMMANDS`]. `shell.rs` owns what happens on a hit
-/// vs. a miss (including, eventually, the apex prompt) -- this is just
-/// the table lookup.
-pub fn find(name: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|c| c.name == name)
-}
-
 fn cmd_help(_rest: &str) {
     println!("commands:");
     for cmd in COMMANDS {
@@ -322,7 +315,7 @@ fn cmd_diskbench(_rest: &str) {
         run("256 random 4 KiB reads", 256 * 4096, cold, &mut || random(&mut chunk));
         run("  again", 256 * 4096, &mut || {}, &mut || random(&mut chunk));
         let bench = path("BENCH.TMP");
-        run("write 1 MiB", data.len(), &mut || drop(vfs::remove_file(&bench)), &mut || vfs::write_file(&bench, &data));
+        run("write 1 MiB", data.len(), &mut || { let _ = vfs::remove_file(&bench); }, &mut || vfs::write_file(&bench, &data));
         run("read it back", data.len(), cold, &mut || match vfs::read_file(&bench)? {
             d if d == data => Ok(()),
             _ => Err("** read-back mismatch: the disk returned different data **"),
@@ -334,7 +327,7 @@ fn cmd_diskbench(_rest: &str) {
             }
             Ok(())
         });
-        run("delete it", 0, &mut || drop(vfs::write_file(&bench, &data)), &mut || vfs::remove_file(&bench));
+        run("delete it", 0, &mut || { let _ = vfs::write_file(&bench, &data); }, &mut || vfs::remove_file(&bench));
     }
 }
 

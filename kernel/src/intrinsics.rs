@@ -150,3 +150,15 @@ pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     }
     n
 }
+
+/// Unwinding never happens in this kernel (`panic = "abort"`), but the
+/// precompiled `alloc` that stable Rust ships was built for unwinding, so
+/// some of its functions (`format!`, `String::from_utf8_lossy`, ...) carry
+/// cleanup paths that call this. Those paths only run while unwinding a
+/// panic, which an abort never does, so this is never called; it exists so
+/// the kernel links. (Before it existed, those functions had to be
+/// avoided; see the README's toolchain notes.)
+#[unsafe(no_mangle)]
+pub extern "C" fn _Unwind_Resume() -> ! {
+    panic!("_Unwind_Resume called: something tried to unwind");
+}

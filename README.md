@@ -75,34 +75,57 @@ grabbed the keyboard, or the host OS may take Alt+Tab and Super itself.
 Things to try in the Terminal:
 
 ```
-ls                 list files on the disk
-ls /fat            list the FAT16 disk, if one is attached
-cat README.TXT     print a file
-run hello.exe      run a Windows-format program
-doom               play DOOM (opens in its own window)
-ps                 list running tasks
+ls                                     list files on the disk, as a table
+ls | filter size > 1MB | sort-by size  only the big ones, smallest first
+ls /fat                                the FAT16 disk, if one is attached
+open README.TXT | lines | length       how many lines a file has
+disks                                  the disks and their free space
+ps | select id name state              running tasks
+run hello.exe                          run a Windows-format program
+doom                                   play DOOM (opens in its own window)
 ```
 
-## Shell commands
+## The shell
 
-| Command | Description |
+The Terminal runs ks, KonjacShell ([design](docs/ks-design.md)).
+Commands pass **values** to each other, not text: `ls` gives a table
+whose `size` column holds sizes and whose `modified` column holds dates,
+so the next command can filter and sort on them directly.
+
+```
+ls | filter size > 50MB and name =~ "*.wad" | sort-by modified -r
+ls *.txt | delete                  # asks first: "delete 3 files (209 B)?"
+let big = (ls | filter size > 1MB)
+def kb [file: string] { (stat $file).size / 1KB }
+"hello" | save hello.txt
+open data.json | get items.0.name
+```
+
+- Values have types: numbers, text, sizes (`50MB` is 1000-based, `50MiB`
+  1024-based), durations (`2s`, `5min`), dates, lists, records and
+  tables. Mixing them up is an error that says what you meant:
+  `size > 5` gives "5 has no unit; did you mean 5MB?".
+- A failed step stops the whole pipeline, and the error points at the
+  place in the line. Ctrl+C stops anything that's running.
+- `delete`, `move` and `copy` check everything first and change nothing
+  if any file is missing or in the way.
+- `let`, `mut`, `def`, `if`, `for` and `while` work at the prompt and in
+  `.ks` scripts (`source script.ks`).
+
+| Group | Commands |
 | --- | --- |
-| `help` | List all commands |
-| `ls`, `cd`, `pwd` | Browse the filesystem |
-| `cat <file>` | Print a file |
-| `write <file> <text>` | Create or overwrite a file |
-| `rm <file>` | Delete a file (needs the admin password) |
-| `run <file> [args]` | Run a program |
-| `ps`, `kill <id>` | List or stop running tasks |
-| `doom` | Play DOOM |
-| `meminfo`, `uptime` | Show memory use and uptime |
-| `diskbench` | Time reads (whole, in 4 KiB pieces, random), writes and deletes on each disk |
-| `verify [folder]` | Read every file and report any that are damaged |
-| `kfstest [steps] [seed] [keep] [fill]` | Random writes, renames and deletes on KonjacFS, each checked; `fill` also fills the disk |
-| `reboot`, `halt` | Restart or stop the machine (needs the admin password) |
+| Files | `ls`, `cd`, `pwd`, `open`, `cat`, `save`, `mkdir`, `delete` (`rm`), `move` (`mv`), `copy` (`cp`), `stat` |
+| Tables | `filter`, `sort-by`, `sort`, `select`, `reject`, `get`, `first`, `last`, `skip`, `length`, `reverse`, `uniq`, `each`, `group-by`, `enumerate`, `insert`, `update`, `columns`, `is-empty` |
+| Text | `lines`, `split`, `str contains`/`upcase`/`downcase`/`trim`/`length`/`replace`/`join`/`starts-with`/`ends-with`, `from json`, `to json`, `into int`/`float`/`size`/`string` |
+| Maths | `math sum`, `math avg`, `math min`, `math max` |
+| System | `ps`, `kill`, `uptime`, `mem`, `disks`, `date now`, `clear`, `help`, `echo`, `print`, `describe`, `do`, `source` |
+| Original | `run <file> [args]`, `doom`, `write <file> <text>`, `diskbench`, `verify [folder]`, `kfstest`, `reboot`, `halt`, and the rest from before |
 
-The first time you run a command that needs the admin password, you
-choose one. Only its SHA-256 hash is stored on the disk.
+`help` lists every command (it's a table too: `help | filter group ==
+files`), and `help <command>` explains one.
+
+`delete`, `reboot` and `halt` need the admin password. The first time
+you run one, you choose it; only its SHA-256 hash is stored on the disk.
 
 ## Building from source
 
@@ -137,6 +160,13 @@ alone after that. To add a file to the KonjacFS disk:
 python3 tools/kfs.py put kfs.img myfile.txt /     # also: ls, cat, get, mkdir, rm, check
 ```
 
+The shell's language has its own tests, which run on the host in a
+second:
+
+```sh
+cd ks && cargo test
+```
+
 Two tests boot KonjacOS in QEMU over and over to check KonjacFS:
 
 ```sh
@@ -161,6 +191,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 | Path | Contents |
 | --- | --- |
 | `kernel/src/` | The kernel, in Rust |
+| `ks/` | ks, the shell's language: its own crate, so its tests run on the host |
 | `kernel/src/ui/` | The desktop ([design notes](docs/desktop-ui-design.md)) |
 | `kernel/assets/` | Wallpaper, logo, icons and fonts baked into the kernel |
 | `kernel/csrc/` | C code built into the kernel, including the DOOM port |
