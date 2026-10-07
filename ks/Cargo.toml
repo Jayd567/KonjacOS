@@ -1,0 +1,12 @@
+[package]
+name = "ks"
+version = "0.1.0"
+edition = "2021"
+
+# KonjacShell's language: lexer, parser, values, evaluator and the
+# commands that only need values. No kernel code, so `cargo test` here runs
+# on the host; the kernel supplies files, tasks and the screen through the
+# `Host` trait. See docs/ks-design.md.
+
+[lib]
+path = "src/lib.rs"

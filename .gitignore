@@ -1,4 +1,6 @@
 /kernel/target/
+/ks/target/
+/ks/Cargo.lock
 /iso_root/
 /image.iso
 /disk.img

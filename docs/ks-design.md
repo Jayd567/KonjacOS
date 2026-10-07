@@ -7,7 +7,8 @@ text, a failed step **stops the pipeline**, and changes to files are
 **previewed and grouped** so a pipeline can't half-finish. ks can also
 control the desktop. This document fixes the language, its values, how
 pipelines and errors behave, and the order it gets built in. Status:
-**design only, nothing implemented yet.**
+**stage 1 implemented**, plus most of stage 3 and the first layer of
+stage 4 (see [What building stage 1 changed](#what-building-stage-1-changed)).
 
 ```
 konjac> ls | filter size > 50MB | sort-by modified | delete
@@ -490,3 +491,53 @@ These are settled:
 | Name | `ks`, with scripts in `.ks` files. |
 | Where does it run? | In the kernel, with the language in its own crate. |
 | Streaming? | Not in version 1: each step finishes first. |
+
+## What building stage 1 changed
+
+Things that turned out differently from the plan above, or that the
+plan didn't cover.
+
+**Done earlier than planned.**
+- `let`, `mut`, `def`, `if`, `for`, `while`, `break`, `continue`,
+  `return` and `source` (stage 3) came with the evaluator, since they
+  cost little once it existed. What's left of stage 3 is `try`/`catch`,
+  `def main` for scripts, and the checker.
+- The preview, `--yes` and `--dry-run` (stage 4's first layer) are in
+  `delete`. `delete` also asks when several paths, or any folder, are
+  named on the command line, not only when they're piped in. All-or-
+  nothing commits still need `kfs::begin()`/`finish()`.
+- `kill` takes task ids, or rows piped in from `ps`.
+
+**Rules the syntax needed.**
+- Operators need spaces around them: `size > 5MB`, not `size>5MB`.
+  A word runs up to a space, so `*.txt` and `../docs` stay one word.
+- `,` always separates (in lists and records), so text that is just a
+  comma needs quotes: `split ","`.
+- Inside a block, a bare word at the start of a step is a command, as at
+  the prompt. `if $x { a }` runs a command called `a`; write `{ 'a' }`.
+- `let x = word` stores the text when `word` isn't a command.
+- In a row condition, a bare word right of a comparison is text
+  (`type == file`), and everywhere else it's a column.
+- A `def` sees only its parameters, not the prompt's variables. A
+  closure copies the variables it uses when it's made.
+- A `def` has to come before its first use in a script.
+
+**Smaller decisions.**
+- `echo a b` gives the text `a b`, not a list.
+- `ls` lists folders first, then names ignoring case; names are paths
+  from where you are (`ls docs` gives `docs/a.md`).
+- `cd` alone goes to `/`.
+- `=~` ignores case.
+- The stable toolchain's `alloc` is built for unwinding, and some of it
+  (`format!`) refers to `_Unwind_Resume`. The kernel now defines that
+  symbol (it can never be called under `panic = "abort"`), so ks and the
+  rest of the kernel can use `format!`.
+
+**Issues found, for later.**
+- `run` doesn't wait for the program it starts, so the program's output
+  lands after the next prompt. ks can't tell whether a program failed
+  until the loader waits for it and hands back the exit code.
+- The input line is still the old 120-character buffer with only
+  backspace; stage 2 replaces it.
+- The console grid holds ASCII only, so other characters in output show
+  as `?`.

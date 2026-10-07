@@ -32,6 +32,7 @@ mod heap;
 mod idt;
 mod intrinsics;
 mod keyboard;
+mod ks_host;
 mod kfs;
 mod libc_shim;
 mod limine;
@@ -90,6 +91,9 @@ pub extern "C" fn kstart() -> ! {
         sprintln!("bootloader: {} {}", info.name, info.version);
     } else {
         sprintln!("bootloader: (no bootloader_info response)");
+    }
+    if !limine::stack_size_granted() {
+        sprintln!("bootloader: didn't grant the 1 MiB stack; the shell has 64 KiB");
     }
 
     let hhdm_offset = limine::hhdm_offset().unwrap_or_else(|| {

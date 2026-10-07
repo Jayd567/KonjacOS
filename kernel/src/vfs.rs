@@ -42,6 +42,23 @@ pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Nanoseconds since 1970, when the filesystem records it.
+    pub modified: Option<i64>,
+    pub created: Option<i64>,
+}
+
+/// A FAT date and time (date in the high 16 bits) as nanoseconds since
+/// 1970.
+fn fat_time(raw: u32) -> Option<i64> {
+    let (date, time) = ((raw >> 16) as i64, (raw & 0xffff) as i64);
+    if date == 0 {
+        return None;
+    }
+    ks::date_from_parts(1980 + (date >> 9), (date >> 5) & 15, date & 31, time >> 11, (time >> 5) & 63, (time & 31) * 2)
+}
+
+fn kfs_time(ns: u64) -> Option<i64> {
+    if ns == 0 { None } else { i64::try_from(ns).ok() }
 }
 
 /// Which filesystem a path is on, and the path within it.
@@ -123,14 +140,14 @@ pub fn change_dir(path: &str) -> Result<(), &'static str> {
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, &'static str> {
     match on(path) {
         On::Kfs(p) => {
-            let mut v: Vec<DirEntry> = kfs::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect();
+            let mut v: Vec<DirEntry> = kfs::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size, modified: kfs_time(e.modified), created: kfs_time(e.created) }).collect();
             // The FAT16 disk shows up as a folder in the root.
             if p == "/" && fat_at_mount() {
-                v.push(DirEntry { name: String::from(&FAT_MOUNT[1..]), is_dir: true, size: 0 });
+                v.push(DirEntry { name: String::from(&FAT_MOUNT[1..]), is_dir: true, size: 0, modified: None, created: None });
             }
             Ok(v)
         }
-        On::Fat(p) => Ok(fat16::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64 }).collect()),
+        On::Fat(p) => Ok(fat16::list_dir(&p)?.into_iter().map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size as u64, modified: fat_time(e.modified), created: None }).collect()),
     }
 }
 

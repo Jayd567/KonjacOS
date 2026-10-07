@@ -336,6 +336,9 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u32,
     pub cluster: u32,
+    /// Last written, as FAT stores it: the date in the high 16 bits, the
+    /// time in the low 16 (0 if never set).
+    pub modified: u32,
 }
 
 /// Turns the raw 8.3 `name[8]`/`ext[3]` fields into a normal display
@@ -372,6 +375,7 @@ fn decode_entry(chunk: &[u8]) -> DirEntry {
         is_dir: attr & ATTR_DIRECTORY != 0,
         size,
         cluster,
+        modified: u32::from_le_bytes([chunk[22], chunk[23], chunk[24], chunk[25]]),
     }
 }
 
